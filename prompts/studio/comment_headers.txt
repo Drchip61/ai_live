@@ -1,0 +1,4 @@
+# 弹幕区 section 标题
+old_comments=【上次回复前的弹幕（背景参考）】
+new_comments=【上次回复后的新弹幕】
+silence=【上次回复后无人说话】

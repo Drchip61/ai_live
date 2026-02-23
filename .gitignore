@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets (API keys)
+secrets/
+
+# Data files (large video/audio)
+data/*.mp4
+data/*.mkv
+data/*.flv
+data/*.m4a
+data/*.webm
+
+# Chroma DB (local vector store)
+chroma_data/
+
+# Memory archive
+memory_archive/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
