@@ -141,6 +141,17 @@ async def main():
   def on_response(response):
     pass
 
+  def on_pre_response(old_comments, new_comments):
+    print("--- 回复弹幕 ---")
+    for c in old_comments:
+      label = "[优先]" if c.priority else "[旧]"
+      print(f"{label} {c.nickname}: {c.content}")
+    for c in new_comments:
+      label = "[优先]" if c.priority else "[新]"
+      print(f"{label} {c.nickname}: {c.content}")
+    print("-" * 16)
+
+  studio.on_pre_response(on_pre_response)
   studio.on_response_chunk(on_chunk)
   studio.on_response(on_response)
 

@@ -26,6 +26,7 @@ class Comment:
   content: str
   id: str = field(default_factory=lambda: str(uuid.uuid4()))
   timestamp: datetime = field(default_factory=datetime.now)
+  priority: bool = False
 
   def to_dict(self) -> dict:
     """转换为字典"""

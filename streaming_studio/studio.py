@@ -142,6 +142,9 @@ class StreamingStudio:
     self.enable_streaming: bool = False
     self._chunk_callbacks: list[Callable[[ResponseChunk], None]] = []
 
+    # 生成回复前回调（用于打印即将回复的弹幕等）
+    self._pre_response_callbacks: list[Callable] = []
+
     # 话题管理器
     self._topic_manager = None
     if enable_topic_manager:
@@ -267,6 +270,15 @@ class StreamingStudio:
     if callback in self._chunk_callbacks:
       self._chunk_callbacks.remove(callback)
 
+  def on_pre_response(self, callback: Callable) -> None:
+    """
+    注册生成回复前回调函数
+
+    Args:
+      callback: 回调函数，签名 (old_comments, new_comments) -> None
+    """
+    self._pre_response_callbacks.append(callback)
+
   async def start(self) -> None:
     """启动直播间主循环"""
     if self._running:
@@ -371,14 +383,22 @@ class StreamingStudio:
 
         old_comments, new_comments = self._collect_comments()
 
-        # VLM 模式下视频播完且无新弹幕时停止
+        # VLM 模式下视频播完且无新弹幕（含优先弹幕）时停止
         if self._video_player and self._video_player.is_finished:
-          if not new_comments:
+          has_priority = any(c.priority for c in old_comments)
+          if not new_comments and not has_priority:
             print("视频播放完毕，直播间停止")
             break
 
         if not old_comments and not new_comments:
           continue
+
+        # 触发生成回复前回调
+        for cb in self._pre_response_callbacks:
+          try:
+            cb(old_comments, new_comments)
+          except Exception as e:
+            print(f"pre_response 回调错误: {e}")
 
         # 收集当前帧图片（VLM 模式）
         images = None
@@ -436,7 +456,15 @@ class StreamingStudio:
       - old_comments: 上次回复之前的弹幕（背景参考）
       - new_comments: 上次回复之后的新弹幕
     """
-    recent = list(self._comment_buffer)[-self.recent_comments_limit:]
+    all_buffered = list(self._comment_buffer)
+    recent = all_buffered[-self.recent_comments_limit:]
+    recent_ids = {c.id for c in recent}
+
+    # 优先弹幕始终包含在收集范围内（不受 recent_comments_limit 截断）
+    for c in all_buffered:
+      if c.priority and c.id not in recent_ids:
+        recent.append(c)
+        recent_ids.add(c.id)
 
     if self._last_reply_time is None:
       return [], recent
@@ -444,12 +472,21 @@ class StreamingStudio:
     old = [c for c in recent if c.timestamp < self._last_reply_time]
     new = [c for c in recent if c.timestamp >= self._last_reply_time]
 
-    # 动态上限：根据新弹幕数量限制总弹幕数
-    dynamic_limit = max(1, int(len(new) * self.config.new_comment_context_ratio))
+    # 优先弹幕：无论时间戳如何，始终归入新弹幕
+    promoted = [c for c in old if c.priority]
+    if promoted:
+      old = [c for c in old if not c.priority]
+
+    # 动态上限：根据新弹幕数量限制总弹幕数（优先弹幕计入总数但不被截断）
+    total_new = len(new) + len(promoted)
+    dynamic_limit = max(1, int(total_new * self.config.new_comment_context_ratio))
     total_limit = min(self.recent_comments_limit, dynamic_limit)
 
-    # 新弹幕优先，剩余配额给旧弹幕
-    new = new[-total_limit:]
+    # 新弹幕优先，优先弹幕始终保留，剩余配额给普通新弹幕
+    normal_quota = max(0, total_limit - len(promoted))
+    new = new[-normal_quota:] if normal_quota > 0 else []
+    new = promoted + new
+
     old_quota = max(0, total_limit - len(new))
     old = old[-old_quota:] if old_quota > 0 else []
 
@@ -477,6 +514,9 @@ class StreamingStudio:
     if not new_comments:
       return set()
 
+    # 优先弹幕始终入选
+    priority_ids = {c.id for c in new_comments if c.priority}
+
     # 计算每条弹幕的权重
     topic_weights: dict[str, float] = {}
     if self._topic_manager:
@@ -489,22 +529,26 @@ class StreamingStudio:
         for cid in topic.comment_ids:
           topic_weights[cid] = max(topic_weights.get(cid, 0), w)
 
+    # 非优先弹幕参与抽样
+    non_priority = [c for c in new_comments if not c.priority]
+
     weights = []
-    for c in new_comments:
+    for c in non_priority:
       if c.id in topic_weights:
         weights.append(max(topic_weights[c.id], 0.01))
       else:
         weights.append(self.config.interaction_base_weight)
 
-    # 确定选几条（高斯分布，至少 1 条）
+    # 确定选几条（高斯分布，至少 1 条，已包含优先弹幕的名额扣除）
     mu = min(self.config.interaction_target_mu, len(new_comments) * 0.6)
     count = round(random.gauss(mu, self.config.interaction_target_sigma))
     count = max(1, min(count, len(new_comments)))
+    remaining_slots = max(0, count - len(priority_ids))
 
     # 加权随机不放回抽样
-    selected: set[str] = set()
-    pool = list(zip(new_comments, weights))
-    for _ in range(count):
+    selected: set[str] = set(priority_ids)
+    pool = list(zip(non_priority, weights))
+    for _ in range(remaining_slots):
       if not pool:
         break
       total = sum(w for _, w in pool)
