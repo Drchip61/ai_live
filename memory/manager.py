@@ -184,7 +184,7 @@ class MemoryManager:
       summary_text = summary_text.strip()
 
       if summary_text:
-        self._active.add(summary_text)
+        self._active.add(summary_text, response=response)
         self._recent_interactions.append(
           (user_input, response, datetime.now())
         )
@@ -207,7 +207,7 @@ class MemoryManager:
       response: LLM 回复
     """
     summary_text = f"我回复了一位观众：他说「{user_input}」，我说了「{response[:50]}」"
-    self._active.add(summary_text)
+    self._active.add(summary_text, response=response)
     self._recent_interactions.append(
       (user_input, response, datetime.now())
     )
@@ -299,7 +299,11 @@ class MemoryManager:
       "active_count": self._active.count(),
       "active_capacity": self._active._config.capacity,
       "active_memories": [
-        {"content": m.content, "timestamp": m.timestamp.strftime("%H:%M:%S")}
+        {
+          "content": m.content,
+          "timestamp": m.timestamp.strftime("%H:%M:%S"),
+          "response": m.response,
+        }
         for m in active_memories
       ],
       "temporary_count": self._temporary.count(),

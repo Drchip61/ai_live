@@ -104,10 +104,15 @@ class MemoryRetriever:
         content=m.content,
         layer="active",
         timestamp=m.timestamp,
+        metadata={"response": m.response},
       )
       for m in active_memories
     ]
-    active_text = format_active_memories(active_entries)
+    active_text = format_active_memories(
+      active_entries,
+      include_response=self._config.include_response_in_active,
+      response_max_length=self._config.response_display_max_length,
+    )
 
     # RAG 层检索
     if self._config.mode == "weighted":
@@ -118,6 +123,8 @@ class MemoryRetriever:
     rag_text = format_retrieved_memories(
       rag_entries,
       current_session_id=self.session_id,
+      include_temp_response=self._config.include_response_in_temporary,
+      response_max_length=self._config.response_display_max_length,
     )
 
     return active_text, rag_text

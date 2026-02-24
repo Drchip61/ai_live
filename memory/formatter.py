@@ -37,12 +37,25 @@ def _relative_time(memory_time: datetime, now: datetime) -> str:
     return f"{minutes}分前"
 
 
-def format_active_memories(entries: list[MemoryEntry]) -> str:
+def _truncate_response(response: str, max_length: int) -> str:
+  """截断回复原文，超过 max_length 时末尾加省略号"""
+  if len(response) <= max_length:
+    return response
+  return response[:max_length] + "..."
+
+
+def format_active_memories(
+  entries: list[MemoryEntry],
+  include_response: bool = True,
+  response_max_length: int = 80,
+) -> str:
   """
   格式化 active 层记忆（无 RAG，直接时序列出）
 
   Args:
     entries: active 层记忆列表
+    include_response: 是否引用主播回复原文
+    response_max_length: 回复原文最大显示长度
 
   Returns:
     格式化文本
@@ -53,6 +66,11 @@ def format_active_memories(entries: list[MemoryEntry]) -> str:
   lines = ["【近期记忆】"]
   for entry in entries:
     lines.append(f"- {entry.content}")
+    if include_response and entry.metadata:
+      response = entry.metadata.get("response", "")
+      if response:
+        truncated = _truncate_response(response, response_max_length)
+        lines.append(f"  → 我说：「{truncated}」")
   return "\n".join(lines)
 
 
@@ -60,6 +78,8 @@ def format_retrieved_memories(
   entries: list[MemoryEntry],
   now: Optional[datetime] = None,
   current_session_id: Optional[str] = None,
+  include_temp_response: bool = False,
+  response_max_length: int = 80,
 ) -> str:
   """
   格式化跨层 RAG 检索结果（按层级分组，各层有小标题）
@@ -81,6 +101,8 @@ def format_retrieved_memories(
     entries: 跨层检索结果
     now: 当前时间（默认 datetime.now()）
     current_session_id: 当前直播会话 ID（用于跨会话标注）
+    include_temp_response: 是否在 temporary 层引用主播回复原文
+    response_max_length: 回复原文最大显示长度
 
   Returns:
     格式化文本，无结果时返回空字符串
@@ -129,6 +151,13 @@ def format_retrieved_memories(
         # temporary / summary 层加相对时间前缀
         rel_time = _relative_time(entry.timestamp, now)
         lines.append(f"- {cross_session_prefix}【{rel_time}的记忆】{entry.content}")
+
+        # temporary 层可选引用回复原文
+        if include_temp_response and entry.layer == "temporary" and entry.metadata:
+          response = entry.metadata.get("response", "")
+          if response:
+            truncated = _truncate_response(response, response_max_length)
+            lines.append(f"  → 我说：「{truncated}」")
 
     parts.append("\n".join(lines))
 

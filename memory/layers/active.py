@@ -18,6 +18,7 @@ class ActiveMemory:
   id: str
   content: str
   timestamp: datetime
+  response: str = ""  # 主播当时的回复原文
 
 
 class ActiveLayer:
@@ -38,14 +39,14 @@ class ActiveLayer:
 
     Args:
       config: 层配置
-      on_overflow: 溢出回调，签名 (content: str, timestamp: datetime) -> None
+      on_overflow: 溢出回调，签名 (content: str, timestamp: datetime, response: str) -> None
                    当旧记忆被挤出时调用
     """
     self._config = config or ActiveConfig()
     self._on_overflow = on_overflow
     self._memories: deque[ActiveMemory] = deque(maxlen=self._config.capacity)
 
-  def add(self, content: str) -> str:
+  def add(self, content: str, response: str = "") -> str:
     """
     添加一条记忆
 
@@ -53,6 +54,7 @@ class ActiveLayer:
 
     Args:
       content: 记忆内容（由小模型总结后的第一人称文本）
+      response: 主播当时的回复原文
 
     Returns:
       记忆 ID
@@ -60,12 +62,13 @@ class ActiveLayer:
     # 检查是否会溢出
     if len(self._memories) == self._config.capacity and self._on_overflow:
       oldest = self._memories[0]  # 即将被挤出的
-      self._on_overflow(oldest.content, oldest.timestamp)
+      self._on_overflow(oldest.content, oldest.timestamp, oldest.response)
 
     memory = ActiveMemory(
       id=str(uuid.uuid4()),
       content=content,
       timestamp=datetime.now(),
+      response=response,
     )
     self._memories.append(memory)
     return memory.id

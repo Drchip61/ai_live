@@ -48,6 +48,13 @@ class RetrievalConfig:
   weight_static: float = 1.2
   weighted_overfetch_multiplier: int = 3  # 多取回的倍数，再加权重排
 
+  # 在 active 层格式化时引用主播回复原文
+  include_response_in_active: bool = True
+  # 在 temporary 层格式化时引用主播回复原文（预留，暂不启用）
+  include_response_in_temporary: bool = False
+  # 格式化时回复原文的最大显示长度
+  response_display_max_length: int = 80
+
 
 @dataclass(frozen=True)
 class EmbeddingConfig:

@@ -46,13 +46,14 @@ class TemporaryLayer:
     self._config = config or TemporaryConfig()
     self.session_id: Optional[str] = None
 
-  def add(self, content: str, timestamp: Optional[datetime] = None) -> str:
+  def add(self, content: str, timestamp: Optional[datetime] = None, response: str = "") -> str:
     """
     添加一条记忆（通常来自 active 层溢出）
 
     Args:
       content: 记忆内容
       timestamp: 原始时间戳（来自 active 层），默认为当前时间
+      response: 主播当时的回复原文
 
     Returns:
       记忆 ID
@@ -65,6 +66,7 @@ class TemporaryLayer:
       "layer": "temporary",
       "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
       "significance": initial_significance(),
+      "response": response[:200],
     }
     if self.session_id is not None:
       metadata["session_id"] = self.session_id
