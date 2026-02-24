@@ -27,12 +27,12 @@ REMOTE_MODELS = {
     "small": "gpt-5-mini",
   },
   ModelType.ANTHROPIC: {
-    "large": "claude-sonnet-4-20250514",
-    "small": "claude-haiku-4-5-20251001",
+    "large": "claude-sonnet-4-6",
+    "small": "claude-haiku-4-5",
   },
   ModelType.GEMINI: {
-    "large": "gemini-2.5-flash",
-    "small": "gemini-2.0-flash",
+    "large": "gemini-3-flash",
+    "small": "gemini-2.5-flash-lite",
   },
 }
 
