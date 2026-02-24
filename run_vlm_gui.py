@@ -119,7 +119,7 @@ def main():
   studio.enable_streaming = True
 
   # MJPEG 视频流：显示帧通过 HTTP 流式推送，避免 WebSocket base64 闪烁
-  _mjpeg_state = {"jpeg_bytes": b""}
+  _mjpeg_state = {"jpeg_bytes": b"", "running": False}
 
   def _store_display_frame(frame):
     _mjpeg_state["jpeg_bytes"] = base64.b64decode(frame.base64_jpeg)
@@ -128,7 +128,7 @@ def main():
 
   async def _mjpeg_generator():
     interval = 1.0 / max(player.display_fps, 1)
-    while True:
+    while _mjpeg_state["running"]:
       data = _mjpeg_state["jpeg_bytes"]
       if data:
         yield (
@@ -176,16 +176,32 @@ def main():
 
       async def on_start():
         start_btn.disable()
+        _mjpeg_state["running"] = True
         _register_callbacks()
         await studio.start()
         stop_btn.enable()
 
       async def on_stop():
         stop_btn.disable()
+        _mjpeg_state["running"] = False
         _cleanup_callbacks()
         await studio.stop()
         start_btn.enable()
         progress.set_value(0)
+
+      def on_auto_stop():
+        """视频播完由 studio 回调触发，在 GUI 线程中安排清理"""
+        async def _do_stop():
+          stop_btn.disable()
+          _mjpeg_state["running"] = False
+          _cleanup_callbacks()
+          await studio.stop()
+          start_btn.enable()
+          progress.set_value(1.0)
+          time_label.set_text(f"{player.duration:.1f} / {player.duration:.1f}s (完毕)")
+        ui.timer(0.1, lambda: asyncio.ensure_future(_do_stop()), once=True)
+
+      studio.on_stop(on_auto_stop)
 
       start_btn = ui.button("开始", on_click=on_start).props(
         "dense icon=play_arrow color=green"

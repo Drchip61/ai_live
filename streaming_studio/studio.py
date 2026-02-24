@@ -148,6 +148,9 @@ class StreamingStudio:
     # 生成回复前回调（用于打印即将回复的弹幕等）
     self._pre_response_callbacks: list[Callable] = []
 
+    # 停止回调（主循环结束时通知外部，如视频播完自动停止）
+    self._stop_callbacks: list[Callable] = []
+
     # 话题管理器
     self._topic_manager = None
     if enable_topic_manager:
@@ -299,6 +302,14 @@ class StreamingStudio:
     """
     self._pre_response_callbacks.append(callback)
 
+  def on_stop(self, callback: Callable) -> None:
+    """注册停止回调（主循环自然结束时触发，如视频播完）"""
+    self._stop_callbacks.append(callback)
+
+  def remove_stop_callback(self, callback: Callable) -> None:
+    if callback in self._stop_callbacks:
+      self._stop_callbacks.remove(callback)
+
   async def start(self) -> None:
     """启动直播间主循环"""
     if self._running:
@@ -340,6 +351,15 @@ class StreamingStudio:
     self._running = False
     self._stream_start_time = None
 
+    # 先取消主循环，确保不会在 LLM 调用中阻塞
+    if self._main_task:
+      self._main_task.cancel()
+      try:
+        await self._main_task
+      except asyncio.CancelledError:
+        pass
+      self._main_task = None
+
     # 停止视频播放器
     if self._video_player:
       await self._video_player.stop()
@@ -356,17 +376,12 @@ class StreamingStudio:
     # 停止记忆定时任务
     await self.llm_wrapper.stop_memory()
 
-    # 等待后台任务
+    # 取消并等待后台任务（超时 3 秒避免挂起）
+    for task in self._background_tasks:
+      task.cancel()
     if self._background_tasks:
-      await asyncio.gather(*self._background_tasks, return_exceptions=True)
-
-    if self._main_task:
-      self._main_task.cancel()
-      try:
-        await self._main_task
-      except asyncio.CancelledError:
-        pass
-      self._main_task = None
+      await asyncio.wait(self._background_tasks, timeout=3.0)
+    self._background_tasks.clear()
 
   async def _main_loop(self) -> None:
     """
@@ -412,6 +427,11 @@ class StreamingStudio:
           has_priority = any(c.priority for c in old_comments)
           if not new_comments and not has_priority:
             print("视频播放完毕，直播间停止")
+            for cb in self._stop_callbacks:
+              try:
+                cb()
+              except Exception as e:
+                print(f"停止回调错误: {e}")
             break
 
         if not old_comments and not new_comments:
