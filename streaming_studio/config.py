@@ -3,7 +3,7 @@ StreamingStudio 配置
 管理直播间行为相关的细节参数
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -47,3 +47,27 @@ class StudioConfig:
 
   interaction_stale_weight: float = 0.1
   """过期话题弹幕的权重"""
+
+
+@dataclass(frozen=True)
+class ReplyDeciderConfig:
+  """回复决策器配置"""
+
+  min_quality_length: int = 3
+  """低于此长度的弹幕视为低质量（纯反应词）"""
+
+  must_reply_comment_count: int = 5
+  """新弹幕数量 >= 此值时规则直接放行"""
+
+  skip_patterns: tuple[str, ...] = (
+    "哈哈", "哈哈哈", "hhhh", "hhh", "233", "666", "nb",
+    "草", "笑死", "www", "awsl", "yyds", "dd", "弹幕",
+    "1", "11", "111", "??", "？？",
+  )
+  """这些模式如果覆盖所有弹幕则建议跳过"""
+
+  proactive_silence_threshold: float = 30.0
+  """沉默超过此秒数后，若画面有重大变化则主动发言"""
+
+  llm_judge_urgency_threshold: float = 4.0
+  """LLM 精判返回 urgency 低于此值时跳过回复"""

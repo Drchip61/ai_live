@@ -14,6 +14,8 @@ NiceGUI Web 界面，集成视频画面、弹幕侧栏、用户输入和控制�
 """
 
 import argparse
+import asyncio
+import base64
 import collections
 import sys
 from pathlib import Path
@@ -22,7 +24,8 @@ project_root = Path(__file__).parent
 if str(project_root) not in sys.path:
   sys.path.insert(0, str(project_root))
 
-from nicegui import ui, context
+from nicegui import ui, context, app
+from starlette.responses import StreamingResponse
 
 from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio, Comment
@@ -115,6 +118,34 @@ def main():
   )
   studio.enable_streaming = True
 
+  # MJPEG 视频流：显示帧通过 HTTP 流式推送，避免 WebSocket base64 闪烁
+  _mjpeg_state = {"jpeg_bytes": b""}
+
+  def _store_display_frame(frame):
+    _mjpeg_state["jpeg_bytes"] = base64.b64decode(frame.base64_jpeg)
+
+  player.on_display_frame(_store_display_frame)
+
+  async def _mjpeg_generator():
+    interval = 1.0 / max(player.display_fps, 1)
+    while True:
+      data = _mjpeg_state["jpeg_bytes"]
+      if data:
+        yield (
+          b"--frame\r\n"
+          b"Content-Type: image/jpeg\r\n\r\n"
+          + data
+          + b"\r\n"
+        )
+      await asyncio.sleep(interval)
+
+  @app.get("/video-stream")
+  async def video_stream_route():
+    return StreamingResponse(
+      _mjpeg_generator(),
+      media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
   print(f"VLM 直播间 GUI")
   print(f"  视频: {args.video} ({player.duration:.1f}s)")
   print(f"  弹幕: {args.danmaku or '无'}")
@@ -131,7 +162,6 @@ def main():
       "response_fn": None,
       "chunk_fn": None,
       "pre_fn": None,
-      "frame_fn": None,
       "danmaku_fn": None,
     }
 
@@ -173,11 +203,13 @@ def main():
     # ── 中间区域：视频画面 + 弹幕侧栏 ──
     with ui.row().classes("w-full gap-0 px-2").style("height: 55vh"):
 
-      # 左侧：视频画面
+      # 左侧：视频画面（MJPEG 流，浏览器原生支持无闪烁连续帧）
       with ui.column().classes("h-full p-1 overflow-hidden").style("flex: 3"):
-        video_img = ui.image().classes("w-full h-full object-contain").style(
-          "background: #111"
-        )
+        ui.html(
+          '<img src="/video-stream" '
+          'style="width:100%;height:100%;object-fit:contain;background:#111;">',
+          sanitize=False,
+        ).classes("w-full h-full")
 
       # 右侧：弹幕侧栏 + 输入
       with ui.column().classes("h-full gap-2 pl-2 pr-1 py-1").style("flex: 2"):
@@ -252,10 +284,6 @@ def main():
 
     # ── 回调函数 ──
 
-    def on_frame(frame):
-      """视频新帧 → 更新画面"""
-      video_img.set_source(f"data:image/jpeg;base64,{frame.base64_jpeg}")
-
     def on_danmaku(danmaku):
       """视频弹幕到达 → 侧栏显示"""
       nick = (
@@ -314,24 +342,17 @@ def main():
     # ── 回调注册 / 清理 ──
 
     def _register_callbacks():
-      callback_refs["frame_fn"] = on_frame
       callback_refs["danmaku_fn"] = on_danmaku
       callback_refs["pre_fn"] = on_pre_response
       callback_refs["chunk_fn"] = on_chunk
       callback_refs["response_fn"] = on_response
 
-      player.on_frame(on_frame)
       player.on_danmaku(on_danmaku)
       studio.on_pre_response(on_pre_response)
       studio.on_response_chunk(on_chunk)
       studio.on_response(on_response)
 
     def _cleanup_callbacks():
-      fn = callback_refs.get("frame_fn")
-      if fn and fn in player._on_frame_callbacks:
-        player._on_frame_callbacks.remove(fn)
-      callback_refs["frame_fn"] = None
-
       fn = callback_refs.get("danmaku_fn")
       if fn and fn in player._on_danmaku_callbacks:
         player._on_danmaku_callbacks.remove(fn)

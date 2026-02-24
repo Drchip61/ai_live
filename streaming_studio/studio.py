@@ -18,11 +18,12 @@ project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
   sys.path.insert(0, str(project_root))
 
-from langchain_wrapper import LLMWrapper, ModelType
+from langchain_wrapper import LLMWrapper, ModelType, ModelProvider
 from prompts import PromptLoader
 from .models import Comment, StreamerResponse, ResponseChunk
 from .database import CommentDatabase
-from .config import StudioConfig
+from .config import StudioConfig, ReplyDeciderConfig
+from .reply_decider import ReplyDecider
 
 if TYPE_CHECKING:
   from video_source import VideoPlayer
@@ -47,12 +48,14 @@ class StreamingStudio:
     enable_memory: bool = False,
     enable_global_memory: bool = False,
     enable_topic_manager: bool = False,
+    enable_reply_decider: bool = True,
     # VLM 视频源（传入后启用 VLM 模式：画面+弹幕 → 多模态 LLM）
     video_player: Optional["VideoPlayer"] = None,
     # 高级定制
     llm_wrapper: Optional[LLMWrapper] = None,
     database: Optional[CommentDatabase] = None,
     config: Optional[StudioConfig] = None,
+    reply_decider_config: Optional[ReplyDeciderConfig] = None,
   ):
     """
     初始化虚拟直播间
@@ -122,8 +125,8 @@ class StreamingStudio:
     # 弹幕缓冲区（环形，保留足够历史）
     self._comment_buffer: deque[Comment] = deque(maxlen=self.config.buffer_maxlen)
 
-    # 新弹幕到达通知
-    self._comment_arrived: asyncio.Event = asyncio.Event()
+    # 新弹幕到达通知（延迟到 start() 创建，避免 Python 3.9 event loop 绑定问题）
+    self._comment_arrived: Optional[asyncio.Event] = None
     self._pending_comment_count: int = 0
 
     # 上次回复时间（用于区分新旧弹幕）
@@ -154,6 +157,19 @@ class StreamingStudio:
         database=self.database,
       )
 
+    # 回复决策器
+    self._reply_decider: Optional[ReplyDecider] = None
+    if enable_reply_decider:
+      rd_config = reply_decider_config or ReplyDeciderConfig()
+      rd_llm = ModelProvider.remote_small(provider=model_type)
+      _loader = PromptLoader()
+      rd_prompt = _loader.load("studio/reply_judge.txt")
+      self._reply_decider = ReplyDecider(
+        config=rd_config,
+        llm_model=rd_llm,
+        judge_prompt=rd_prompt,
+      )
+
     # Prompt 模板
     _loader = PromptLoader()
     self._comment_headers = _loader.load_headers("studio/comment_headers.txt")
@@ -166,6 +182,9 @@ class StreamingStudio:
     # VLM 视频源
     self._video_player = video_player
     self._current_frame_b64: Optional[str] = None
+
+    # 上一次场景描述（用于主动发言时检测画面变化）
+    self._prev_scene_description: Optional[str] = None
 
     # 直播开始时间（用于计算已开播时长）
     self._stream_start_time: Optional[datetime] = None
@@ -192,7 +211,8 @@ class StreamingStudio:
     self.database.save_comment(comment)
     self._comment_buffer.append(comment)
     self._pending_comment_count += 1
-    self._comment_arrived.set()
+    if self._comment_arrived is not None:
+      self._comment_arrived.set()
 
     # 转发给话题管理器（非阻塞）
     if self._topic_manager:
@@ -286,6 +306,10 @@ class StreamingStudio:
 
     self._running = True
     self._stream_start_time = datetime.now()
+
+    # 在当前事件循环中创建 Event（Python 3.9 兼容）
+    self._comment_arrived = asyncio.Event()
+    self._pending_comment_count = 0
 
     # 生成会话 ID
     self._session_id = str(uuid.uuid4())
@@ -391,7 +415,21 @@ class StreamingStudio:
             break
 
         if not old_comments and not new_comments:
-          continue
+          # 无弹幕 → 检查是否应主动发言（VLM 模式下场景变化触发）
+          if await self._check_proactive_speak():
+            old_comments, new_comments = [], []
+          else:
+            continue
+
+        # 回复决策器：判断是否值得回复
+        if self._reply_decider and (old_comments or new_comments):
+          decision = await self._reply_decider.should_reply(
+            old_comments, new_comments,
+            last_reply_time=self._last_reply_time,
+          )
+          if not decision.should_reply:
+            print(f"[决策器] 跳过回复: {decision.reason}")
+            continue
 
         # 触发生成回复前回调
         for cb in self._pre_response_callbacks:
@@ -417,6 +455,11 @@ class StreamingStudio:
         if response:
           self.database.save_response(response)
           await self._response_queue.put(response)
+
+          # 缓存场景描述，用于主动发言的场景变化检测
+          scene = self.llm_wrapper.last_scene_understanding
+          if scene:
+            self._prev_scene_description = scene
 
           for callback in self._response_callbacks:
             try:
@@ -444,6 +487,44 @@ class StreamingStudio:
       except Exception as e:
         print(f"主循环错误: {e}")
         await asyncio.sleep(1)
+
+  async def _check_proactive_speak(self) -> bool:
+    """
+    检查是否应主动发言（无弹幕时，基于画面变化触发）
+
+    仅在 VLM 模式下且有回复决策器时工作。
+    当沉默时间超过阈值且画面发生重大变化时返回 True。
+    """
+    if not self._reply_decider or not self._video_player:
+      return False
+    if not self._current_frame_b64:
+      return False
+
+    silence = 0.0
+    if self._last_reply_time:
+      silence = (datetime.now() - self._last_reply_time).total_seconds()
+    elif self._stream_start_time:
+      silence = (datetime.now() - self._stream_start_time).total_seconds()
+
+    rd_config = self._reply_decider.config
+    if silence < rd_config.proactive_silence_threshold:
+      return False
+
+    # 运行场景理解获取当前画面描述
+    images = [self._current_frame_b64]
+    timestamp = self._get_stream_timestamp()
+    current_scene = await self.llm_wrapper.ascene_understand(
+      f"[当前画面] {timestamp}", images,
+    )
+    if not current_scene:
+      return False
+
+    decision = await self._reply_decider.should_proactive_speak(
+      self._prev_scene_description, current_scene, silence,
+    )
+    if decision.should_reply:
+      print(f"[决策器] 主动发言: {decision.reason}")
+    return decision.should_reply
 
   def _collect_comments(self) -> tuple[list[Comment], list[Comment]]:
     """

@@ -38,7 +38,7 @@ class VideoPlayer:
   异步视频时间轴播放器
 
   模拟视频播放，按真实时间推进，同步产出视频帧和弹幕。
-  不做实际视频渲染，只按时间轴提供数据给 LLM 消费。
+  支持两种帧率：高帧率显示帧（流畅播放）和低帧率 AI 采样帧（节省 token）。
 
   用法:
     player = VideoPlayer(video_path, danmaku_path)
@@ -57,24 +57,42 @@ class VideoPlayer:
     frame_interval: float = 5.0,
     max_width: int = 1280,
     jpeg_quality: int = 75,
+    display_fps: float = 10.0,
+    display_max_width: int = 960,
+    display_jpeg_quality: int = 50,
   ):
     """
     Args:
       video_path: 视频文件路径
       danmaku_path: B站弹幕 XML 文件路径（可选）
       speed: 播放速度倍率（1.0 = 实时）
-      frame_interval: 帧采样间隔（秒，视频时间）
-      max_width: 帧最大宽度
-      jpeg_quality: JPEG 压缩质量
+      frame_interval: AI 帧采样间隔（秒，视频时间）
+      max_width: AI 帧最大宽度
+      jpeg_quality: AI 帧 JPEG 压缩质量
+      display_fps: 显示帧率（仅用于 GUI 流畅播放，不影响 AI）
+      display_max_width: 显示帧最大宽度（可比 AI 帧低以提高速度）
+      display_jpeg_quality: 显示帧 JPEG 压缩质量
     """
     self.speed = speed
     self.frame_interval = frame_interval
+    self.display_fps = display_fps
 
+    # AI 帧提取器（高质量，低频率）
     self._extractor = FrameExtractor(
       video_path,
       max_width=max_width,
       jpeg_quality=jpeg_quality,
     )
+
+    # 显示帧提取器（低质量，高频率，独立 VideoCapture 避免 seek 冲突）
+    self._display_extractor: Optional[FrameExtractor] = None
+    if display_fps > 0:
+      self._display_extractor = FrameExtractor(
+        video_path,
+        max_width=display_max_width,
+        jpeg_quality=display_jpeg_quality,
+      )
+
     self._parser = DanmakuParser(danmaku_path) if danmaku_path else None
 
     # 播放状态
@@ -83,9 +101,13 @@ class VideoPlayer:
     self._current_sec: float = 0.0
     self._paused = False
 
-    # 最新帧缓存
+    # 最新帧缓存（AI 帧）
     self._current_frame: Optional[VideoFrame] = None
     self._last_frame_sec: float = -999.0
+
+    # 显示帧状态
+    self._last_display_frame_sec: float = -999.0
+    self._display_interval: float = 1.0 / display_fps if display_fps > 0 else 999.0
 
     # 弹幕已消费位置
     self._danmaku_cursor: float = 0.0
@@ -98,6 +120,7 @@ class VideoPlayer:
     # 事件回调
     self._on_danmaku_callbacks: list[Callable[[Danmaku], None]] = []
     self._on_frame_callbacks: list[Callable[[VideoFrame], None]] = []
+    self._on_display_frame_callbacks: list[Callable[[VideoFrame], None]] = []
 
   @property
   def duration(self) -> float:
@@ -127,8 +150,12 @@ class VideoPlayer:
     self._on_danmaku_callbacks.append(callback)
 
   def on_frame(self, callback: Callable[[VideoFrame], None]) -> None:
-    """注册新帧回调"""
+    """注册 AI 采样帧回调（低频率，每 frame_interval 秒一次）"""
     self._on_frame_callbacks.append(callback)
+
+  def on_display_frame(self, callback: Callable[[VideoFrame], None]) -> None:
+    """注册显示帧回调（高频率，用于 GUI 流畅播放）"""
+    self._on_display_frame_callbacks.append(callback)
 
   async def start(self) -> None:
     """开始播放"""
@@ -157,6 +184,8 @@ class VideoPlayer:
         pass
       self._tick_task = None
     self._extractor.close()
+    if self._display_extractor:
+      self._display_extractor.close()
 
   def get_snapshot(self) -> PlaybackSnapshot:
     """
@@ -176,10 +205,12 @@ class VideoPlayer:
 
   async def _tick_loop(self) -> None:
     """
-    后台时钟循环：每 0.5 秒更新一次播放位置，
-    检查是否需要提取新帧、发放新弹幕
+    后台时钟循环：高频驱动显示帧 + 低频驱动 AI 帧 + 弹幕投递
+
+    tick_interval 取决于是否有显示帧回调：有则 0.05s（~20fps 上限），否则 0.5s
     """
-    tick_interval = 0.5
+    has_display = bool(self._on_display_frame_callbacks and self._display_extractor)
+    tick_interval = 0.05 if has_display else 0.5
 
     while self._running:
       try:
@@ -197,7 +228,19 @@ class VideoPlayer:
           logger.info("视频播放完毕 (%.1fs)", self._extractor.duration)
           break
 
-        # 按间隔提取帧
+        # 显示帧（高频率，用于 GUI 流畅播放）
+        if has_display:
+          if self._current_sec - self._last_display_frame_sec >= self._display_interval:
+            display_frame = self._display_extractor.extract_at(self._current_sec)
+            if display_frame:
+              self._last_display_frame_sec = self._current_sec
+              for cb in self._on_display_frame_callbacks:
+                try:
+                  cb(display_frame)
+                except Exception as e:
+                  logger.error("显示帧回调错误: %s", e)
+
+        # AI 采样帧（低频率，供 VLM 模型使用）
         if self._current_sec - self._last_frame_sec >= self.frame_interval:
           frame = self._extractor.extract_at(self._current_sec)
           if frame:
@@ -240,6 +283,7 @@ class VideoPlayer:
       "progress": f"{self._current_sec / self.duration * 100:.1f}%" if self.duration > 0 else "N/A",
       "speed": self.speed,
       "frame_interval": self.frame_interval,
+      "display_fps": self.display_fps,
       "has_frame": self._current_frame is not None,
       "pending_danmakus": len(self._pending_danmakus),
       "video": repr(self._extractor),
