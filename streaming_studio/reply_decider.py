@@ -3,9 +3,7 @@
 两阶段判断主播是否应该回复：规则快筛（免费） + LLM 精判（Haiku）
 """
 
-import json
 import logging
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -234,28 +232,12 @@ class ReplyDecider:
       return ReplyDecision(False, 0, f"判断异常({e})", "llm")
 
   def _parse_judge_response(self, text: str) -> ReplyDecision:
-    """解析 LLM 精判的 JSON 响应"""
-    text = text.strip()
-
-    # 尝试提取 JSON（可能被包在 markdown code block 中）
-    json_match = re.search(r'\{[^}]+\}', text)
-    if json_match:
-      try:
-        data = json.loads(json_match.group())
-        reply = bool(data.get("reply", True))
-        urgency = float(data.get("urgency", 5))
-
-        if urgency < self.config.llm_judge_urgency_threshold:
-          reply = False
-
-        return ReplyDecision(
-          should_reply=reply,
-          urgency=urgency,
-          reason=data.get("reason", "LLM判断"),
-          phase="llm",
-        )
-      except (json.JSONDecodeError, ValueError, KeyError):
-        pass
+    """解析 LLM 精判的 true/false 响应"""
+    normalized = text.strip().lower()
+    if normalized.startswith("true"):
+      return ReplyDecision(True, 5, "LLM判断", "llm")
+    if normalized.startswith("false"):
+      return ReplyDecision(False, 1, "LLM判断", "llm")
 
     logger.warning("LLM 精判响应解析失败: %s", text[:100])
     return ReplyDecision(False, 2, "响应解析失败，默认跳过", "llm")
