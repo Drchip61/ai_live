@@ -601,8 +601,12 @@ class StreamingStudio:
     if promoted:
       old = [c for c in old if not c.priority]
 
-    # 动态上限：根据新弹幕数量限制总弹幕数（优先弹幕计入总数但不被截断）
+    # 无新弹幕也无优先弹幕 → 返回空，让主循环的沉默逻辑处理
     total_new = len(new) + len(promoted)
+    if total_new == 0:
+      return [], []
+
+    # 动态上限：根据新弹幕数量限制总弹幕数（优先弹幕计入总数但不被截断）
     dynamic_limit = max(1, int(total_new * self.config.new_comment_context_ratio))
     total_limit = min(self.recent_comments_limit, dynamic_limit)
 
