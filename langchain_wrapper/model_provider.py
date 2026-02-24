@@ -16,6 +16,7 @@ class ModelType(Enum):
   """模型类型枚举"""
   OPENAI = "openai"
   ANTHROPIC = "anthropic"
+  GEMINI = "gemini"
   LOCAL_QWEN = "local_qwen"
 
 
@@ -28,6 +29,10 @@ REMOTE_MODELS = {
   ModelType.ANTHROPIC: {
     "large": "claude-sonnet-4-20250514",
     "small": "claude-haiku-4-5-20251001",
+  },
+  ModelType.GEMINI: {
+    "large": "gemini-2.5-flash",
+    "small": "gemini-2.0-flash",
   },
 }
 
@@ -90,6 +95,8 @@ class ModelProvider:
       return self._create_openai_model(model_name, **kwargs)
     elif model_type == ModelType.ANTHROPIC:
       return self._create_anthropic_model(model_name, **kwargs)
+    elif model_type == ModelType.GEMINI:
+      return self._create_gemini_model(model_name, **kwargs)
     elif model_type == ModelType.LOCAL_QWEN:
       return self._create_local_qwen_model(model_name, **kwargs)
     else:
@@ -128,6 +135,32 @@ class ModelProvider:
     return ChatAnthropic(
       model=model_name or "claude-sonnet-4-20250514",
       api_key=api_key,
+      **kwargs
+    )
+
+  def _create_gemini_model(
+    self,
+    model_name: Optional[str] = None,
+    **kwargs
+  ) -> BaseChatModel:
+    """
+    创建 Gemini 模型
+    通过 Google AI 的 OpenAI 兼容接口调用，无需额外安装包
+    """
+    from langchain_openai import ChatOpenAI
+
+    api_key = self._get_secret("gemini_api_key")
+    if not api_key:
+      raise ValueError(
+        "未配置 Gemini API Key，请设置环境变量 GEMINI_API_KEY "
+        "或在 secrets/api_keys.json 中配置 gemini_api_key\n"
+        "获取地址: https://aistudio.google.com/apikey"
+      )
+
+    return ChatOpenAI(
+      model=model_name or "gemini-2.5-flash",
+      api_key=api_key,
+      base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
       **kwargs
     )
 

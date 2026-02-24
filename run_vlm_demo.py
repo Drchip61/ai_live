@@ -51,7 +51,7 @@ def parse_args():
   )
   parser.add_argument(
     "--model", default="anthropic",
-    choices=["openai", "anthropic"],
+    choices=["openai", "anthropic", "gemini"],
     help="模型提供者（VLM 推荐 anthropic，默认 anthropic）",
   )
   parser.add_argument(
@@ -91,6 +91,7 @@ async def main():
   model_map = {
     "openai": ModelType.OPENAI,
     "anthropic": ModelType.ANTHROPIC,
+    "gemini": ModelType.GEMINI,
   }
   model_type = model_map[args.model]
 

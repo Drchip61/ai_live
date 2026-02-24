@@ -443,13 +443,16 @@ class StreamingStudio:
 
         # 回复决策器：判断是否值得回复
         if self._reply_decider and (old_comments or new_comments):
+          all_texts = [c.content for c in (old_comments + new_comments)][:3]
           decision = await self._reply_decider.should_reply(
             old_comments, new_comments,
             last_reply_time=self._last_reply_time,
           )
+          preview = " | ".join(all_texts)
           if not decision.should_reply:
-            print(f"[决策器] 跳过回复: {decision.reason}")
+            print(f"[决策器] 跳过({decision.phase}): {decision.reason} ← {preview[:40]}")
             continue
+          print(f"[决策器] 回复({decision.phase},u={decision.urgency:.0f}): {decision.reason} ← {preview[:40]}")
 
         # 触发生成回复前回调
         for cb in self._pre_response_callbacks:
