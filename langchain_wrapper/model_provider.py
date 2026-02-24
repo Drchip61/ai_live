@@ -20,6 +20,10 @@ class ModelType(Enum):
   LOCAL_QWEN = "local_qwen"
 
 
+# Anthropic 默认大模型（统一单一来源，避免多处硬编码不一致）
+DEFAULT_ANTHROPIC_LARGE = "claude-sonnet-4-6"
+
+
 # 预设远程模型名称映射
 REMOTE_MODELS = {
   ModelType.OPENAI: {
@@ -27,8 +31,8 @@ REMOTE_MODELS = {
     "small": "gpt-5-mini",
   },
   ModelType.ANTHROPIC: {
-    "large": "claude-sonnet-4-6",
-    "small": "claude-haiku-4-5",
+    "large": DEFAULT_ANTHROPIC_LARGE,
+    "small": "claude-haiku-4-5-20251001",
   },
   ModelType.GEMINI: {
     "large": "gemini-3-flash",
@@ -133,7 +137,7 @@ class ModelProvider:
       raise ValueError("未配置 Anthropic API Key，请设置环境变量 ANTHROPIC_API_KEY 或在 secrets/api_keys.json 中配置")
 
     return ChatAnthropic(
-      model=model_name or "claude-sonnet-4-20250514",
+      model=model_name or DEFAULT_ANTHROPIC_LARGE,
       api_key=api_key,
       **kwargs
     )
@@ -203,7 +207,7 @@ class ModelProvider:
 
     Args:
       provider: 模型源，默认 OpenAI (gpt-5.2)
-                支持 ANTHROPIC (claude-opus-4.6)
+                支持 ANTHROPIC (claude-sonnet-4-6)
     """
     model_name = REMOTE_MODELS[provider]["large"]
     return cls().get_model(provider, model_name=model_name, **kwargs)
