@@ -15,6 +15,7 @@ B站视频 + 弹幕下载工具
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import zlib
@@ -100,8 +101,10 @@ def download_video_ytdlp(url: str, output_dir: Path, filename: str) -> Path:
   """用 yt-dlp 下载视频"""
   output_template = str(output_dir / f"{filename}.%(ext)s")
 
-  cmd = [
-    "yt-dlp",
+  # 优先使用 yt-dlp 可执行文件；若 PATH 不可见则回退到 python -m yt_dlp
+  ytdlp_cmd = [shutil.which("yt-dlp")] if shutil.which("yt-dlp") else [sys.executable, "-m", "yt_dlp"]
+
+  cmd = ytdlp_cmd + [
     "--format", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
     "--merge-output-format", "mp4",
     "--output", output_template,

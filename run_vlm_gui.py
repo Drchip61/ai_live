@@ -19,6 +19,7 @@ import base64
 import collections
 import sys
 from pathlib import Path
+from typing import Optional
 
 project_root = Path(__file__).parent
 if str(project_root) not in sys.path:
@@ -100,37 +101,53 @@ def main():
   }
   model_type = model_map[args.model]
 
-  player = VideoPlayer(
-    video_path=args.video,
-    danmaku_path=args.danmaku,
-    speed=args.speed,
-    frame_interval=args.frame_interval,
-    max_width=args.max_width,
-  )
-
-  studio = StreamingStudio(
-    persona=args.persona,
-    model_type=model_type,
-    model_name=args.model_name,
-    enable_memory=not args.no_memory,
-    enable_global_memory=args.global_memory,
-    enable_topic_manager=args.topic_manager,
-    video_player=player,
-  )
-  studio.enable_streaming = True
-
   # MJPEG 视频流：显示帧通过 HTTP 流式推送，避免 WebSocket base64 闪烁
   _mjpeg_state = {"jpeg_bytes": b"", "running": False}
 
   def _store_display_frame(frame):
     _mjpeg_state["jpeg_bytes"] = base64.b64decode(frame.base64_jpeg)
 
-  player.on_display_frame(_store_display_frame)
+  def _normalize_path(raw_path: str) -> str:
+    p = Path(raw_path).expanduser()
+    if not p.is_absolute():
+      p = (project_root / p).resolve()
+    return str(p)
+
+  def _build_runtime(video_path: str, danmaku_path: Optional[str]):
+    normalized_video = _normalize_path(video_path)
+    normalized_danmaku = _normalize_path(danmaku_path) if danmaku_path else None
+
+    player = VideoPlayer(
+      video_path=normalized_video,
+      danmaku_path=normalized_danmaku,
+      speed=args.speed,
+      frame_interval=args.frame_interval,
+      max_width=args.max_width,
+    )
+    studio = StreamingStudio(
+      persona=args.persona,
+      model_type=model_type,
+      model_name=args.model_name,
+      enable_memory=not args.no_memory,
+      enable_global_memory=args.global_memory,
+      enable_topic_manager=args.topic_manager,
+      video_player=player,
+    )
+    studio.enable_streaming = True
+    player.on_display_frame(_store_display_frame)
+    return {
+      "video_path": normalized_video,
+      "danmaku_path": normalized_danmaku,
+      "player": player,
+      "studio": studio,
+    }
+
+  runtime = _build_runtime(args.video, args.danmaku)
 
   async def _mjpeg_generator():
-    interval = 1.0 / max(player.display_fps, 1)
     while True:
       if _mjpeg_state["running"]:
+        interval = 1.0 / max(runtime["player"].display_fps, 1)
         data = _mjpeg_state["jpeg_bytes"]
         if data:
           yield (
@@ -151,8 +168,8 @@ def main():
     )
 
   print(f"VLM 直播间 GUI")
-  print(f"  视频: {args.video} ({player.duration:.1f}s)")
-  print(f"  弹幕: {args.danmaku or '无'}")
+  print(f"  视频: {runtime['video_path']} ({runtime['player'].duration:.1f}s)")
+  print(f"  弹幕: {runtime['danmaku_path'] or '无'}")
   print(f"  人设: {args.persona}  模型: {args.model}")
   print(f"  端口: {args.port}")
 
@@ -161,16 +178,26 @@ def main():
     # ── 页面局部状态 ──
     streaming_labels: dict[str, ui.label] = {}
     streamed_ids: collections.deque[str] = collections.deque(maxlen=50)
+    terminal_state = {"active_response_id": None}
     danmaku_entries: list[ui.element] = []
     callback_refs = {
       "response_fn": None,
       "chunk_fn": None,
       "pre_fn": None,
       "danmaku_fn": None,
+      "stop_fn": None,
+      "bound_player": None,
+      "bound_studio": None,
     }
 
     DANMAKU_HEIGHT = "height: calc(55vh - 120px)"
     CONSOLE_HEIGHT = "height: calc(35vh - 50px)"
+
+    def _current_player() -> VideoPlayer:
+      return runtime["player"]
+
+    def _current_studio() -> StreamingStudio:
+      return runtime["studio"]
 
     # ── 顶部控制栏 ──
     with ui.row().classes(
@@ -179,33 +206,25 @@ def main():
       ui.label("VLM 直播间").classes("text-xl font-bold")
 
       async def on_start():
+        if _current_studio().is_running:
+          return
         start_btn.disable()
         _mjpeg_state["running"] = True
         _register_callbacks()
-        await studio.start()
+        await _current_studio().start()
         stop_btn.enable()
 
       async def on_stop():
+        if not _current_studio().is_running:
+          stop_btn.disable()
+          start_btn.enable()
+          return
         stop_btn.disable()
         _mjpeg_state["running"] = False
         _cleanup_callbacks()
-        await studio.stop()
+        await _current_studio().stop()
         start_btn.enable()
         progress.set_value(0)
-
-      def on_auto_stop():
-        """视频播完由 studio 回调触发，在 GUI 线程中安排清理"""
-        async def _do_stop():
-          stop_btn.disable()
-          _mjpeg_state["running"] = False
-          _cleanup_callbacks()
-          await studio.stop()
-          start_btn.enable()
-          progress.set_value(1.0)
-          time_label.set_text(f"{player.duration:.1f} / {player.duration:.1f}s (完毕)")
-        ui.timer(0.1, lambda: asyncio.ensure_future(_do_stop()), once=True)
-
-      studio.on_stop(on_auto_stop)
 
       start_btn = ui.button("开始", on_click=on_start).props(
         "dense icon=play_arrow color=green"
@@ -217,8 +236,88 @@ def main():
 
       progress = ui.linear_progress(value=0, show_value=False).classes("flex-1")
       time_label = ui.label(
-        f"0.0 / {player.duration:.1f}s"
+        f"0.0 / {_current_player().duration:.1f}s"
       ).classes("text-sm text-gray-600 whitespace-nowrap")
+
+    with ui.row().classes(
+      "w-full items-center gap-2 px-4 pb-2 bg-gray-100 shrink-0"
+    ):
+      video_input = ui.input(label="视频路径").props("dense outlined").classes("flex-1")
+      video_input.value = runtime["video_path"]
+
+      danmaku_input = ui.input(
+        label="弹幕XML路径（可空）"
+      ).props("dense outlined").classes("flex-1")
+      danmaku_input.value = runtime["danmaku_path"] or ""
+
+      async def on_switch_source():
+        raw_video = (video_input.value or "").strip()
+        raw_danmaku = (danmaku_input.value or "").strip()
+
+        if not raw_video:
+          ui.notify("请先填写视频文件路径", type="warning")
+          return
+
+        normalized_video = _normalize_path(raw_video)
+        if not Path(normalized_video).exists():
+          ui.notify(f"视频文件不存在: {normalized_video}", type="negative")
+          return
+
+        normalized_danmaku = _normalize_path(raw_danmaku) if raw_danmaku else None
+        if normalized_danmaku and not Path(normalized_danmaku).exists():
+          ui.notify(f"弹幕文件不存在: {normalized_danmaku}", type="negative")
+          return
+
+        if (
+          normalized_video == runtime["video_path"]
+          and normalized_danmaku == runtime["danmaku_path"]
+        ):
+          ui.notify("视频与弹幕源未发生变化", type="info")
+          return
+
+        switch_btn.disable()
+        start_btn.disable()
+        stop_btn.disable()
+        _mjpeg_state["running"] = False
+        _mjpeg_state["jpeg_bytes"] = b""
+
+        old_studio = _current_studio()
+        try:
+          _cleanup_callbacks()
+          if old_studio.is_running:
+            await old_studio.stop()
+
+          new_runtime = _build_runtime(normalized_video, normalized_danmaku)
+          runtime.update(new_runtime)
+
+          video_input.value = runtime["video_path"]
+          danmaku_input.value = runtime["danmaku_path"] or ""
+
+          progress.set_value(0)
+          time_label.set_text(f"0.0 / {_current_player().duration:.1f}s")
+          _add_console_block(
+            (
+              f"[系统] 已切换视频源\n"
+              f"视频: {runtime['video_path']}\n"
+              f"弹幕: {runtime['danmaku_path'] or '无'}"
+            ),
+            "text-sm text-cyan-300 font-mono whitespace-pre-wrap",
+          )
+          ui.notify("已切换视频/弹幕源", type="positive")
+        except Exception as e:
+          ui.notify(f"切换失败: {e}", type="negative")
+          _add_console_block(
+            f"[系统] 切换失败: {e}",
+            "text-sm text-red-300 font-mono whitespace-pre-wrap",
+          )
+        finally:
+          switch_btn.enable()
+          start_btn.enable()
+          stop_btn.disable()
+
+      switch_btn = ui.button("切换源", on_click=on_switch_source).props(
+        "dense icon=sync color=primary"
+      )
 
     # ── 中间区域：视频画面 + 弹幕侧栏 ──
     with ui.row().classes("w-full gap-0 px-2").style("height: 55vh"):
@@ -248,14 +347,14 @@ def main():
 
           def send_comment():
             content = msg_input.value.strip()
-            if not content or not studio.is_running:
+            if not content or not _current_studio().is_running:
               return
             comment = Comment(
               user_id="manual_user",
               nickname="手动观众",
               content=content,
             )
-            studio.send_comment(comment)
+            _current_studio().send_comment(comment)
             _add_danmaku("手动观众", content, priority=True)
             msg_input.value = ""
 
@@ -330,6 +429,19 @@ def main():
 
     def on_chunk(chunk: ResponseChunk):
       """流式回复 → 控制台逐字显示"""
+      # 同步输出到终端，便于无界面排障与远程观察
+      active_id = terminal_state["active_response_id"]
+      if chunk.response_id != active_id:
+        if active_id is not None:
+          print()
+        terminal_state["active_response_id"] = chunk.response_id
+        print("[主播] ", end="", flush=True)
+      if chunk.chunk:
+        print(chunk.chunk, end="", flush=True)
+      if chunk.done:
+        print()
+        terminal_state["active_response_id"] = None
+
       if chunk.response_id not in streaming_labels:
         with console_column:
           lbl = ui.label(chunk.accumulated).classes(
@@ -354,6 +466,7 @@ def main():
       """完整回复回调（非流式兜底）"""
       if response.id in streamed_ids:
         return
+      print(f"[主播] {response.content}")
       _add_console_block(
         response.content,
         "text-sm text-gray-200 font-mono whitespace-pre-wrap",
@@ -362,37 +475,71 @@ def main():
     # ── 回调注册 / 清理 ──
 
     def _register_callbacks():
+      _cleanup_callbacks()
+      current_player = _current_player()
+      current_studio = _current_studio()
+
       callback_refs["danmaku_fn"] = on_danmaku
       callback_refs["pre_fn"] = on_pre_response
       callback_refs["chunk_fn"] = on_chunk
       callback_refs["response_fn"] = on_response
+      callback_refs["bound_player"] = current_player
+      callback_refs["bound_studio"] = current_studio
 
-      player.on_danmaku(on_danmaku)
-      studio.on_pre_response(on_pre_response)
-      studio.on_response_chunk(on_chunk)
-      studio.on_response(on_response)
+      def on_auto_stop():
+        """视频播完由 studio 回调触发，在 GUI 线程中安排清理"""
+        async def _do_stop():
+          if callback_refs.get("bound_studio") is not current_studio:
+            return
+          stop_btn.disable()
+          _mjpeg_state["running"] = False
+          _cleanup_callbacks()
+          await current_studio.stop()
+          start_btn.enable()
+          progress.set_value(1.0)
+          total = current_player.duration
+          time_label.set_text(f"{total:.1f} / {total:.1f}s (完毕)")
+        ui.timer(0.1, lambda: asyncio.ensure_future(_do_stop()), once=True)
+
+      callback_refs["stop_fn"] = on_auto_stop
+
+      current_player.on_danmaku(on_danmaku)
+      current_studio.on_pre_response(on_pre_response)
+      current_studio.on_response_chunk(on_chunk)
+      current_studio.on_response(on_response)
+      current_studio.on_stop(on_auto_stop)
 
     def _cleanup_callbacks():
+      bound_player = callback_refs.get("bound_player")
+      bound_studio = callback_refs.get("bound_studio")
+
       fn = callback_refs.get("danmaku_fn")
-      if fn and fn in player._on_danmaku_callbacks:
-        player._on_danmaku_callbacks.remove(fn)
+      if fn and bound_player and fn in bound_player._on_danmaku_callbacks:
+        bound_player._on_danmaku_callbacks.remove(fn)
       callback_refs["danmaku_fn"] = None
 
       fn = callback_refs.get("pre_fn")
-      if fn and fn in studio._pre_response_callbacks:
-        studio._pre_response_callbacks.remove(fn)
+      if fn and bound_studio and fn in bound_studio._pre_response_callbacks:
+        bound_studio._pre_response_callbacks.remove(fn)
       callback_refs["pre_fn"] = None
 
       fn = callback_refs.get("chunk_fn")
-      if fn:
-        studio.remove_chunk_callback(fn)
+      if fn and bound_studio:
+        bound_studio.remove_chunk_callback(fn)
       callback_refs["chunk_fn"] = None
 
       fn = callback_refs.get("response_fn")
-      if fn:
-        studio.remove_callback(fn)
+      if fn and bound_studio:
+        bound_studio.remove_callback(fn)
       callback_refs["response_fn"] = None
 
+      fn = callback_refs.get("stop_fn")
+      if fn and bound_studio:
+        bound_studio.remove_stop_callback(fn)
+      callback_refs["stop_fn"] = None
+
+      callback_refs["bound_player"] = None
+      callback_refs["bound_studio"] = None
       streaming_labels.clear()
 
     context.client.on_disconnect(_cleanup_callbacks)
@@ -400,6 +547,8 @@ def main():
     # ── 进度条定时器 ──
 
     def update_progress():
+      player = _current_player()
+      studio = _current_studio()
       if not studio.is_running:
         return
       current = player.current_sec

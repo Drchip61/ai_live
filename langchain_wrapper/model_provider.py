@@ -22,6 +22,8 @@ class ModelType(Enum):
 
 # Anthropic 默认大模型（统一单一来源，避免多处硬编码不一致）
 DEFAULT_ANTHROPIC_LARGE = "claude-sonnet-4-6"
+# Anthropic 默认小模型（使用无日期别名，便于平滑升级）
+DEFAULT_ANTHROPIC_SMALL = "claude-haiku-4-5"
 
 
 # 预设远程模型名称映射
@@ -32,7 +34,7 @@ REMOTE_MODELS = {
   },
   ModelType.ANTHROPIC: {
     "large": DEFAULT_ANTHROPIC_LARGE,
-    "small": "claude-haiku-4-5-20251001",
+    "small": DEFAULT_ANTHROPIC_SMALL,
   },
   ModelType.GEMINI: {
     "large": "gemini-3-flash",
