@@ -103,6 +103,15 @@ class PromptLoader:
     """
     return self.load("base_instruction.txt")
 
+  def get_security_instruction(self) -> str:
+    """
+    获取安全与抗注入指令
+
+    Returns:
+      安全指令内容
+    """
+    return self.load("security/anti_injection.txt")
+
   def get_full_system_prompt(self, persona: str) -> str:
     """
     获取完整的系统提示词（基础指令 + 角色提示词）
@@ -116,8 +125,9 @@ class PromptLoader:
       完整的系统提示词
     """
     base = self.get_base_instruction()
+    security = self.get_security_instruction()
     persona_prompt = self._persona_loader.get_system_prompt(persona)
-    return f"{base}\n\n{persona_prompt}"
+    return f"{base}\n\n{security}\n\n{persona_prompt}"
 
   def list_personas(self) -> list[str]:
     """

@@ -197,8 +197,12 @@ class ReplyDecider:
     if silence_seconds < self.config.proactive_silence_threshold:
       return ReplyDecision(False, 0, "沉默时间不足", "rule")
 
-    if not current_scene or not prev_scene:
+    if not current_scene:
       return ReplyDecision(False, 0, "无场景信息", "rule")
+
+    # 没有上一帧基线时，允许在沉默阈值后先主动开场一次
+    if not prev_scene:
+      return ReplyDecision(True, 6, "沉默已久，基于当前画面主动开场", "rule")
 
     if current_scene == prev_scene:
       return ReplyDecision(False, 0, "场景无变化", "rule")

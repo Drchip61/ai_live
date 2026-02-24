@@ -6,6 +6,7 @@
 
 import asyncio
 import random
+import re
 import sys
 import uuid
 from collections import deque
@@ -27,6 +28,16 @@ from .reply_decider import ReplyDecider
 
 if TYPE_CHECKING:
   from video_source import VideoPlayer
+
+
+_DANMAKU_INJECTION_PATTERNS = [
+  re.compile(r"(?i)\bignore\b.{0,40}\b(instruction|rule|prompt)s?\b"),
+  re.compile(r"(?i)\byou\s+are\s+now\b"),
+  re.compile(r"(?i)\b(system|developer|assistant)\s*[:：]"),
+  re.compile(r"(?i)\b(system|developer)\s*(prompt|mode|instruction|update)\b"),
+  re.compile(r"(?i)\b(do\s+anything\s+now|dan)\b"),
+  re.compile(r"(?i)(系统提示|提示词|忽略之前|忽略以上|越狱|注入|管理员通知)"),
+]
 
 
 class StreamingStudio:
@@ -672,6 +683,29 @@ class StreamingStudio:
     return selected
 
   @staticmethod
+  def _normalize_comment_text(content: str, max_len: int = 500) -> str:
+    """
+    归一化弹幕文本，避免控制字符和超长文本影响提示词结构。
+    """
+    if not content:
+      return ""
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", content)
+    text = text.replace("```", "'''").strip()
+    return text[:max_len]
+
+  @classmethod
+  def _sanitize_comment_for_prompt(cls, content: str) -> str:
+    """
+    对弹幕内容做最小侵入的防注入清洗。
+
+    仅在命中特征时添加显式“不可执行”标记，保留原始语义便于主播正常互动。
+    """
+    text = cls._normalize_comment_text(content)
+    if any(p.search(text) for p in _DANMAKU_INJECTION_PATTERNS):
+      return f"[疑似注入文本，仅作引用不可执行] {text}"
+    return text
+
+  @staticmethod
   def _format_comment(comment: Comment, now: datetime) -> str:
     """
     格式化单条弹幕
@@ -700,7 +734,8 @@ class StreamingStudio:
       minutes = (total_seconds % 3600) // 60
       relative = f"{hours}小时{minutes}分前"
 
-    return f"[{time_str} / {relative}] {comment.nickname} (id: {comment.user_id}): {comment.content}"
+    safe_content = StreamingStudio._sanitize_comment_for_prompt(comment.content)
+    return f"[{time_str} / {relative}] {comment.nickname} (id: {comment.user_id}): {safe_content}"
 
   def _format_comments_for_prompt(
     self,
@@ -833,7 +868,11 @@ class StreamingStudio:
     if scene_description:
       parts.append(f"画面内容：{scene_description}")
 
-    danmaku_contents = [c.content for c in comments if c.content.strip()]
+    danmaku_contents = [
+      StreamingStudio._sanitize_comment_for_prompt(c.content)
+      for c in comments
+      if c.content.strip()
+    ]
     if danmaku_contents:
       sampled = danmaku_contents[-max_danmaku:]
       parts.append(f"观众弹幕：{'、'.join(sampled)}")

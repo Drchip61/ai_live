@@ -66,8 +66,8 @@ class ReplyDeciderConfig:
   )
   """这些模式如果覆盖所有弹幕则建议跳过"""
 
-  proactive_silence_threshold: float = 30.0
-  """沉默超过此秒数后，若画面有重大变化则主动发言"""
+  proactive_silence_threshold: float = 10.0
+  """沉默超过此秒数后主动发言（优先基于画面变化判断）"""
 
   llm_judge_urgency_threshold: float = 4.0
   """LLM 精判返回 urgency 低于此值时跳过回复"""
