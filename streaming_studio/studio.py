@@ -140,8 +140,10 @@ class StreamingStudio:
     self._comment_arrived: Optional[asyncio.Event] = None
     self._pending_comment_count: int = 0
 
-    # 上次回复时间（用于区分新旧弹幕）
+    # 上次回复完成时间（用于沉默时长等节奏判断）
     self._last_reply_time: Optional[datetime] = None
+    # 上次进入回复生成的起始时间（用于区分新旧弹幕）
+    self._last_collect_time: Optional[datetime] = None
 
     # 最近一次发给模型的完整 prompt（供调试监控）
     self._last_prompt: Optional[str] = None
@@ -328,6 +330,8 @@ class StreamingStudio:
 
     self._running = True
     self._stream_start_time = datetime.now()
+    self._last_reply_time = None
+    self._last_collect_time = None
 
     # 在当前事件循环中创建 Event（Python 3.9 兼容）
     self._comment_arrived = asyncio.Event()
@@ -477,6 +481,10 @@ class StreamingStudio:
         if self._current_frame_b64:
           images = [self._current_frame_b64]
 
+        # 以“开始生成回复”的时间作为新旧弹幕分界，
+        # 这样回复期间到达的新弹幕会在下一轮继续作为新弹幕处理。
+        reply_started_at = datetime.now()
+
         if self.enable_streaming:
           response = await self._generate_response_streaming(
             old_comments, new_comments, images=images,
@@ -501,6 +509,7 @@ class StreamingStudio:
             except Exception as e:
               print(f"回调执行错误: {e}")
 
+          self._last_collect_time = reply_started_at
           self._last_reply_time = datetime.now()
 
           # 回复后分析（fire-and-forget）
@@ -562,7 +571,7 @@ class StreamingStudio:
 
   def _collect_comments(self) -> tuple[list[Comment], list[Comment]]:
     """
-    从缓冲区收集最近弹幕，按上次回复时间分割为旧弹幕和新弹幕
+    从缓冲区收集最近弹幕，按“上次开始回复时间”分割为旧弹幕和新弹幕
 
     实际弹幕上限 = min(recent_comments_limit, 新弹幕数 * new_comment_context_ratio)
 
@@ -581,11 +590,11 @@ class StreamingStudio:
         recent.append(c)
         recent_ids.add(c.id)
 
-    if self._last_reply_time is None:
+    if self._last_collect_time is None:
       return [], recent
 
-    old = [c for c in recent if c.timestamp < self._last_reply_time]
-    new = [c for c in recent if c.timestamp >= self._last_reply_time]
+    old = [c for c in recent if c.timestamp < self._last_collect_time]
+    new = [c for c in recent if c.timestamp >= self._last_collect_time]
 
     # 优先弹幕：无论时间戳如何，始终归入新弹幕
     promoted = [c for c in old if c.priority]
