@@ -128,16 +128,19 @@ def main():
 
   async def _mjpeg_generator():
     interval = 1.0 / max(player.display_fps, 1)
-    while _mjpeg_state["running"]:
-      data = _mjpeg_state["jpeg_bytes"]
-      if data:
-        yield (
-          b"--frame\r\n"
-          b"Content-Type: image/jpeg\r\n\r\n"
-          + data
-          + b"\r\n"
-        )
-      await asyncio.sleep(interval)
+    while True:
+      if _mjpeg_state["running"]:
+        data = _mjpeg_state["jpeg_bytes"]
+        if data:
+          yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n"
+            + data
+            + b"\r\n"
+          )
+          await asyncio.sleep(interval)
+          continue
+      await asyncio.sleep(0.2)
 
   @app.get("/video-stream")
   async def video_stream_route():
