@@ -199,6 +199,54 @@ def main():
     def _current_studio() -> StreamingStudio:
       return runtime["studio"]
 
+    def _list_local_files(suffixes: tuple[str, ...]) -> list[str]:
+      """列出 data/ 下可选文件（返回项目相对路径）"""
+      data_dir = project_root / "data"
+      if not data_dir.exists():
+        return []
+      items: list[str] = []
+      suffix_set = {s.lower() for s in suffixes}
+      for path in data_dir.rglob("*"):
+        if path.is_file() and path.suffix.lower() in suffix_set:
+          try:
+            items.append(str(path.relative_to(project_root)))
+          except ValueError:
+            items.append(str(path))
+      items.sort()
+      return items
+
+    def _open_source_picker(
+      title: str,
+      suffixes: tuple[str, ...],
+      target_input: ui.input,
+    ) -> None:
+      """打开本地文件选择对话框（用于视频/弹幕换源）"""
+      options = _list_local_files(suffixes)
+      if not options:
+        ui.notify("data/ 目录下没有可选文件，请先下载数据", type="warning")
+        return
+
+      dialog = ui.dialog()
+      with dialog, ui.card().classes("w-[56rem] max-w-[95vw]"):
+        ui.label(title).classes("text-base font-bold")
+        picker = ui.select(
+          options=options,
+          value=options[0],
+        ).props("dense outlined use-input fill-input")
+        picker.classes("w-full")
+
+        with ui.row().classes("w-full justify-end gap-2"):
+          ui.button("取消", on_click=dialog.close).props("flat")
+
+          def _confirm():
+            if picker.value:
+              target_input.value = str(picker.value)
+            dialog.close()
+
+          ui.button("选择", on_click=_confirm).props("color=primary")
+
+      dialog.open()
+
     # ── 顶部控制栏 ──
     with ui.row().classes(
       "w-full items-center gap-4 px-4 py-2 bg-gray-100 shrink-0"
@@ -242,12 +290,30 @@ def main():
     with ui.row().classes(
       "w-full items-center gap-2 px-4 pb-2 bg-gray-100 shrink-0"
     ):
-      video_input = ui.input(label="视频路径").props("dense outlined").classes("flex-1")
+      with ui.row().classes("flex-1 items-center gap-2"):
+        video_input = ui.input(label="视频路径").props("dense outlined").classes("flex-1")
+        ui.button(
+          "选择视频",
+          on_click=lambda: _open_source_picker(
+            "选择视频文件",
+            (".mp4", ".mkv", ".flv", ".webm"),
+            video_input,
+          ),
+        ).props("dense")
       video_input.value = runtime["video_path"]
 
-      danmaku_input = ui.input(
-        label="弹幕XML路径（可空）"
-      ).props("dense outlined").classes("flex-1")
+      with ui.row().classes("flex-1 items-center gap-2"):
+        danmaku_input = ui.input(
+          label="弹幕XML路径（可空）"
+        ).props("dense outlined").classes("flex-1")
+        ui.button(
+          "选择弹幕",
+          on_click=lambda: _open_source_picker(
+            "选择弹幕 XML 文件",
+            (".xml",),
+            danmaku_input,
+          ),
+        ).props("dense")
       danmaku_input.value = runtime["danmaku_path"] or ""
 
       async def on_switch_source():
@@ -287,6 +353,24 @@ def main():
           if old_studio.is_running:
             await old_studio.stop()
 
+          # 切换源视为“重启新会话”：清理运行期状态，避免记忆串场
+          old_studio.llm_wrapper.clear_history()
+          old_studio._comment_buffer.clear()
+          old_studio._response_queue = asyncio.Queue()
+          old_studio._last_collect_time = None
+          old_studio._last_reply_time = None
+          old_studio._last_prompt = None
+          old_studio._prev_scene_description = None
+          old_studio._pending_comment_count = 0
+          old_studio._current_frame_b64 = None
+          old_studio._last_used_timing = None
+
+          mem_mgr = old_studio.llm_wrapper.memory_manager
+          if mem_mgr is not None:
+            mem_mgr.clear_runtime_state(clear_summary=True)
+
+          _clear_ui_state()
+
           new_runtime = _build_runtime(normalized_video, normalized_danmaku)
           runtime.update(new_runtime)
 
@@ -297,7 +381,7 @@ def main():
           time_label.set_text(f"0.0 / {_current_player().duration:.1f}s")
           _add_console_block(
             (
-              f"[系统] 已切换视频源\n"
+              f"[系统] 已切换视频源（会话已重置）\n"
               f"视频: {runtime['video_path']}\n"
               f"弹幕: {runtime['danmaku_path'] or '无'}"
             ),
@@ -400,6 +484,25 @@ def main():
       with console_column:
         ui.label(text).classes(classes)
       console_scroll.scroll_to(percent=1.0)
+
+    def _clear_ui_state() -> None:
+      """清空页面状态（用于切源时模拟重启）"""
+      for entry in danmaku_entries:
+        try:
+          entry.delete()
+        except Exception:
+          pass
+      danmaku_entries.clear()
+
+      for lbl in streaming_labels.values():
+        try:
+          lbl.delete()
+        except Exception:
+          pass
+      streaming_labels.clear()
+
+      streamed_ids.clear()
+      terminal_state["active_response_id"] = None
 
     # ── 回调函数 ──
 

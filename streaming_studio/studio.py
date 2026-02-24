@@ -101,7 +101,6 @@ class StreamingStudio:
       memory_manager = None
       if enable_memory:
         from memory import MemoryManager, MemoryConfig
-        from langchain_wrapper.model_provider import ModelProvider
         summary_model = ModelProvider.remote_small(provider=model_type)
         memory_manager = MemoryManager(
           persona=persona,
