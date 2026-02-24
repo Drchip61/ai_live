@@ -115,7 +115,7 @@ python run_vlm_demo.py \
 | `--video` | (必填) | 视频文件路径 |
 | `--danmaku` | 无 | 弹幕 XML 路径（不提供则只看画面） |
 | `--persona` | karin | 主播人设：`karin`(元气偶像) / `sage`(知性学者) / `kuro`(酷酷游戏主播) |
-| `--model` | anthropic | 模型提供者：`anthropic` / `openai` |
+| `--model` | anthropic | 模型提供者：`anthropic` / `openai` / `gemini` |
 | `--model-name` | 自动 | 指定模型名称（默认 Sonnet） |
 | `--speed` | 1.0 | 播放倍速（4.0 = 四倍速） |
 | `--frame-interval` | 5.0 | 帧采样间隔秒数（越大越省 token） |
@@ -123,6 +123,38 @@ python run_vlm_demo.py \
 | `--no-memory` | false | 禁用记忆系统 |
 | `--global-memory` | false | 开启全局记忆（持久化到磁盘，跨会话保留） |
 | `--topic-manager` | false | 启用话题管理器 |
+
+### 无弹幕模式（只看画面）
+
+不传 `--danmaku` 即可进入“仅画面”模式，适合验证无新弹幕时的主动发言逻辑：
+
+```bash
+python -u run_vlm_demo.py \
+  --video "data/你的视频.mp4" \
+  --persona kuro \
+  --model anthropic \
+  --speed 8 \
+  --frame-interval 2
+```
+
+说明：
+- 终端会显示 `弹幕: 无`。
+- 沉默超过阈值后，系统会基于当前直播画面触发主动发言。
+- 当本轮没有新弹幕时，不会把 FIFO 里旧弹幕当作回复目标（`priority` 弹幕除外）。
+
+### 常见问题：场景理解 403
+
+若日志出现：
+
+```text
+场景理解调用失败: Error code: 403 - {'error': {'type': 'forbidden', 'message': 'Request not allowed'}}
+```
+
+通常表示上游模型服务拒绝了该请求（常见于账号权限、模型白名单或策略限制），不是本地弹幕队列逻辑错误。可按以下步骤排查：
+
+1. 检查当前 API Key 所在项目是否开通了对应模型和图像输入能力。
+2. 切换 `--model`（如 `openai` / `gemini`）或显式指定可用 `--model-name` 再测试。
+3. 确认没有额外网关策略拦截该请求。
 
 ## 其他运行方式
 
