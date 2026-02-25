@@ -15,3 +15,5 @@ sentence-transformers
 coolname
 nicegui
 opencv-python
+requests
+yt-dlp

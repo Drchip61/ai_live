@@ -109,6 +109,8 @@ def download_video_ytdlp(url: str, output_dir: Path, filename: str) -> Path:
     "--merge-output-format", "mp4",
     "--output", output_template,
     "--no-playlist",
+    "--referer", "https://www.bilibili.com/",
+    "--user-agent", HEADERS["User-Agent"],
     url,
   ]
 
