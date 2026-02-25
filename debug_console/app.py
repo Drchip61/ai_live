@@ -17,6 +17,7 @@ if str(project_root) not in sys.path:
 from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio
 
+from .comment_broadcaster import CommentBroadcaster
 from .state_collector import StateCollector
 from .pages.monitor import create_monitor_page
 from .pages.chat import create_chat_page
@@ -52,18 +53,19 @@ def run(
   )
   studio.enable_streaming = True
   collector = StateCollector(studio)
+  broadcaster = CommentBroadcaster()
 
   @ui.page("/")
   def index():
-    _build_page(studio, collector, default_tab="monitor")
+    _build_page(studio, collector, broadcaster, default_tab="monitor")
 
   @ui.page("/monitor")
   def monitor():
-    _build_page(studio, collector, default_tab="monitor")
+    _build_page(studio, collector, broadcaster, default_tab="monitor")
 
   @ui.page("/chat")
   def chat():
-    _build_page(studio, collector, default_tab="chat")
+    _build_page(studio, collector, broadcaster, default_tab="chat")
 
   ui.run(
     title="调试控制台 — mio-streaming-demo",
@@ -75,6 +77,7 @@ def run(
 def _build_page(
   studio: StreamingStudio,
   collector: StateCollector,
+  broadcaster: CommentBroadcaster,
   default_tab: str = "monitor",
 ) -> None:
   """
@@ -83,6 +86,7 @@ def _build_page(
   Args:
     studio: 直播间实例
     collector: 状态收集器
+    broadcaster: 弹幕广播器
     default_tab: 默认激活的标签页
   """
   # 顶部菜单栏
@@ -99,4 +103,4 @@ def _build_page(
     with ui.tab_panel("monitor"):
       create_monitor_page(collector)
     with ui.tab_panel("chat"):
-      create_chat_page(studio)
+      create_chat_page(studio, broadcaster)

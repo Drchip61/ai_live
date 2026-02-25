@@ -11,6 +11,7 @@ from coolname import generate
 from nicegui import ui, context
 
 from debug_console.auto_viewer import AutoViewer
+from debug_console.comment_broadcaster import CommentBroadcaster
 from streaming_studio import StreamingStudio, Comment
 from streaming_studio.models import ResponseChunk
 
@@ -28,12 +29,13 @@ def _random_identity() -> tuple[str, str]:
   return user_id, nickname
 
 
-def create_chat_page(studio: StreamingStudio) -> None:
+def create_chat_page(studio: StreamingStudio, broadcaster: CommentBroadcaster) -> None:
   """
   构建模拟直播间 UI（左右分栏）
 
   Args:
     studio: 直播间实例
+    broadcaster: 弹幕广播器（跨客户端同步弹幕显示）
   """
   # 页面局部状态
   state = {
@@ -191,14 +193,13 @@ def create_chat_page(studio: StreamingStudio) -> None:
               user_id = state["user_id"] or "test_user"
               nickname = state["nickname"] or "测试用户"
 
-            now = datetime.now()
             comment = Comment(
               user_id=user_id,
               nickname=nickname,
               content=content,
             )
             studio.send_comment(comment)
-            _add_comment_bubble(nickname, content, now.strftime("%H:%M:%S"))
+            broadcaster.broadcast(comment)
 
             msg_input.value = ""
 
@@ -273,22 +274,26 @@ def create_chat_page(studio: StreamingStudio) -> None:
   callback_ref["chunk_fn"] = on_chunk
   studio.on_response_chunk(on_chunk)
 
-  # ── 自动观众弹幕显示回调 ──
+  # ── 弹幕广播回调注册 ──
 
-  def on_auto_comment(comment: Comment):
-    """自动观众弹幕 → 显示到右栏"""
+  def on_broadcast_comment(comment: Comment):
+    """广播弹幕 → 显示到本客户端右栏"""
     _add_comment_bubble(
       comment.nickname,
       comment.content,
       comment.timestamp.strftime("%H:%M:%S"),
     )
 
-  auto_viewer.on_comment(on_auto_comment)
+  broadcaster.register(on_broadcast_comment)
+
+  # 自动观众弹幕也通过广播器同步到所有客户端
+  auto_viewer.on_comment(broadcaster.broadcast)
 
   # ── 清理 ──
 
   def cleanup():
-    auto_viewer.remove_comment_callback(on_auto_comment)
+    broadcaster.unregister(on_broadcast_comment)
+    auto_viewer.remove_comment_callback(broadcaster.broadcast)
     if auto_viewer.is_running:
       import asyncio
       asyncio.create_task(auto_viewer.stop())
