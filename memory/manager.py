@@ -239,6 +239,28 @@ class MemoryManager:
     self._summary_task = None
     self._cleanup_task = None
 
+  def clear_runtime_state(self, clear_summary: bool = True) -> None:
+    """
+    清空运行期记忆状态（用于“重开一局”场景）
+
+    会清空：
+    - active 层
+    - temporary 层
+    - 最近交互缓冲
+    - （可选）summary 层
+
+    不会清空 static 层（角色固定记忆）。
+
+    Args:
+      clear_summary: 是否同时清空 summary 层，默认 True
+    """
+    self._active.clear()
+    self._temporary.clear()
+    if clear_summary:
+      self._summary_layer.clear()
+    self._recent_interactions.clear()
+    logger.info("已清空运行期记忆状态 (clear_summary=%s)", clear_summary)
+
   def debug_state(self) -> dict:
     """
     获取调试状态快照（供监控面板使用）

@@ -103,7 +103,7 @@ python run_vlm_demo.py \
   --danmaku "data/你的弹幕.xml" \
   --persona kuro \
   --model anthropic \
-  --model-name claude-sonnet-4-5-20250929 \
+  --model-name claude-sonnet-4-6 \
   --speed 4.0 \
   --frame-interval 10
 ```
