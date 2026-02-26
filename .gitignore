@@ -27,6 +27,8 @@ data/*.mkv
 data/*.flv
 data/*.m4a
 data/*.webm
+# 弹幕文件也不要上传，没有对应的视频文件本来就没意义
+data/*.xml
 
 # Chroma DB (local vector store)
 chroma_data/
