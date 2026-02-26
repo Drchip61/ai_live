@@ -6,6 +6,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Union
 
 from langchain_core.language_models import BaseChatModel
@@ -18,6 +19,8 @@ from .layers.active import ActiveLayer
 from .layers.temporary import TemporaryLayer
 from .layers.summary import SummaryLayer
 from .layers.static import StaticLayer
+from .layers.user_profile import UserProfileLayer
+from .layers.character_profile import CharacterProfileLayer
 from .retriever import MemoryRetriever
 from .prompts import INTERACTION_SUMMARY_PROMPT, PERIODIC_SUMMARY_PROMPT
 
@@ -98,6 +101,22 @@ class MemoryManager:
     )
     self._static.load()
 
+    # 用户画像层（可选）
+    self._user_profile: Optional[UserProfileLayer] = None
+    if config.user_profile.enabled:
+      persist_path = None
+      if enable_global_memory and config.embedding.persist_directory:
+        persist_path = Path(config.embedding.persist_directory) / config.user_profile.persist_filename
+      self._user_profile = UserProfileLayer(persist_path=persist_path)
+
+    # 角色设定档层（可选）
+    self._character_profile: Optional[CharacterProfileLayer] = None
+    if config.character_profile.enabled:
+      persist_path = None
+      if enable_global_memory and config.embedding.persist_directory:
+        persist_path = Path(config.embedding.persist_directory) / config.character_profile.persist_filename
+      self._character_profile = CharacterProfileLayer(persist_path=persist_path)
+
     # 当前会话 ID（由 studio 在 start() 时设置）
     self._session_id: Optional[str] = None
 
@@ -120,6 +139,14 @@ class MemoryManager:
 
     # 近期交互缓冲（供定时汇总使用）
     self._recent_interactions: list[tuple[str, str, datetime]] = []
+
+  @property
+  def user_profile(self) -> Optional[UserProfileLayer]:
+    return self._user_profile
+
+  @property
+  def character_profile(self) -> Optional[CharacterProfileLayer]:
+    return self._character_profile
 
   @property
   def embeddings(self) -> HuggingFaceEmbeddings:
@@ -265,6 +292,7 @@ class MemoryManager:
     if clear_summary:
       self._summary_layer.clear()
     self._recent_interactions.clear()
+    # 注意：user_profile 和 character_profile 不随运行期清空（它们是跨会话的）
     logger.info("已清空运行期记忆状态 (clear_summary=%s)", clear_summary)
 
   def debug_state(self) -> dict:
@@ -323,7 +351,7 @@ class MemoryManager:
     except Exception as e:
       logger.debug("读取 static 层记忆失败: %s", e)
 
-    return {
+    result = {
       "active_count": self._active.count(),
       "active_capacity": self._active._config.capacity,
       "active_memories": [
@@ -344,6 +372,13 @@ class MemoryManager:
       "summary_task_running": self._summary_task is not None and not self._summary_task.done(),
       "cleanup_task_running": self._cleanup_task is not None and not self._cleanup_task.done(),
     }
+
+    if self._user_profile is not None:
+      result["user_profile"] = self._user_profile.debug_state()
+    if self._character_profile is not None:
+      result["character_profile"] = self._character_profile.debug_state()
+
+    return result
 
   async def _summary_loop(self) -> None:
     """

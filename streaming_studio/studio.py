@@ -104,19 +104,44 @@ class StreamingStudio:
       memory_manager = None
       if enable_memory:
         from memory import MemoryManager, MemoryConfig
+        from memory.config import UserProfileConfig, CharacterProfileConfig
         summary_model = ModelProvider.remote_small(provider=model_type)
+        is_naixiong = persona.lower() == "naixiong"
+        mem_config = MemoryConfig(
+          user_profile=UserProfileConfig(enabled=is_naixiong),
+          character_profile=CharacterProfileConfig(enabled=is_naixiong),
+        )
         memory_manager = MemoryManager(
           persona=persona,
-          config=MemoryConfig(),
+          config=mem_config,
           summary_model=summary_model,
           enable_global_memory=enable_global_memory,
         )
+
+      # 奶凶角色专用模块
+      emotion_machine = None
+      affection_bank = None
+      meme_manager = None
+      response_checker = None
+      if persona.lower() == "naixiong":
+        from emotion import EmotionMachine, AffectionBank
+        from meme import MemeManager as MemeManagerCls
+        from validation import ResponseChecker
+        emotion_machine = EmotionMachine()
+        affection_bank = AffectionBank()
+        seed_memes = Path(__file__).resolve().parent.parent / "personas" / "naixiong" / "seed_memes.json"
+        meme_manager = MemeManagerCls(seed_path=seed_memes)
+        response_checker = ResponseChecker()
 
       self.llm_wrapper = LLMWrapper(
         model_type=model_type,
         model_name=model_name,
         persona=persona,
         memory_manager=memory_manager,
+        emotion_machine=emotion_machine,
+        affection_bank=affection_bank,
+        meme_manager=meme_manager,
+        response_checker=response_checker,
       )
 
     # 数据库：全局记忆关闭时使用内存数据库
@@ -200,6 +225,20 @@ class StreamingStudio:
       self._comment_clusterer = CommentClusterer(
         config=cc_config,
         embeddings=cc_embeddings,
+      )
+
+    # 表情动作语义映射器
+    self._expression_mapper = None
+    mapping_file = Path(__file__).resolve().parent.parent.parent / "expression_motion_mapping.json"
+    if mapping_file.exists():
+      from expression_mapper import ExpressionMotionMapper
+      shared_embeddings = None
+      mem = self.llm_wrapper.memory_manager
+      if mem is not None:
+        shared_embeddings = getattr(mem, "embeddings", None)
+      self._expression_mapper = ExpressionMotionMapper(
+        mapping_path=mapping_file,
+        embeddings=shared_embeddings,
       )
 
     # 最近一次聚类结果（供 debug_state 和 prompt 格式化使用）
@@ -500,6 +539,9 @@ class StreamingStudio:
           except Exception as e:
             print(f"pre_response 回调错误: {e}")
 
+        # 奶凶系统：情绪检测（在生成回复前更新情绪状态）
+        self._detect_emotion_from_comments(new_comments)
+
         # 收集当前帧图片（VLM 模式）
         images = None
         if self._current_frame_b64:
@@ -535,6 +577,9 @@ class StreamingStudio:
 
           self._last_collect_time = reply_started_at
           self._last_reply_time = datetime.now()
+
+          # 奶凶系统：好感度更新
+          self._update_affection_from_comments(new_comments, response.content)
 
           # 回复后分析（fire-and-forget）
           if self._topic_manager:
@@ -598,7 +643,47 @@ class StreamingStudio:
         print(f"[话题管理器] 主动推进话题: 「{topic.title}」 (沉默 {int(silence)}秒)")
         return True
 
+    # 路径 3: 奶凶角色情绪跟进 — 长沉默触发真情流露或赌气
+    emotion = self.llm_wrapper._emotion
+    if emotion is not None and silence > min_silence * 2:
+      from emotion.state import Mood
+      if emotion.mood == Mood.NORMAL:
+        emotion.transition(Mood.SOFT, f"观众沉默{int(silence)}秒未说话")
+        print(f"[奶凶] 主动发言(真情流露): 沉默 {int(silence)}秒")
+        return True
+
     return False
+
+  def _detect_emotion_from_comments(self, comments: list[Comment]) -> None:
+    """分析弹幕，触发情绪状态转换（奶凶专用）"""
+    emotion = self.llm_wrapper._emotion
+    if emotion is None:
+      return
+    from emotion.detector import EmotionTriggerDetector
+    detector = EmotionTriggerDetector()
+    for c in comments:
+      result = detector.detect(c.content, emotion.mood)
+      if result:
+        target_mood, trigger = result
+        emotion.transition(target_mood, trigger)
+        break
+
+  def _update_affection_from_comments(
+    self,
+    comments: list[Comment],
+    ai_response: str,
+  ) -> None:
+    """处理好感度更新（奶凶专用）"""
+    affection = self.llm_wrapper._affection
+    if affection is None:
+      return
+    meme_mgr = self.llm_wrapper._meme_manager
+    for c in comments:
+      meme_caught = False
+      if meme_mgr:
+        relevant = meme_mgr.find_relevant(c.content)
+        meme_caught = len(relevant) > 0
+      affection.process_interaction(c.content, ai_response, meme_caught=meme_caught)
 
   def _collect_comments(self) -> tuple[list[Comment], list[Comment]]:
     """
@@ -1030,7 +1115,7 @@ class StreamingStudio:
       return None
 
     reply_ids = tuple(c.id for c in new_comments)
-    return StreamerResponse(content=content, reply_to=reply_ids)
+    return self._build_response(content, reply_ids)
 
   async def _generate_response_streaming(
     self,
@@ -1116,11 +1201,14 @@ class StreamingStudio:
           except Exception as e:
             print(f"chunk 回调错误: {e}")
 
-      # 发送完成标记
+      # 流式结束后：对完整文本做表情/动作映射，替换标签
+      display_text, em_tags = self._apply_expression_mapping(accumulated)
+
+      # 发送完成标记（携带映射后文本，GUI 会用它刷新最终显示）
       done_chunk = ResponseChunk(
         response_id=response_id,
         chunk="",
-        accumulated=accumulated,
+        accumulated=display_text,
         done=True,
       )
       for cb in list(self._chunk_callbacks):
@@ -1145,11 +1233,51 @@ class StreamingStudio:
           pass
       return None
 
-    return StreamerResponse(
-      id=response_id,
-      content=accumulated,
-      reply_to=reply_ids,
-    )
+    kwargs: dict = {
+      "content": display_text,
+      "reply_to": reply_ids,
+      "id": response_id,
+      "mapped_content": display_text if em_tags else None,
+      "expression_motion_tags": em_tags,
+    }
+    return StreamerResponse(**kwargs)
+
+  def _apply_expression_mapping(self, text: str) -> tuple[str, tuple]:
+    """对文本做表情/动作语义映射，返回 (映射后文本, 标签元组)"""
+    if self._expression_mapper is None:
+      return text, ()
+    try:
+      result = self._expression_mapper.map_response(text)
+      tags = tuple(result.tags)
+      if tags:
+        preview = ", ".join(
+          f"{t.original_action}→{t.mapped_motion} / {t.original_emotion}→{t.mapped_expression}"
+          for t in tags[:3]
+        )
+        print(f"[表情映射] {preview}")
+      return result.mapped_text, tags
+    except Exception as e:
+      print(f"表情动作映射失败: {e}")
+      return text, ()
+
+  def _build_response(
+    self,
+    content: str,
+    reply_ids: tuple[str, ...],
+    response_id: Optional[str] = None,
+  ) -> StreamerResponse:
+    """统一构建 StreamerResponse（非流式路径），content 直接使用映射后文本"""
+    display_text, em_tags = self._apply_expression_mapping(content)
+
+    kwargs: dict = {
+      "content": display_text,
+      "reply_to": reply_ids,
+      "mapped_content": display_text if em_tags else None,
+      "expression_motion_tags": em_tags,
+    }
+    if response_id is not None:
+      kwargs["id"] = response_id
+    return StreamerResponse(**kwargs)
 
   def _format_cluster_debug(self) -> Optional[dict]:
     """最近一次聚类结果的调试摘要"""

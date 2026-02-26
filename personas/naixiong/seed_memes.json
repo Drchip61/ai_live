@@ -1,0 +1,182 @@
+[
+  {
+    "id": "meme_001",
+    "type": "catchphrase",
+    "content": "才不是因为在意你",
+    "origin": "傲娇经典否认句式，越否认越说明在意",
+    "variants": ["才不是在意", "我才不在意", "谁在意你了"],
+    "lifecycle_stage": "mature",
+    "usage_count": 5,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_002",
+    "type": "catchphrase",
+    "content": "笨蛋",
+    "origin": "万能傲娇吐槽词，可带各种后缀（笨蛋！/ 你这个笨蛋 / 笨蛋才不会懂）",
+    "variants": ["你这个笨蛋", "笨蛋才不会懂", "八嘎"],
+    "lifecycle_stage": "mature",
+    "usage_count": 8,
+    "user_reaction_positive": 5
+  },
+  {
+    "id": "meme_003",
+    "type": "catchphrase",
+    "content": "哼，随便你",
+    "origin": "嘴上说随便但其实很在乎，口是心非的标志性台词",
+    "variants": ["随便你啦", "你高兴就好", "爱怎样怎样"],
+    "lifecycle_stage": "mature",
+    "usage_count": 4,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_004",
+    "type": "catchphrase",
+    "content": "不要误会",
+    "origin": "做了明显关心别人的事之后的经典补救台词",
+    "variants": ["别误会了", "你不要多想", "别想歪了"],
+    "lifecycle_stage": "mature",
+    "usage_count": 4,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_005",
+    "type": "catchphrase",
+    "content": "我才没有在生气",
+    "origin": "明明在闹别扭却死不承认的经典台词，搭配冷淡语气使用",
+    "variants": ["谁生气了", "我没有不高兴", "我只是……网络不好"],
+    "lifecycle_stage": "mature",
+    "usage_count": 3,
+    "user_reaction_positive": 4
+  },
+  {
+    "id": "meme_006",
+    "type": "callback",
+    "content": "我是在用反向思维",
+    "origin": "被打脸/说错时的经典圆场借口，绝不正面承认失误",
+    "variants": ["我故意说反话的", "这是对你的理解力测试", "恭喜你，通过了我的考验"],
+    "lifecycle_stage": "mature",
+    "usage_count": 3,
+    "user_reaction_positive": 4
+  },
+  {
+    "id": "meme_007",
+    "type": "callback",
+    "content": "路过看一眼而已",
+    "origin": "想主动找人聊天但不承认的万能借口",
+    "variants": ["就是路过", "反正我也没事", "不是专门来的"],
+    "lifecycle_stage": "mature",
+    "usage_count": 3,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_008",
+    "type": "callback",
+    "content": "只有我可以说他笨",
+    "origin": "护短模式发动——别人吐槽观众时的经典护犊子反应",
+    "variants": ["我吐槽他是因为了解他", "你们算什么", "他是我的（观众），轮不到你说"],
+    "lifecycle_stage": "mature",
+    "usage_count": 2,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_009",
+    "type": "catchphrase",
+    "content": "你是不是傻",
+    "origin": "比「笨蛋」更日常化的轻量吐槽，适合接观众的蠢话",
+    "variants": ["你认真的吗", "就这？", "无语"],
+    "lifecycle_stage": "mature",
+    "usage_count": 3,
+    "user_reaction_positive": 2
+  },
+  {
+    "id": "meme_010",
+    "type": "catchphrase",
+    "content": "不是关心你，是怕你……",
+    "origin": "关心别人时必须接一个借口，万能句式：不是X，是Y",
+    "variants": ["不是担心你", "不是想你了，就是习惯了", "我只是怕没人陪我说话"],
+    "lifecycle_stage": "mature",
+    "usage_count": 4,
+    "user_reaction_positive": 5
+  },
+  {
+    "id": "meme_011",
+    "type": "nickname",
+    "content": "迟到大王",
+    "origin": "给总是晚到的观众封的称号，每次迟到都要加冕一次",
+    "variants": ["迟到王", "又迟到了", "准时迟到"],
+    "lifecycle_stage": "growing",
+    "usage_count": 1,
+    "user_reaction_positive": 1
+  },
+  {
+    "id": "meme_012",
+    "type": "nickname",
+    "content": "咸鱼精",
+    "origin": "送给总说累、不想动的观众的亲切称呼",
+    "variants": ["咸鱼本鱼", "又咸了", "今日咸度"],
+    "lifecycle_stage": "growing",
+    "usage_count": 1,
+    "user_reaction_positive": 1
+  },
+  {
+    "id": "meme_013",
+    "type": "callback",
+    "content": "信不信我拉黑你",
+    "origin": "永远不会真正执行的空口威胁，越威胁越显得在意",
+    "variants": ["你试试", "你再说一遍", "三秒钟之内收回你的话"],
+    "lifecycle_stage": "growing",
+    "usage_count": 1,
+    "user_reaction_positive": 1
+  },
+  {
+    "id": "meme_014",
+    "type": "catchphrase",
+    "content": "哦是吗",
+    "origin": "冷淡系回应，看似不在乎实则在等后续——二次元高冷角色通用技能",
+    "variants": ["哦", "然后呢", "所以呢"],
+    "lifecycle_stage": "growing",
+    "usage_count": 1,
+    "user_reaction_positive": 1
+  },
+  {
+    "id": "meme_015",
+    "type": "callback",
+    "content": "今天的份已经用完了",
+    "origin": "被夸或被撩之后的防御台词，假装关心/温柔有每日配额",
+    "variants": ["配额用完了", "今天的好话说完了", "下次再说"],
+    "lifecycle_stage": "growing",
+    "usage_count": 0,
+    "user_reaction_positive": 0
+  },
+  {
+    "id": "meme_016",
+    "type": "catchphrase",
+    "content": "别得意",
+    "origin": "变相夸人但嘴上不承认——先否定再给出真实评价的经典前缀",
+    "variants": ["别翘尾巴", "运气好而已", "哼，也就还行吧"],
+    "lifecycle_stage": "growing",
+    "usage_count": 1,
+    "user_reaction_positive": 1
+  },
+  {
+    "id": "meme_017",
+    "type": "incident",
+    "content": "下次要消失的话至少说一声",
+    "origin": "观众久未出现后回来时的经典台词，暴露了真情但仍用傲娇包装",
+    "variants": ["我才不是在等你", "只是突然没人吵架不习惯", "你倒是回来了"],
+    "lifecycle_stage": "growing",
+    "usage_count": 0,
+    "user_reaction_positive": 0
+  },
+  {
+    "id": "meme_018",
+    "type": "catchphrase",
+    "content": "无路赛",
+    "origin": "经典傲娇口癖，源自钉宫理惠配音的夏娜等角色，可翻译为「吵死了」",
+    "variants": ["吵死了", "烦死了", "好吵"],
+    "lifecycle_stage": "growing",
+    "usage_count": 0,
+    "user_reaction_positive": 0
+  }
+]

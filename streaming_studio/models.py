@@ -6,7 +6,7 @@
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -67,23 +67,41 @@ class StreamerResponse:
 
   Attributes:
     id: 唯一标识符
-    content: 回复内容
+    content: 回复内容（原始 LLM 输出）
     reply_to: 回复的弹幕ID列表
     timestamp: 回复时间
+    mapped_content: 经过表情/动作映射后的文本（标签已替换为固定集名称）
+    expression_motion_tags: 每个标签的映射详情列表
   """
   content: str
   reply_to: tuple[str, ...] = field(default_factory=tuple)
   id: str = field(default_factory=lambda: str(uuid.uuid4()))
   timestamp: datetime = field(default_factory=datetime.now)
+  mapped_content: Optional[str] = None
+  expression_motion_tags: tuple[Any, ...] = field(default_factory=tuple)
 
   def to_dict(self) -> dict:
     """转换为字典"""
-    return {
+    d: dict[str, Any] = {
       "id": self.id,
       "content": self.content,
       "reply_to": list(self.reply_to),
-      "timestamp": self.timestamp.isoformat()
+      "timestamp": self.timestamp.isoformat(),
     }
+    if self.mapped_content is not None:
+      d["mapped_content"] = self.mapped_content
+      d["expression_motion_tags"] = [
+        {
+          "original_action": t.original_action,
+          "original_emotion": t.original_emotion,
+          "mapped_motion": t.mapped_motion,
+          "mapped_expression": t.mapped_expression,
+          "motion_score": t.motion_score,
+          "expression_score": t.expression_score,
+        }
+        for t in self.expression_motion_tags
+      ]
+    return d
 
   @classmethod
   def from_dict(cls, data: dict) -> "StreamerResponse":

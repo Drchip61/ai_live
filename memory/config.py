@@ -75,6 +75,20 @@ STATIC_CATEGORY_DEFAULT_PREFIX = "【关于我自己的回忆】"
 
 
 @dataclass(frozen=True)
+class UserProfileConfig:
+  """用户画像层配置"""
+  enabled: bool = False
+  persist_filename: str = "user_profile.json"
+
+
+@dataclass(frozen=True)
+class CharacterProfileConfig:
+  """角色设定档层配置"""
+  enabled: bool = False
+  persist_filename: str = "character_profile.json"
+
+
+@dataclass(frozen=True)
 class MemoryConfig:
   """记忆系统总配置"""
   active: ActiveConfig = ActiveConfig()
@@ -82,3 +96,5 @@ class MemoryConfig:
   summary: SummaryConfig = SummaryConfig()
   retrieval: RetrievalConfig = RetrievalConfig()
   embedding: EmbeddingConfig = EmbeddingConfig()
+  user_profile: UserProfileConfig = UserProfileConfig()
+  character_profile: CharacterProfileConfig = CharacterProfileConfig()

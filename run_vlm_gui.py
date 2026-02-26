@@ -51,7 +51,7 @@ def parse_args():
   )
   parser.add_argument(
     "--persona", default="karin",
-    choices=["karin", "sage", "kuro"],
+    choices=["karin", "sage", "kuro", "naixiong"],
     help="主播人设（默认 karin）",
   )
   parser.add_argument(
@@ -642,19 +642,19 @@ def main():
       callback_refs["bound_studio"] = current_studio
 
       def on_auto_stop():
-        """视频播完由 studio 回调触发，在 GUI 线程中安排清理"""
-        async def _do_stop():
-          if callback_refs.get("bound_studio") is not current_studio:
-            return
+        """视频播完由 studio 回调触发（从 asyncio 后台 task 调用，无 UI slot）"""
+        _mjpeg_state["running"] = False
+        _cleanup_callbacks()
+
+        def _update_ui():
           stop_btn.disable()
-          _mjpeg_state["running"] = False
-          _cleanup_callbacks()
-          await current_studio.stop()
           start_btn.enable()
           progress.set_value(1.0)
           total = current_player.duration
           time_label.set_text(f"{total:.1f} / {total:.1f}s (完毕)")
-        ui.timer(0.1, lambda: asyncio.ensure_future(_do_stop()), once=True)
+
+        if page_client.has_socket_connection:
+          page_client.safe_invoke(_update_ui)
 
       callback_refs["stop_fn"] = on_auto_stop
 
@@ -697,9 +697,14 @@ def main():
       callback_refs["bound_studio"] = None
       streaming_labels.clear()
 
+    page_client = context.client
+
     def _on_broadcast(comment: Comment):
       """broadcaster 回调 → 本客户端弹幕侧栏显示"""
-      _add_danmaku(comment.nickname, comment.content, priority=comment.priority)
+      def _update():
+        _add_danmaku(comment.nickname, comment.content, priority=comment.priority)
+      if page_client.has_socket_connection:
+        page_client.safe_invoke(_update)
 
     broadcaster.register(_on_broadcast)
 
