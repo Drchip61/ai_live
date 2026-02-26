@@ -32,6 +32,9 @@ from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio, Comment
 from streaming_studio.models import ResponseChunk
 from video_source import VideoPlayer
+from debug_console.state_collector import StateCollector
+from debug_console.comment_broadcaster import CommentBroadcaster
+from debug_console.pages.monitor import create_monitor_page
 
 
 def parse_args():
@@ -181,6 +184,7 @@ def main():
     )
 
   host = "0.0.0.0" if args.lan else "127.0.0.1"
+  broadcaster = CommentBroadcaster()
 
   print(f"VLM 直播间 GUI")
   if runtime.get("player"):
@@ -190,6 +194,17 @@ def main():
     print(f"  视频: 未指定（请在 GUI 中选择）")
   print(f"  人设: {args.persona}  模型: {args.model}")
   print(f"  地址: {host}:{args.port}")
+
+  @ui.page("/monitor")
+  def monitor_page():
+    studio = runtime.get("studio")
+    if not studio:
+      with ui.column().classes("w-full items-center justify-center p-8"):
+        ui.label("直播间未初始化").classes("text-xl text-gray-500")
+        ui.label("请先在主页选择视频并启动").classes("text-gray-400")
+      return
+    collector = StateCollector(studio)
+    create_monitor_page(collector)
 
   @ui.page("/")
   async def vlm_page():
@@ -305,6 +320,10 @@ def main():
         "dense icon=stop color=red"
       )
       stop_btn.disable()
+
+      ui.link("监控面板", "/monitor", new_tab=True).classes(
+        "text-sm text-blue-600 no-underline hover:underline"
+      )
 
       progress = ui.linear_progress(value=0, show_value=False).classes("flex-1")
       _init_player = runtime.get("player")
@@ -467,7 +486,7 @@ def main():
               content=content,
             )
             _current_studio().send_comment(comment)
-            _add_danmaku("手动观众", content, priority=True)
+            broadcaster.broadcast(comment)
             msg_input.value = ""
 
           ui.button("发送", on_click=send_comment).props("dense")
@@ -535,13 +554,18 @@ def main():
     # ── 回调函数 ──
 
     def on_danmaku(danmaku):
-      """视频弹幕到达 → 侧栏显示"""
+      """视频弹幕到达 → 广播给所有客户端"""
       nick = (
         f"观众{danmaku.user_hash[:4]}"
         if danmaku.user_hash
         else "观众"
       )
-      _add_danmaku(nick, danmaku.content)
+      comment = Comment(
+        user_id=danmaku.user_hash or "anonymous",
+        nickname=nick,
+        content=danmaku.content,
+      )
+      broadcaster.broadcast(comment)
 
     def on_pre_response(old_comments, new_comments):
       """生成回复前 → 控制台显示弹幕列表"""
@@ -673,7 +697,17 @@ def main():
       callback_refs["bound_studio"] = None
       streaming_labels.clear()
 
-    context.client.on_disconnect(_cleanup_callbacks)
+    def _on_broadcast(comment: Comment):
+      """broadcaster 回调 → 本客户端弹幕侧栏显示"""
+      _add_danmaku(comment.nickname, comment.content, priority=comment.priority)
+
+    broadcaster.register(_on_broadcast)
+
+    def _on_disconnect():
+      _cleanup_callbacks()
+      broadcaster.unregister(_on_broadcast)
+
+    context.client.on_disconnect(_on_disconnect)
 
     # ── 进度条定时器 ──
 
