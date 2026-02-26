@@ -23,8 +23,8 @@ from langchain_wrapper import LLMWrapper, ModelType, ModelProvider
 from prompts import PromptLoader
 from .models import Comment, StreamerResponse, ResponseChunk
 from .database import CommentDatabase
-from .config import StudioConfig, ReplyDeciderConfig
-from .reply_decider import ReplyDecider
+from .config import StudioConfig, ReplyDeciderConfig, CommentClustererConfig
+from .reply_decider import ReplyDecider, CommentClusterer, ClusterResult
 
 if TYPE_CHECKING:
   from video_source import VideoPlayer
@@ -60,6 +60,7 @@ class StreamingStudio:
     enable_global_memory: bool = False,
     enable_topic_manager: bool = False,
     enable_reply_decider: bool = True,
+    enable_comment_clusterer: bool = False,
     # VLM 视频源（传入后启用 VLM 模式：画面+弹幕 → 多模态 LLM）
     video_player: Optional["VideoPlayer"] = None,
     # 高级定制
@@ -67,6 +68,7 @@ class StreamingStudio:
     database: Optional[CommentDatabase] = None,
     config: Optional[StudioConfig] = None,
     reply_decider_config: Optional[ReplyDeciderConfig] = None,
+    comment_clusterer_config: Optional[CommentClustererConfig] = None,
   ):
     """
     初始化虚拟直播间
@@ -78,6 +80,7 @@ class StreamingStudio:
       enable_memory: 是否启用分层记忆系统
       enable_global_memory: 是否开启全局记忆（持久化到文件），需同时开启 enable_memory
       enable_topic_manager: 是否启用话题管理器（追踪、分类和管理直播话题）
+      enable_comment_clusterer: 是否启用弹幕聚类器（合并语义相似弹幕，节省 token）
       video_player: 视频播放器（传入后启用 VLM 模式，自动从视频提取帧和弹幕）
       llm_wrapper: 自定义 LLM 封装（高级用户，传入后忽略 persona/model_type/enable_memory）
       database: 自定义数据库（高级用户）
@@ -184,6 +187,23 @@ class StreamingStudio:
         llm_model=rd_llm,
         judge_prompt=rd_prompt,
       )
+
+    # 弹幕聚类器
+    self._comment_clusterer: Optional[CommentClusterer] = None
+    if enable_comment_clusterer:
+      cc_config = comment_clusterer_config or CommentClustererConfig()
+      cc_embeddings = None
+      # 尝试复用记忆模块的 embedding 模型
+      mem = self.llm_wrapper.memory_manager
+      if mem is not None:
+        cc_embeddings = getattr(mem, "embeddings", None)
+      self._comment_clusterer = CommentClusterer(
+        config=cc_config,
+        embeddings=cc_embeddings,
+      )
+
+    # 最近一次聚类结果（供 debug_state 和 prompt 格式化使用）
+    self._last_cluster_result: Optional[ClusterResult] = None
 
     # Prompt 模板
     _loader = PromptLoader()
@@ -454,6 +474,11 @@ class StreamingStudio:
             old_comments, new_comments = [], []
           else:
             continue
+
+        # 弹幕聚类
+        self._last_cluster_result = None
+        if self._comment_clusterer and new_comments:
+          self._last_cluster_result = self._comment_clusterer.cluster(new_comments)
 
         # 回复决策器：判断是否值得回复
         if self._reply_decider and (old_comments or new_comments):
@@ -762,6 +787,7 @@ class StreamingStudio:
     new_comments: list[Comment],
     annotations: Optional[dict[str, str]] = None,
     interaction_targets: Optional[set[str]] = None,
+    cluster_result: Optional[ClusterResult] = None,
   ) -> str:
     """
     组合弹幕为 LLM 输入 prompt
@@ -771,13 +797,42 @@ class StreamingStudio:
       new_comments: 上次回复后的新弹幕
       annotations: 弹幕→话题标注映射（来自话题管理器）
       interaction_targets: 被选中为互动目标的弹幕 ID 集合
+      cluster_result: 弹幕聚类结果（有则折叠显示同簇弹幕）
 
     Returns:
       格式化后的 prompt 字符串
     """
     now = datetime.now()
 
+    # 预建聚类查找表：comment_id → 所属簇
+    clustered_ids: set[str] = set()
+    shown_cluster_reps: set[str] = set()
+    if cluster_result:
+      for cluster in cluster_result.clusters:
+        for m in cluster.members:
+          clustered_ids.add(m.id)
+
     def fmt(c: Comment) -> str:
+      # 聚类折叠：对同簇弹幕只显示代表，附计数
+      if cluster_result and c.id in clustered_ids:
+        cluster = cluster_result.cluster_for(c.id)
+        if cluster and cluster.representative.id not in shown_cluster_reps:
+          # 首次遇到该簇 → 显示代表弹幕，tags 基于代表查找
+          shown_cluster_reps.add(cluster.representative.id)
+          rep = cluster.representative
+          rep_base = self._format_comment(rep, now)
+          rep_tags = [f"x{cluster.count}条类似"]
+          if annotations and rep.id in annotations:
+            rep_tags.append(f"话题: {annotations[rep.id]}")
+          if interaction_targets and rep.id in interaction_targets:
+            rep_tags.append("优先回复")
+          prefix = "[" + " | ".join(rep_tags) + "] "
+          return f"- {prefix}{rep_base}"
+        else:
+          # 同簇非代表弹幕，跳过
+          return ""
+
+      # 非聚类弹幕，正常显示
       base = self._format_comment(c, now)
       tags = []
       if annotations and c.id in annotations:
@@ -793,14 +848,18 @@ class StreamingStudio:
 
     if old_comments:
       lines = [fmt(c) for c in old_comments]
-      parts.append(self._comment_headers["old_comments"] + "\n" + "\n".join(lines))
+      lines = [l for l in lines if l]  # 过滤聚类跳过的空行
+      if lines:
+        parts.append(self._comment_headers["old_comments"] + "\n" + "\n".join(lines))
 
     if new_comments:
       lines = [fmt(c) for c in new_comments]
+      lines = [l for l in lines if l]  # 过滤聚类跳过的空行
       header = self._comment_headers["new_comments"]
       if interaction_targets:
         header += "\n" + self._interaction_instruction
-      parts.append(header + "\n" + "\n".join(lines))
+      if lines:
+        parts.append(header + "\n" + "\n".join(lines))
     else:
       # 计算距离最近一条弹幕的沉默时长
       silence_msg = self._comment_headers["silence"]
@@ -930,6 +989,7 @@ class StreamingStudio:
 
     prompt = self._format_comments_for_prompt(
       old_comments, new_comments, annotations, interaction_targets,
+      cluster_result=self._last_cluster_result,
     )
 
     # VLM 两趟调用
@@ -1004,6 +1064,7 @@ class StreamingStudio:
 
     prompt = self._format_comments_for_prompt(
       old_comments, new_comments, annotations, interaction_targets,
+      cluster_result=self._last_cluster_result,
     )
 
     # VLM 两趟调用
@@ -1090,6 +1151,24 @@ class StreamingStudio:
       reply_to=reply_ids,
     )
 
+  def _format_cluster_debug(self) -> Optional[dict]:
+    """最近一次聚类结果的调试摘要"""
+    cr = self._last_cluster_result
+    if cr is None:
+      return None
+    return {
+      "cluster_count": len(cr.clusters),
+      "single_count": len(cr.singles),
+      "clusters": [
+        {
+          "representative": c.representative.content[:30],
+          "count": c.count,
+          "reason": c.merge_reason,
+        }
+        for c in cr.clusters
+      ],
+    }
+
   def debug_state(self) -> dict:
     """
     获取调试状态快照（供监控面板使用）
@@ -1145,6 +1224,8 @@ class StreamingStudio:
       "total_comments": self.database.get_comment_count(),
       "total_responses": self.database.get_response_count(),
       "topic_manager_enabled": self._topic_manager is not None,
+      "comment_clusterer_enabled": self._comment_clusterer is not None,
+      "last_cluster_result": self._format_cluster_debug(),
       "vlm_mode": self._video_player is not None,
       "video_player": self._video_player.debug_state() if self._video_player else None,
     }

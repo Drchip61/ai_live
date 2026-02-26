@@ -11,7 +11,8 @@ streaming_studio/
 ├── __init__.py               # 模块导出
 ├── models.py                 # Comment, StreamerResponse 数据模型
 ├── database.py               # SQLite弹幕存储
-├── config.py                 # StudioConfig 行为配置
+├── config.py                 # StudioConfig, ReplyDeciderConfig, CommentClustererConfig
+├── reply_decider.py          # ReplyDecider(回复决策器) + CommentClusterer(弹幕聚类器)
 ├── studio.py                 # StreamingStudio 异步核心类
 ├── test_chatter_studio.py    # 命令行测试（单用户）
 └── test_danmaku_studio.py    # 弹幕模拟测试（随机用户身份）
@@ -94,6 +95,10 @@ class CommentDatabase:
 | `model_type` | ModelType | OPENAI | 模型类型 (OPENAI/ANTHROPIC/LOCAL_QWEN) |
 | `model_name` | str \| None | None | 模型名称（可选） |
 | `enable_memory` | bool | False | 是否启用分层记忆系统 |
+| `enable_global_memory` | bool | False | 是否开启全局记忆持久化 |
+| `enable_topic_manager` | bool | False | 是否启用话题管理器 |
+| `enable_reply_decider` | bool | True | 是否启用回复决策器 |
+| `enable_comment_clusterer` | bool | False | 是否启用弹幕聚类器 |
 
 **高级定制：**
 
@@ -102,6 +107,8 @@ class CommentDatabase:
 | `llm_wrapper` | LLMWrapper \| None | None | 自定义 LLM 封装（传入后忽略上述核心配置） |
 | `database` | CommentDatabase \| None | None | 自定义数据库 |
 | `config` | StudioConfig \| None | None | 自定义行为配置 |
+| `reply_decider_config` | ReplyDeciderConfig \| None | None | 自定义决策器配置 |
+| `comment_clusterer_config` | CommentClustererConfig \| None | None | 自定义聚类器配置 |
 
 #### 双轨定时器机制
 
@@ -261,6 +268,61 @@ llm = LLMWrapper(
 studio = StreamingStudio(llm_wrapper=llm)
 ```
 
+### ReplyDeciderConfig
+
+回复决策器配置。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `min_quality_length` | int | 3 | 低于此长度视为低质量弹幕 |
+| `must_reply_comment_count` | int | 5 | 新弹幕数 >= 此值时规则直接放行 |
+| `skip_patterns` | tuple[str] | (哈哈, 666, ...) | 低质量跳过词表 |
+| `proactive_silence_threshold` | float | 10.0 | 沉默超此秒数触发主动发言 |
+| `llm_judge_urgency_threshold` | float | 4.0 | LLM urgency 低于此值强制跳过 |
+
+### CommentClustererConfig
+
+弹幕聚类器配置。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `similarity_threshold` | float | 0.75 | 语义 cosine similarity 阈值 |
+| `min_cluster_size` | int | 2 | 最小成簇数量 |
+| `max_pattern_unit_length` | int | 4 | 循环节最大长度（超过不视为循环） |
+
+### ReplyDecider（回复决策器）
+
+两阶段判断主播是否应该回复弹幕：
+
+- **Phase 1（规则快筛，零成本）**：优先弹幕→必须回复；弹幕数量多→回复；含提问→回复；全低质量→跳过
+- **Phase 2（LLM 精判，小模型）**：规则无法决定时用 Haiku/Mini 综合判断，返回 `{reply, urgency, reason}` JSON
+
+### CommentClusterer（弹幕聚类器）
+
+两阶段合并语义相似弹幕，节省 token、提升信噪比：
+
+- **Phase 1（循环节规则快筛，零成本）**：提取最小循环节，相同循环节归组
+  - "666"+"6666"+"66666" → 循环节 "6" → 同簇
+  - "哈哈"+"哈哈哈哈" → 循环节 "哈" → 同簇
+  - "233"+"233233" → 循环节 "233" → 同簇
+- **Phase 2（语义聚类，需 embeddings）**：增量阈值法，cosine similarity >= 阈值 → 合并
+  - 无 embeddings 时自动跳过，仅跑规则阶段
+  - 可复用记忆模块的 `bge-small-zh-v1.5` 实例
+
+**数据流**：
+
+```
+_collect_comments() → (old, new)
+       │
+       ▼ [enable_comment_clusterer=True]
+CommentClusterer.cluster(new) → ClusterResult
+       │
+       ├─ prompt 格式化：同簇弹幕折叠为 "[x5条类似] 用户A: 666"
+       └─ reply_decider：仍接收原始弹幕（后续可合并）
+```
+
+**priority 弹幕不参与聚类，始终作为独立弹幕保留。**
+
 ## 核心特性
 
 ### 双轨定时器
@@ -310,3 +372,6 @@ studio = StreamingStudio(llm_wrapper=llm)
 - [x] ResponseChunk 数据模型
 - [x] 流式回复生成 (`_generate_response_streaming`)
 - [x] 流式片段回调 (`on_response_chunk` / `remove_chunk_callback`)
+- [x] ReplyDecider 两阶段回复决策器（规则快筛 + LLM 精判）
+- [x] CommentClusterer 两阶段弹幕聚类器（循环节规则 + 语义 embedding）
+- [x] prompt 格式化聚类折叠显示

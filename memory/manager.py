@@ -65,10 +65,11 @@ class MemoryManager:
     # 创建共享 embeddings（避免重复加载模型，优先使用 GPU）
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    embeddings = HuggingFaceEmbeddings(
+    self._embeddings = HuggingFaceEmbeddings(
       model_name=embedding_config.model_name,
       model_kwargs={"device": device},
     )
+    embeddings = self._embeddings
 
     # 初始化归档器（纯内存模式下禁用）
     self._archive = MemoryArchive(
@@ -119,6 +120,11 @@ class MemoryManager:
 
     # 近期交互缓冲（供定时汇总使用）
     self._recent_interactions: list[tuple[str, str, datetime]] = []
+
+  @property
+  def embeddings(self) -> HuggingFaceEmbeddings:
+    """共享的嵌入模型实例（供外部模块复用，避免重复加载）"""
+    return self._embeddings
 
   @property
   def session_id(self) -> Optional[str]:
