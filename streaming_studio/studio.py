@@ -229,7 +229,7 @@ class StreamingStudio:
 
     # 表情动作语义映射器
     self._expression_mapper = None
-    mapping_file = Path(__file__).resolve().parent.parent.parent / "expression_motion_mapping.json"
+    mapping_file = Path(__file__).resolve().parent.parent / "expression_motion_mapping.json"
     if mapping_file.exists():
       from expression_mapper import ExpressionMotionMapper
       shared_embeddings = None
