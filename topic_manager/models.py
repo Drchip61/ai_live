@@ -32,6 +32,8 @@ class Topic:
   stale: bool = False
   created_at: datetime = field(default_factory=datetime.now)
   updated_at: datetime = field(default_factory=datetime.now)
+  last_discussed_at: datetime = field(default_factory=datetime.now)
+  """最近一次有弹幕关联到此话题的时间（区别于 updated_at：任何字段变更都会更新）"""
 
 
 @dataclass(frozen=True)

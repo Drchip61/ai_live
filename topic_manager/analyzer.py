@@ -6,6 +6,7 @@
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import Optional
 
 from langchain_core.language_models import BaseChatModel
@@ -33,6 +34,7 @@ def _significance_label(sig: float) -> str:
 
 def _format_topic_table(table: TopicTable) -> str:
   """格式化话题表供 prompt 使用"""
+  now = datetime.now()
   topics = table.get_all()
   if not topics:
     return "（当前无话题）"
@@ -40,8 +42,10 @@ def _format_topic_table(table: TopicTable) -> str:
   for t in topics:
     stale_mark = " [过期]" if t.stale else ""
     label = _significance_label(t.significance)
+    idle = int((now - t.last_discussed_at).total_seconds())
+    idle_mark = f", 空闲{idle}秒" if idle >= 20 else ""
     lines.append(
-      f"- {t.topic_id}「{t.title}」(重要性: {label}{stale_mark}): "
+      f"- {t.topic_id}「{t.title}」(重要性: {label}{idle_mark}{stale_mark}): "
       f"{t.topic_progress}"
     )
     if t.suggestion:

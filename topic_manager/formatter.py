@@ -4,6 +4,7 @@
 """
 
 import logging
+from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 from prompts import PromptLoader
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 _loader = PromptLoader()
 _STALE_INSTRUCTION = _loader.load("topic/stale_instruction.txt")
 _FOLLOWUP_INSTRUCTION = _loader.load("topic/followup_instruction.txt")
+_PROACTIVE_CONTINUATION = _loader.load("topic/proactive_continuation.txt")
 
 
 def _significance_label(sig: float) -> str:
@@ -91,7 +93,7 @@ def format_topic_context(
     parts.append(topic_summary)
 
   # (b) 额外指令
-  instructions = _format_instructions(topics_to_show, new_comments_ids, table)
+  instructions = _format_instructions(topics_to_show, new_comments_ids, table, config)
   if instructions:
     parts.append(instructions)
 
@@ -136,6 +138,7 @@ def _format_topic_summary(
   config: TopicManagerConfig,
 ) -> str:
   """格式化话题摘要"""
+  now = datetime.now()
   lines = ["【当前话题】"]
 
   for topic in topics:
@@ -148,6 +151,14 @@ def _format_topic_summary(
 
     if topic.stale:
       lines.append("(!) 这个话题已经聊了很久")
+
+    # 空闲时长标注
+    idle_seconds = (now - topic.last_discussed_at).total_seconds()
+    if idle_seconds >= 60:
+      idle_minutes = int(idle_seconds // 60)
+      lines.append(f"(i) 已有约 {idle_minutes} 分钟无人讨论此话题")
+    elif idle_seconds >= 20:
+      lines.append(f"(i) 已有约 {int(idle_seconds)} 秒无人讨论此话题")
 
     # 最近弹幕
     recent_cids = topic.comment_ids[-config.recent_comments_per_topic:]
@@ -184,6 +195,7 @@ def _format_instructions(
   topics: list[Topic],
   new_comment_ids: list[str],
   table: TopicTable,
+  config: TopicManagerConfig,
 ) -> str:
   """格式化额外指令"""
   instructions = []
@@ -194,15 +206,22 @@ def _format_instructions(
     names = "、".join(f"「{t.title}」" for t in stale_topics)
     instructions.append(_STALE_INSTRUCTION.format(names=names))
 
-  # 冷场建议
-  has_new_comments = len(new_comment_ids) > 0
-  if not has_new_comments:
+  # 冷场 / 弹幕稀疏时的话题跟进建议
+  comment_count = len(new_comment_ids)
+  if comment_count <= config.sparse_comment_threshold:
     followup_topics = [t for t in topics if t.suggestion and not t.stale]
     if followup_topics:
       best = max(followup_topics, key=lambda t: t.significance)
-      instructions.append(
-        _FOLLOWUP_INSTRUCTION.format(title=best.title, suggestion=best.suggestion)
-      )
+      if comment_count == 0:
+        # 完全没弹幕：用现有冷场跟进指令
+        instructions.append(
+          _FOLLOWUP_INSTRUCTION.format(title=best.title, suggestion=best.suggestion)
+        )
+      else:
+        # 有少量弹幕但很稀疏：用更温和的推进引导
+        instructions.append(
+          _PROACTIVE_CONTINUATION.format(title=best.title, suggestion=best.suggestion)
+        )
 
   if not instructions:
     return ""

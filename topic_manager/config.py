@@ -64,6 +64,23 @@ class TopicManagerConfig:
   min_analysis_interval_seconds: float = 30.0
   """距上次分析不足此时间跳过模型调用"""
 
+  # 时间感知：空闲话题额外衰减
+  idle_decay_threshold_seconds: float = 60.0
+  """话题空闲超过此秒数后开始额外衰减 significance"""
+
+  idle_decay_rate: float = 0.02
+  """每超过阈值 60 秒额外扣减此值（线性衰减）"""
+
+  # 主动话题推进
+  sparse_comment_threshold: int = 2
+  """新弹幕数 <= 此值视为"稀疏"，触发话题跟进建议"""
+
+  proactive_topic_min_significance: float = 0.25
+  """主动推进话题的最低 significance 要求"""
+
+  proactive_topic_min_idle_seconds: float = 30.0
+  """话题至少空闲此秒数才值得主动推进（避免推荐刚聊过的话题）"""
+
   # 网络搜索（可选，默认关）
   enable_web_search: bool = False
   """是否启用网络搜索（Tavily）"""

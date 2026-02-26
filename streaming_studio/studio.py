@@ -532,41 +532,48 @@ class StreamingStudio:
 
   async def _check_proactive_speak(self) -> bool:
     """
-    检查是否应主动发言（无弹幕时，基于画面变化触发）
+    检查是否应主动发言
 
-    仅在 VLM 模式下且有回复决策器时工作。
-    当沉默时间超过阈值且画面发生重大变化时返回 True。
+    两条路径：
+    1. VLM 路径：基于画面变化 + 沉默超阈值触发（需要 video_player + reply_decider）
+    2. 话题路径：基于话题管理器建议触发（无需视频，需要 topic_manager）
     """
-    if not self._reply_decider or not self._video_player:
-      return False
-    if not self._current_frame_b64:
-      return False
-
     silence = 0.0
     if self._last_reply_time:
       silence = (datetime.now() - self._last_reply_time).total_seconds()
     elif self._stream_start_time:
       silence = (datetime.now() - self._stream_start_time).total_seconds()
 
-    rd_config = self._reply_decider.config
-    if silence < rd_config.proactive_silence_threshold:
+    # 沉默阈值：优先用 reply_decider 配置，否则 fallback 10s
+    min_silence = 10.0
+    if self._reply_decider:
+      min_silence = self._reply_decider.config.proactive_silence_threshold
+    if silence < min_silence:
       return False
 
-    # 运行场景理解获取当前画面描述
-    images = [self._current_frame_b64]
-    timestamp = self._get_stream_timestamp()
-    current_scene = await self.llm_wrapper.ascene_understand(
-      f"[当前画面] {timestamp}", images,
-    )
-    if not current_scene:
-      return False
+    # 路径 1: VLM 模式（画面变化触发）
+    if self._reply_decider and self._video_player and self._current_frame_b64:
+      images = [self._current_frame_b64]
+      timestamp = self._get_stream_timestamp()
+      current_scene = await self.llm_wrapper.ascene_understand(
+        f"[当前画面] {timestamp}", images,
+      )
+      if current_scene:
+        decision = await self._reply_decider.should_proactive_speak(
+          self._prev_scene_description, current_scene, silence,
+        )
+        if decision.should_reply:
+          print(f"[决策器] 主动发言: {decision.reason}")
+          return True
 
-    decision = await self._reply_decider.should_proactive_speak(
-      self._prev_scene_description, current_scene, silence,
-    )
-    if decision.should_reply:
-      print(f"[决策器] 主动发言: {decision.reason}")
-    return decision.should_reply
+    # 路径 2: 话题推进（无需 VLM，需要话题管理器）
+    if self._topic_manager:
+      topic = self._topic_manager.suggest_proactive_topic(silence)
+      if topic is not None:
+        print(f"[话题管理器] 主动推进话题: 「{topic.title}」 (沉默 {int(silence)}秒)")
+        return True
+
+    return False
 
   def _collect_comments(self) -> tuple[list[Comment], list[Comment]]:
     """
