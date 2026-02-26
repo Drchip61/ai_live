@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -61,4 +62,4 @@ class RhythmAnalysisDelta:
     suggested_timing: 建议的下次等待时间 (min, max)，None 表示无建议
   """
   stale_topic_ids: list[str] = field(default_factory=list)
-  suggested_timing: tuple[float, float] | None = None
+  suggested_timing: Optional[tuple[float, float]] = None
