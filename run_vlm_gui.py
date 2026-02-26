@@ -3,14 +3,14 @@ VLM 直播间 GUI
 NiceGUI Web 界面，集成视频画面、弹幕侧栏、用户输入和控制台输出
 
 用法:
+  python run_vlm_gui.py
   python run_vlm_gui.py --video <视频文件> --danmaku <弹幕XML>
 
 示例:
-  python run_vlm_gui.py \
-    --video data/sample.mp4 \
-    --danmaku data/sample.xml \
-    --persona kuro \
-    --model anthropic
+  python run_vlm_gui.py
+  python run_vlm_gui.py --video data/sample.mp4 --danmaku data/sample.xml
+  python run_vlm_gui.py --video data/sample.mp4 --persona kuro --model anthropic
+  python run_vlm_gui.py --lan --port 8081
 """
 
 import argparse
@@ -39,8 +39,8 @@ def parse_args():
     description="VLM 直播间 GUI — 视频画面 + 弹幕 → 多模态理解（NiceGUI 版）",
   )
   parser.add_argument(
-    "--video", required=True,
-    help="视频文件路径（mp4/mkv/flv 等 OpenCV 支持的格式）",
+    "--video", default=None,
+    help="视频文件路径（可选，可在 GUI 中选择）",
   )
   parser.add_argument(
     "--danmaku", default=None,
@@ -87,6 +87,10 @@ def parse_args():
   parser.add_argument(
     "--port", type=int, default=8081,
     help="Web 服务端口（默认 8081）",
+  )
+  parser.add_argument(
+    "--lan", action="store_true", default=False,
+    help="在局域网中部署（绑定 0.0.0.0，允许其它设备访问）",
   )
   return parser.parse_args()
 
@@ -142,12 +146,21 @@ def main():
       "studio": studio,
     }
 
-  runtime = _build_runtime(args.video, args.danmaku)
+  if args.video:
+    runtime = _build_runtime(args.video, args.danmaku)
+  else:
+    runtime = {
+      "video_path": None,
+      "danmaku_path": None,
+      "player": None,
+      "studio": None,
+    }
 
   async def _mjpeg_generator():
     while True:
-      if _mjpeg_state["running"]:
-        interval = 1.0 / max(runtime["player"].display_fps, 1)
+      player = runtime.get("player")
+      if _mjpeg_state["running"] and player:
+        interval = 1.0 / max(player.display_fps, 1)
         data = _mjpeg_state["jpeg_bytes"]
         if data:
           yield (
@@ -167,11 +180,16 @@ def main():
       media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
+  host = "0.0.0.0" if args.lan else "127.0.0.1"
+
   print(f"VLM 直播间 GUI")
-  print(f"  视频: {runtime['video_path']} ({runtime['player'].duration:.1f}s)")
-  print(f"  弹幕: {runtime['danmaku_path'] or '无'}")
+  if runtime.get("player"):
+    print(f"  视频: {runtime['video_path']} ({runtime['player'].duration:.1f}s)")
+    print(f"  弹幕: {runtime['danmaku_path'] or '无'}")
+  else:
+    print(f"  视频: 未指定（请在 GUI 中选择）")
   print(f"  人设: {args.persona}  模型: {args.model}")
-  print(f"  端口: {args.port}")
+  print(f"  地址: {host}:{args.port}")
 
   @ui.page("/")
   async def vlm_page():
@@ -254,7 +272,11 @@ def main():
       ui.label("VLM 直播间").classes("text-xl font-bold")
 
       async def on_start():
-        if _current_studio().is_running:
+        studio = runtime.get("studio")
+        if not studio:
+          ui.notify("请先选择视频文件并点击「切换源」", type="warning")
+          return
+        if studio.is_running:
           return
         start_btn.disable()
         _mjpeg_state["running"] = True
@@ -277,14 +299,17 @@ def main():
       start_btn = ui.button("开始", on_click=on_start).props(
         "dense icon=play_arrow color=green"
       )
+      if not runtime.get("studio"):
+        start_btn.disable()
       stop_btn = ui.button("停止", on_click=on_stop).props(
         "dense icon=stop color=red"
       )
       stop_btn.disable()
 
       progress = ui.linear_progress(value=0, show_value=False).classes("flex-1")
+      _init_player = runtime.get("player")
       time_label = ui.label(
-        f"0.0 / {_current_player().duration:.1f}s"
+        f"0.0 / {_init_player.duration:.1f}s" if _init_player else "未加载视频"
       ).classes("text-sm text-gray-600 whitespace-nowrap")
 
     with ui.row().classes(
@@ -300,7 +325,7 @@ def main():
             video_input,
           ),
         ).props("dense")
-      video_input.value = runtime["video_path"]
+      video_input.value = runtime["video_path"] or ""
 
       with ui.row().classes("flex-1 items-center gap-2"):
         danmaku_input = ui.input(
@@ -335,7 +360,8 @@ def main():
           return
 
         if (
-          normalized_video == runtime["video_path"]
+          runtime.get("video_path")
+          and normalized_video == runtime["video_path"]
           and normalized_danmaku == runtime["danmaku_path"]
         ):
           ui.notify("视频与弹幕源未发生变化", type="info")
@@ -347,27 +373,28 @@ def main():
         _mjpeg_state["running"] = False
         _mjpeg_state["jpeg_bytes"] = b""
 
-        old_studio = _current_studio()
+        old_studio = runtime.get("studio")
         try:
           _cleanup_callbacks()
-          if old_studio.is_running:
-            await old_studio.stop()
+          if old_studio:
+            if old_studio.is_running:
+              await old_studio.stop()
 
-          # 切换源视为“重启新会话”：清理运行期状态，避免记忆串场
-          old_studio.llm_wrapper.clear_history()
-          old_studio._comment_buffer.clear()
-          old_studio._response_queue = asyncio.Queue()
-          old_studio._last_collect_time = None
-          old_studio._last_reply_time = None
-          old_studio._last_prompt = None
-          old_studio._prev_scene_description = None
-          old_studio._pending_comment_count = 0
-          old_studio._current_frame_b64 = None
-          old_studio._last_used_timing = None
+            # 切换源视为"重启新会话"：清理运行期状态，避免记忆串场
+            old_studio.llm_wrapper.clear_history()
+            old_studio._comment_buffer.clear()
+            old_studio._response_queue = asyncio.Queue()
+            old_studio._last_collect_time = None
+            old_studio._last_reply_time = None
+            old_studio._last_prompt = None
+            old_studio._prev_scene_description = None
+            old_studio._pending_comment_count = 0
+            old_studio._current_frame_b64 = None
+            old_studio._last_used_timing = None
 
-          mem_mgr = old_studio.llm_wrapper.memory_manager
-          if mem_mgr is not None:
-            mem_mgr.clear_runtime_state(clear_summary=True)
+            mem_mgr = old_studio.llm_wrapper.memory_manager
+            if mem_mgr is not None:
+              mem_mgr.clear_runtime_state(clear_summary=True)
 
           _clear_ui_state()
 
@@ -396,7 +423,8 @@ def main():
           )
         finally:
           switch_btn.enable()
-          start_btn.enable()
+          if runtime.get("studio"):
+            start_btn.enable()
           stop_btn.disable()
 
       switch_btn = ui.button("切换源", on_click=on_switch_source).props(
@@ -650,9 +678,9 @@ def main():
     # ── 进度条定时器 ──
 
     def update_progress():
-      player = _current_player()
-      studio = _current_studio()
-      if not studio.is_running:
+      player = runtime.get("player")
+      studio = runtime.get("studio")
+      if not player or not studio or not studio.is_running:
         return
       current = player.current_sec
       total = player.duration
@@ -664,7 +692,7 @@ def main():
 
     ui.timer(0.5, update_progress)
 
-  ui.run(port=args.port, reload=False, title="VLM 直播间")
+  ui.run(port=args.port, host=host, reload=False, title="VLM 直播间")
 
 
 if __name__ == "__main__":
