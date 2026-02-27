@@ -139,3 +139,39 @@ class ResponseChunk:
   chunk: str
   accumulated: str
   done: bool = False
+
+
+@dataclass(frozen=True)
+class ResponseTiming:
+  """
+  最近一次回复生成的耗时分解（毫秒）
+
+  覆盖从"决定开始回复"到"回复完成"的全部阶段。
+  """
+  total_ms: float = 0              # 端到端总耗时
+  comment_cluster_ms: float = 0    # 弹幕聚类
+  reply_decision_ms: float = 0     # 回复决策（Phase1 + Phase2）
+  topic_context_ms: float = 0      # 话题标注/上下文获取
+  prompt_format_ms: float = 0      # Prompt 格式化
+  scene_understand_ms: float = 0   # 第一趟 VLM 场景理解
+  memory_retrieval_ms: float = 0   # 记忆检索（RAG）
+  llm_first_token_ms: float = 0    # 第二趟主回复：首 token 延迟（流式）
+  llm_total_ms: float = 0          # 第二趟主回复：完整生成
+  expression_map_ms: float = 0     # 表情动作映射
+  timestamp: str = ""              # 记录时间 (%H:%M:%S)
+
+  def to_dict(self) -> dict:
+    """转换为字典（供 debug_state 使用）"""
+    return {
+      "total_ms": round(self.total_ms, 1),
+      "comment_cluster_ms": round(self.comment_cluster_ms, 1),
+      "reply_decision_ms": round(self.reply_decision_ms, 1),
+      "topic_context_ms": round(self.topic_context_ms, 1),
+      "prompt_format_ms": round(self.prompt_format_ms, 1),
+      "scene_understand_ms": round(self.scene_understand_ms, 1),
+      "memory_retrieval_ms": round(self.memory_retrieval_ms, 1),
+      "llm_first_token_ms": round(self.llm_first_token_ms, 1),
+      "llm_total_ms": round(self.llm_total_ms, 1),
+      "expression_map_ms": round(self.expression_map_ms, 1),
+      "timestamp": self.timestamp,
+    }

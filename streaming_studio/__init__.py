@@ -3,7 +3,7 @@ streaming_studio 模块
 虚拟直播间核心功能
 """
 
-from .models import Comment, StreamerResponse, ResponseChunk
+from .models import Comment, StreamerResponse, ResponseChunk, ResponseTiming
 from .database import CommentDatabase
 from .studio import StreamingStudio
 from .config import StudioConfig, ReplyDeciderConfig, CommentClustererConfig
@@ -26,4 +26,5 @@ __all__ = [
   "CommentClusterer",
   "CommentCluster",
   "ClusterResult",
+  "ResponseTiming",
 ]

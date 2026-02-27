@@ -7,6 +7,7 @@ import asyncio
 import logging
 import re
 import sys
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Optional, Union, TYPE_CHECKING
@@ -113,6 +114,9 @@ class LLMWrapper:
     # 后台任务引用集合（防止被 GC 回收）
     self._background_tasks: set[asyncio.Task] = set()
 
+    # 最近一次调用的耗时记录（供 studio 层读取）
+    self._last_call_timing: dict[str, float] = {}
+
   @property
   def has_memory(self) -> bool:
     """是否启用了记忆功能"""
@@ -122,6 +126,11 @@ class LLMWrapper:
   def memory_manager(self) -> Optional["MemoryManager"]:
     """获取记忆管理器实例"""
     return self._memory
+
+  @property
+  def last_call_timing(self) -> dict[str, float]:
+    """最近一次调用的耗时记录（供 studio 层读取）"""
+    return self._last_call_timing.copy()
 
   @property
   def last_extra_context(self) -> str:
@@ -192,7 +201,9 @@ class LLMWrapper:
     # ④ 检索记忆区
     if self._memory is not None:
       query: Union[str, list[str]] = rag_queries if rag_queries else user_input
+      t0 = time.perf_counter()
       active_text, rag_text = self._memory.retrieve(query)
+      self._last_call_timing["memory_retrieval_ms"] = (time.perf_counter() - t0) * 1000
       if active_text:
         parts.append(active_text)
       if rag_text:
@@ -303,14 +314,18 @@ class LLMWrapper:
     Returns:
       模型回复
     """
+    self._last_call_timing = {}
     normalized_input = self._normalize_untrusted_text(user_input)
     guarded_input = self._guard_user_input(user_input)
     extra_context = self._build_extra_context(normalized_input, rag_queries, topic_context)
     self._last_extra_context = extra_context
+
+    t0 = time.perf_counter()
     response = self.pipeline.invoke(
       guarded_input, self._history, extra_context=extra_context,
       images=images,
     )
+    self._last_call_timing["llm_total_ms"] = (time.perf_counter() - t0) * 1000
 
     if save_history:
       self._history.append((user_input, response))
@@ -346,14 +361,18 @@ class LLMWrapper:
     Returns:
       模型回复
     """
+    self._last_call_timing = {}
     normalized_input = self._normalize_untrusted_text(user_input)
     guarded_input = self._guard_user_input(user_input)
     extra_context = self._build_extra_context(normalized_input, rag_queries, topic_context)
     self._last_extra_context = extra_context
+
+    t0 = time.perf_counter()
     response = await self.pipeline.ainvoke(
       guarded_input, self._history, extra_context=extra_context,
       images=images,
     )
+    self._last_call_timing["llm_total_ms"] = (time.perf_counter() - t0) * 1000
 
     if save_history:
       self._history.append((user_input, response))
@@ -394,6 +413,7 @@ class LLMWrapper:
     Yields:
       模型输出的文本片段
     """
+    self._last_call_timing = {}
     normalized_input = self._normalize_untrusted_text(user_input)
     guarded_input = self._guard_user_input(user_input)
     extra_context = self._build_extra_context(normalized_input, rag_queries, topic_context)
@@ -402,12 +422,18 @@ class LLMWrapper:
     completed = False
 
     try:
+      llm_start = time.perf_counter()
+      first_token_recorded = False
       async for chunk in self.pipeline.astream(
         guarded_input, self._history, extra_context=extra_context,
         images=images,
       ):
+        if not first_token_recorded:
+          self._last_call_timing["llm_first_token_ms"] = (time.perf_counter() - llm_start) * 1000
+          first_token_recorded = True
         full_response += chunk
         yield chunk
+      self._last_call_timing["llm_total_ms"] = (time.perf_counter() - llm_start) * 1000
       completed = True
     finally:
       if completed:

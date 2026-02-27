@@ -8,6 +8,7 @@ import asyncio
 import random
 import re
 import sys
+import time
 import uuid
 from collections import deque
 from datetime import datetime
@@ -21,7 +22,7 @@ if str(project_root) not in sys.path:
 
 from langchain_wrapper import LLMWrapper, ModelType, ModelProvider
 from prompts import PromptLoader
-from .models import Comment, StreamerResponse, ResponseChunk
+from .models import Comment, StreamerResponse, ResponseChunk, ResponseTiming
 from .database import CommentDatabase
 from .config import StudioConfig, ReplyDeciderConfig, CommentClustererConfig
 from .reply_decider import ReplyDecider, CommentClusterer, ClusterResult
@@ -265,6 +266,9 @@ class StreamingStudio:
 
     # 后台任务引用（防止 GC 回收）
     self._background_tasks: set[asyncio.Task] = set()
+
+    # 最近一次回复的耗时分解（供监控面板使用）
+    self._last_response_timing: Optional[ResponseTiming] = None
 
     # 运行状态
     self._running = False
@@ -514,18 +518,25 @@ class StreamingStudio:
           else:
             continue
 
+        # 本轮耗时累加器
+        _t: dict[str, float] = {}
+
         # 弹幕聚类
         self._last_cluster_result = None
         if self._comment_clusterer and new_comments:
+          t0 = time.perf_counter()
           self._last_cluster_result = self._comment_clusterer.cluster(new_comments)
+          _t["comment_cluster_ms"] = (time.perf_counter() - t0) * 1000
 
         # 回复决策器：判断是否值得回复
         if self._reply_decider and (old_comments or new_comments):
           all_texts = [c.content for c in (old_comments + new_comments)][:3]
+          t0 = time.perf_counter()
           decision = await self._reply_decider.should_reply(
             old_comments, new_comments,
             last_reply_time=self._last_reply_time,
           )
+          _t["reply_decision_ms"] = (time.perf_counter() - t0) * 1000
           preview = " | ".join(all_texts)
           if not decision.should_reply:
             print(f"[决策器] 跳过({decision.phase}): {decision.reason} ← {preview[:40]}")
@@ -547,18 +558,34 @@ class StreamingStudio:
         if self._current_frame_b64:
           images = [self._current_frame_b64]
 
-        # 以“开始生成回复”的时间作为新旧弹幕分界，
+        # 以"开始生成回复"的时间作为新旧弹幕分界，
         # 这样回复期间到达的新弹幕会在下一轮继续作为新弹幕处理。
         reply_started_at = datetime.now()
+        total_start = time.perf_counter()
 
         if self.enable_streaming:
           response = await self._generate_response_streaming(
-            old_comments, new_comments, images=images,
+            old_comments, new_comments, images=images, _timing=_t,
           )
         else:
           response = await self._generate_response(
-            old_comments, new_comments, images=images,
+            old_comments, new_comments, images=images, _timing=_t,
           )
+
+        _t["total_ms"] = (time.perf_counter() - total_start) * 1000
+        self._last_response_timing = ResponseTiming(
+          total_ms=_t.get("total_ms", 0),
+          comment_cluster_ms=_t.get("comment_cluster_ms", 0),
+          reply_decision_ms=_t.get("reply_decision_ms", 0),
+          topic_context_ms=_t.get("topic_context_ms", 0),
+          prompt_format_ms=_t.get("prompt_format_ms", 0),
+          scene_understand_ms=_t.get("scene_understand_ms", 0),
+          memory_retrieval_ms=_t.get("memory_retrieval_ms", 0),
+          llm_first_token_ms=_t.get("llm_first_token_ms", 0),
+          llm_total_ms=_t.get("llm_total_ms", 0),
+          expression_map_ms=_t.get("expression_map_ms", 0),
+          timestamp=datetime.now().strftime("%H:%M:%S"),
+        )
 
         if response:
           self.database.save_response(response)
@@ -687,7 +714,7 @@ class StreamingStudio:
 
   def _collect_comments(self) -> tuple[list[Comment], list[Comment]]:
     """
-    从缓冲区收集最近弹幕，按“上次开始回复时间”分割为旧弹幕和新弹幕
+    从缓冲区收集最近弹幕，按"上次开始回复时间"分割为旧弹幕和新弹幕
 
     实际弹幕上限 = min(recent_comments_limit, 新弹幕数 * new_comment_context_ratio)
 
@@ -827,7 +854,7 @@ class StreamingStudio:
     """
     对弹幕内容做最小侵入的防注入清洗。
 
-    仅在命中特征时添加显式“不可执行”标记，保留原始语义便于主播正常互动。
+    仅在命中特征时添加显式"不可执行"标记，保留原始语义便于主播正常互动。
     """
     text = cls._normalize_comment_text(content)
     if any(p.search(text) for p in _DANMAKU_INJECTION_PATTERNS):
@@ -1047,6 +1074,7 @@ class StreamingStudio:
     old_comments: list[Comment],
     new_comments: list[Comment],
     images: Optional[list[str]] = None,
+    _timing: Optional[dict[str, float]] = None,
   ) -> Optional[StreamerResponse]:
     """
     根据弹幕（和视频帧）生成回复
@@ -1059,30 +1087,39 @@ class StreamingStudio:
       old_comments: 上次回复前的弹幕（背景参考）
       new_comments: 上次回复后的新弹幕
       images: base64 JPEG 图片列表（VLM 模式下的视频帧）
+      _timing: 耗时累加器（由 _main_loop 传入）
 
     Returns:
       回复对象
     """
+    _t = _timing if _timing is not None else {}
+
     # 话题管理器：获取标注和上下文
     annotations = None
     topic_context = None
     interaction_targets = None
     if self._topic_manager:
+      t0 = time.perf_counter()
       annotations = self._topic_manager.get_comment_annotations()
       topic_context = self._topic_manager.format_context(old_comments, new_comments)
       interaction_targets = self._select_interaction_targets(new_comments)
+      _t["topic_context_ms"] = (time.perf_counter() - t0) * 1000
 
+    t0 = time.perf_counter()
     prompt = self._format_comments_for_prompt(
       old_comments, new_comments, annotations, interaction_targets,
       cluster_result=self._last_cluster_result,
     )
+    _t["prompt_format_ms"] = (time.perf_counter() - t0) * 1000
 
     # VLM 两趟调用
     scene_description = ""
     rag_queries = None
     memory_input = None
     if images and self._current_frame_b64:
+      t0 = time.perf_counter()
       scene_description = await self._scene_understand(prompt, images)
+      _t["scene_understand_ms"] = (time.perf_counter() - t0) * 1000
 
       rag_queries = [scene_description] if scene_description else None
 
@@ -1114,14 +1151,23 @@ class StreamingStudio:
       print(f"LLM 调用错误: {e}")
       return None
 
-    reply_ids = tuple(c.id for c in new_comments)
-    return self._build_response(content, reply_ids)
+    # 从 wrapper 层读取 LLM 调用耗时
+    wrapper_timing = self.llm_wrapper.last_call_timing
+    _t["memory_retrieval_ms"] = wrapper_timing.get("memory_retrieval_ms", 0)
+    _t["llm_total_ms"] = wrapper_timing.get("llm_total_ms", 0)
+
+    t0 = time.perf_counter()
+    result = self._build_response(content, tuple(c.id for c in new_comments))
+    _t["expression_map_ms"] = (time.perf_counter() - t0) * 1000
+
+    return result
 
   async def _generate_response_streaming(
     self,
     old_comments: list[Comment],
     new_comments: list[Comment],
     images: Optional[list[str]] = None,
+    _timing: Optional[dict[str, float]] = None,
   ) -> Optional[StreamerResponse]:
     """
     流式生成回复，逐 token 分发 ResponseChunk
@@ -1134,30 +1180,39 @@ class StreamingStudio:
       old_comments: 上次回复前的弹幕（背景参考）
       new_comments: 上次回复后的新弹幕
       images: base64 JPEG 图片列表（VLM 模式下的视频帧）
+      _timing: 耗时累加器（由 _main_loop 传入）
 
     Returns:
       完整回复对象（流结束后组装）
     """
+    _t = _timing if _timing is not None else {}
+
     # 话题管理器：获取标注和上下文
     annotations = None
     topic_context = None
     interaction_targets = None
     if self._topic_manager:
+      t0 = time.perf_counter()
       annotations = self._topic_manager.get_comment_annotations()
       topic_context = self._topic_manager.format_context(old_comments, new_comments)
       interaction_targets = self._select_interaction_targets(new_comments)
+      _t["topic_context_ms"] = (time.perf_counter() - t0) * 1000
 
+    t0 = time.perf_counter()
     prompt = self._format_comments_for_prompt(
       old_comments, new_comments, annotations, interaction_targets,
       cluster_result=self._last_cluster_result,
     )
+    _t["prompt_format_ms"] = (time.perf_counter() - t0) * 1000
 
     # VLM 两趟调用
     scene_description = ""
     rag_queries = None
     memory_input = None
     if images and self._current_frame_b64:
+      t0 = time.perf_counter()
       scene_description = await self._scene_understand(prompt, images)
+      _t["scene_understand_ms"] = (time.perf_counter() - t0) * 1000
 
       rag_queries = [scene_description] if scene_description else None
 
@@ -1201,8 +1256,16 @@ class StreamingStudio:
           except Exception as e:
             print(f"chunk 回调错误: {e}")
 
+      # 从 wrapper 层读取 LLM 调用耗时
+      wrapper_timing = self.llm_wrapper.last_call_timing
+      _t["memory_retrieval_ms"] = wrapper_timing.get("memory_retrieval_ms", 0)
+      _t["llm_first_token_ms"] = wrapper_timing.get("llm_first_token_ms", 0)
+      _t["llm_total_ms"] = wrapper_timing.get("llm_total_ms", 0)
+
       # 流式结束后：对完整文本做表情/动作映射，替换标签
+      t0 = time.perf_counter()
       display_text, em_tags = self._apply_expression_mapping(accumulated)
+      _t["expression_map_ms"] = (time.perf_counter() - t0) * 1000
 
       # 发送完成标记（携带映射后文本，GUI 会用它刷新最终显示）
       done_chunk = ResponseChunk(
@@ -1356,6 +1419,11 @@ class StreamingStudio:
       "last_cluster_result": self._format_cluster_debug(),
       "vlm_mode": self._video_player is not None,
       "video_player": self._video_player.debug_state() if self._video_player else None,
+      "response_timing": (
+        self._last_response_timing.to_dict()
+        if self._last_response_timing is not None
+        else None
+      ),
     }
 
   def topic_debug_state(self) -> Optional[dict]:
