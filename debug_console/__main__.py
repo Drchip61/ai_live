@@ -11,6 +11,10 @@ import logging
 import sys
 from pathlib import Path
 
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+  sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+  sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # 将项目根目录添加到路径
 project_root = Path(__file__).parent.parent
 if str(project_root) not in sys.path:
@@ -44,6 +48,10 @@ def main():
     "--topic-manager", action="store_true", default=True,
     help="启用话题管理器（追踪和管理直播话题，默认关闭）",
   )
+  parser.add_argument(
+    "--speech-url", default=None,
+    help="语音/动作服务 URL（如 http://10.81.7.115:9200/say）",
+  )
 
   args = parser.parse_args()
 
@@ -61,6 +69,7 @@ def main():
       port=args.port,
       enable_global_memory=args.global_memory,
       enable_topic_manager=args.topic_manager,
+      speech_url=args.speech_url,
     )
   except KeyboardInterrupt:
     print("\n正在关闭...")

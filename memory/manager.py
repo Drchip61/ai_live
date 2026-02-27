@@ -11,6 +11,8 @@ from typing import Optional, Union
 from langchain_core.language_models import BaseChatModel
 from langchain_huggingface import HuggingFaceEmbeddings
 
+from pathlib import Path
+
 from .config import MemoryConfig, EmbeddingConfig
 from .store import VectorStore
 from .archive import MemoryArchive
@@ -18,6 +20,8 @@ from .layers.active import ActiveLayer
 from .layers.temporary import TemporaryLayer
 from .layers.summary import SummaryLayer
 from .layers.static import StaticLayer
+from .layers.user_profile import UserProfileLayer
+from .layers.character_profile import CharacterProfileLayer
 from .retriever import MemoryRetriever
 from .prompts import INTERACTION_SUMMARY_PROMPT, PERIODIC_SUMMARY_PROMPT
 
@@ -65,10 +69,11 @@ class MemoryManager:
     # 创建共享 embeddings（避免重复加载模型，优先使用 GPU）
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    embeddings = HuggingFaceEmbeddings(
+    self._embeddings = HuggingFaceEmbeddings(
       model_name=embedding_config.model_name,
       model_kwargs={"device": device},
     )
+    embeddings = self._embeddings
 
     # 初始化归档器（纯内存模式下禁用）
     self._archive = MemoryArchive(
@@ -97,6 +102,22 @@ class MemoryManager:
     )
     self._static.load()
 
+    # 用户画像层（可选）
+    self._user_profile: Optional[UserProfileLayer] = None
+    if config.user_profile.enabled:
+      persist_path = None
+      if enable_global_memory and config.embedding.persist_directory:
+        persist_path = Path(config.embedding.persist_directory) / config.user_profile.persist_filename
+      self._user_profile = UserProfileLayer(persist_path=persist_path)
+
+    # 角色设定档层（可选）
+    self._character_profile: Optional[CharacterProfileLayer] = None
+    if config.character_profile.enabled:
+      persist_path = None
+      if enable_global_memory and config.embedding.persist_directory:
+        persist_path = Path(config.embedding.persist_directory) / config.character_profile.persist_filename
+      self._character_profile = CharacterProfileLayer(persist_path=persist_path)
+
     # 当前会话 ID（由 studio 在 start() 时设置）
     self._session_id: Optional[str] = None
 
@@ -119,6 +140,19 @@ class MemoryManager:
 
     # 近期交互缓冲（供定时汇总使用）
     self._recent_interactions: list[tuple[str, str, datetime]] = []
+
+  @property
+  def user_profile(self) -> Optional[UserProfileLayer]:
+    return self._user_profile
+
+  @property
+  def character_profile(self) -> Optional[CharacterProfileLayer]:
+    return self._character_profile
+
+  @property
+  def embeddings(self) -> HuggingFaceEmbeddings:
+    """共享的嵌入模型实例（供外部模块复用，避免重复加载）"""
+    return self._embeddings
 
   @property
   def session_id(self) -> Optional[str]:
@@ -249,7 +283,7 @@ class MemoryManager:
     - 最近交互缓冲
     - （可选）summary 层
 
-    不会清空 static 层（角色固定记忆）。
+    不会清空 static 层（角色固定记忆）和 profile 层（跨会话持久化）。
 
     Args:
       clear_summary: 是否同时清空 summary 层，默认 True
@@ -317,7 +351,7 @@ class MemoryManager:
     except Exception as e:
       logger.debug("读取 static 层记忆失败: %s", e)
 
-    return {
+    result = {
       "active_count": self._active.count(),
       "active_capacity": self._active._config.capacity,
       "active_memories": [
@@ -338,6 +372,13 @@ class MemoryManager:
       "summary_task_running": self._summary_task is not None and not self._summary_task.done(),
       "cleanup_task_running": self._cleanup_task is not None and not self._cleanup_task.done(),
     }
+
+    if self._user_profile is not None:
+      result["user_profile"] = self._user_profile.debug_state()
+    if self._character_profile is not None:
+      result["character_profile"] = self._character_profile.debug_state()
+
+    return result
 
   async def _summary_loop(self) -> None:
     """

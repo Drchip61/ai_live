@@ -25,6 +25,10 @@ from prompts import PromptLoader
 
 if TYPE_CHECKING:
   from memory.manager import MemoryManager
+  from emotion.state import EmotionMachine
+  from emotion.affection import AffectionBank
+  from meme.manager import MemeManager
+  from validation.checker import ResponseChecker
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,10 @@ class LLMWrapper:
     persona: str = "karin",
     max_history: int = 20,
     memory_manager: Optional["MemoryManager"] = None,
+    emotion_machine: Optional["EmotionMachine"] = None,
+    affection_bank: Optional["AffectionBank"] = None,
+    meme_manager: Optional["MemeManager"] = None,
+    response_checker: Optional["ResponseChecker"] = None,
   ):
     """
     初始化 LLM 包装器
@@ -57,14 +65,22 @@ class LLMWrapper:
     Args:
       model_type: 模型类型
       model_name: 模型名称，不指定则使用默认值
-      persona: 人设名称 (karin/sage/kuro)
+      persona: 人设名称 (karin/sage/kuro/naixiong)
       max_history: 保留的最大历史消息数
       memory_manager: 记忆管理器（可选，传入后启用记忆功能）
+      emotion_machine: 情绪状态机（可选，奶凶人设专用）
+      affection_bank: 好感度银行（可选，奶凶人设专用）
+      meme_manager: 梗管理器（可选，奶凶人设专用）
+      response_checker: 回复校验器（可选，奶凶人设专用）
     """
     self.model_type = model_type
     self.model_name = model_name
     self.persona = persona
     self._memory = memory_manager
+    self._emotion = emotion_machine
+    self._affection = affection_bank
+    self._meme_manager = meme_manager
+    self._checker = response_checker
 
     # 加载提示词
     prompt_loader = PromptLoader()
@@ -143,23 +159,44 @@ class LLMWrapper:
     topic_context: Optional[str] = None,
   ) -> str:
     """
-    构建额外上下文（记忆 + 话题）
+    构建额外上下文
 
-    Args:
-      user_input: 用户输入（默认也用作 RAG 查询）
-      rag_queries: 自定义 RAG 查询列表（如逐条弹幕），
-        传入时用此列表代替 user_input 进行 RAG 检索
-      topic_context: 话题上下文（来自话题管理器）
+    当奶凶系统模块存在时，按五分区结构组装：
+    情绪状态 → 好感度 → 检索记忆+梗 → 话题上下文
 
-    Returns:
-      格式化的额外上下文文本
+    无新模块时走原有逻辑，保持向下兼容。
     """
     parts: list[str] = []
+
+    if self._emotion is not None:
+      parts.append(self._emotion.state.to_prompt())
+    if self._affection is not None:
+      hint = self._affection.to_prompt()
+      if hint:
+        parts.append(hint)
+
+    if self._memory is not None and getattr(self._memory, "character_profile", None) is not None:
+      cp_text = self._memory.character_profile.to_prompt()
+      if cp_text:
+        parts.append(cp_text)
+
+    if self._memory is not None and getattr(self._memory, "user_profile", None) is not None:
+      up_text = self._memory.user_profile.to_prompt()
+      if up_text:
+        parts.append(up_text)
 
     if self._memory is not None:
       query: Union[str, list[str]] = rag_queries if rag_queries else user_input
       active_text, rag_text = self._memory.retrieve(query)
-      parts = [p for p in [active_text, rag_text] if p]
+      if active_text:
+        parts.append(active_text)
+      if rag_text:
+        parts.append(rag_text)
+
+    if self._meme_manager is not None:
+      meme_text = self._meme_manager.to_prompt()
+      if meme_text:
+        parts.append(meme_text)
 
     if topic_context:
       parts.append(topic_context)
@@ -231,6 +268,7 @@ class LLMWrapper:
       self._last_scene_understanding = text.strip()
       return self._last_scene_understanding
     except Exception as e:
+      print(f"[VLM] 场景理解调用失败: {e}", flush=True)
       logger.error("场景理解调用失败: %s", e)
       self._last_scene_understanding = ""
       return ""
@@ -370,6 +408,16 @@ class LLMWrapper:
         for processor in self.pipeline.postprocessors:
           full_response = processor(full_response)
 
+        if self._checker is not None:
+          mood = self._emotion.mood.value if self._emotion else "normal"
+          result = self._checker.check(full_response, current_mood=mood)
+          if not result.passed and result.auto_fixed and result.fixed_response:
+            logger.info("回复校验自动修正: %s", result.violations)
+            full_response = result.fixed_response
+
+        if self._emotion is not None:
+          self._emotion.tick()
+
         if save_history:
           self._history.append((user_input, full_response))
 
@@ -409,7 +457,7 @@ class LLMWrapper:
     Returns:
       包含当前运行状态的字典
     """
-    return {
+    state = {
       "model_type": self.model_type.value,
       "model_name": self.model_name,
       "persona": self.persona,
@@ -418,6 +466,13 @@ class LLMWrapper:
       "background_tasks": len(self._background_tasks),
       "system_prompt_preview": self.pipeline.system_prompt[:200],
     }
+    if self._emotion is not None:
+      state["emotion"] = self._emotion.debug_state()
+    if self._affection is not None:
+      state["affection"] = self._affection.debug_state()
+    if self._meme_manager is not None:
+      state["meme"] = self._meme_manager.debug_state()
+    return state
 
   def memory_debug_state(self) -> Optional[dict]:
     """

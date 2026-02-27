@@ -16,6 +16,7 @@ if str(project_root) not in sys.path:
 
 from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio
+from connection import SpeechBroadcaster
 
 from .comment_broadcaster import CommentBroadcaster
 from .state_collector import StateCollector
@@ -30,6 +31,7 @@ def run(
   port: int = 8080,
   enable_global_memory: bool = False,
   enable_topic_manager: bool = False,
+  speech_url: Optional[str] = None,
 ) -> None:
   """
   启动调试控制台
@@ -41,6 +43,7 @@ def run(
     port: 监听端口
     enable_global_memory: 是否开启全局记忆（持久化到文件）
     enable_topic_manager: 是否启用话题管理器
+    speech_url: 语音/动作服务 URL（None 则不启用）
   """
   # 初始化直播间
   studio = StreamingStudio(
@@ -54,6 +57,10 @@ def run(
   studio.enable_streaming = True
   collector = StateCollector(studio)
   broadcaster = CommentBroadcaster()
+
+  if speech_url:
+    speech = SpeechBroadcaster(api_url=speech_url, model_type=model_type)
+    speech.attach(studio)
 
   @ui.page("/")
   def index():

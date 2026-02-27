@@ -70,11 +70,15 @@ class StreamerResponse:
     content: 回复内容
     reply_to: 回复的弹幕ID列表
     timestamp: 回复时间
+    mapped_content: 表情/动作映射后的文本（无映射时为 None）
+    expression_motion_tags: 表情/动作标签元组
   """
   content: str
   reply_to: tuple[str, ...] = field(default_factory=tuple)
   id: str = field(default_factory=lambda: str(uuid.uuid4()))
   timestamp: datetime = field(default_factory=datetime.now)
+  mapped_content: Optional[str] = None
+  expression_motion_tags: tuple = field(default_factory=tuple)
 
   def to_dict(self) -> dict:
     """转换为字典"""

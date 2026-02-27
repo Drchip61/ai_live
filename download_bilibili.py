@@ -22,6 +22,10 @@ import zlib
 from pathlib import Path
 from urllib.parse import urlparse
 
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+  sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+  sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import requests
 
 BILIBILI_VIEW_API = "https://api.bilibili.com/x/web-interface/view"

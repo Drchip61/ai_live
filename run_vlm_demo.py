@@ -23,6 +23,10 @@ import asyncio
 import sys
 from pathlib import Path
 
+if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
+  sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+  sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 project_root = Path(__file__).parent
 if str(project_root) not in sys.path:
   sys.path.insert(0, str(project_root))
@@ -30,6 +34,7 @@ if str(project_root) not in sys.path:
 from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio
 from video_source import VideoPlayer
+from connection import SpeechBroadcaster
 
 
 def parse_args():
@@ -46,7 +51,7 @@ def parse_args():
   )
   parser.add_argument(
     "--persona", default="karin",
-    choices=["karin", "sage", "kuro"],
+    choices=["karin", "sage", "kuro", "naixiong"],
     help="主播人设（默认 karin）",
   )
   parser.add_argument(
@@ -82,6 +87,10 @@ def parse_args():
     "--topic-manager", action="store_true", default=False,
     help="启用话题管理器",
   )
+  parser.add_argument(
+    "--speech-url", default=None,
+    help="语音/动作服务 URL（如 http://10.81.7.115:9200/say），启用后回复自动翻译日语并推送",
+  )
   return parser.parse_args()
 
 
@@ -106,6 +115,7 @@ async def main():
   print(f"  帧间隔: {args.frame_interval}s")
   print(f"  记忆: {'启用' if not args.no_memory else '禁用'}")
   print(f"  全局记忆: {'启用' if args.global_memory else '禁用'}")
+  print(f"  语音服务: {args.speech_url or '未启用'}")
   print("=" * 60)
   print()
 
@@ -134,10 +144,8 @@ async def main():
 
   def on_chunk(chunk):
     if chunk.done:
+      print(f"[主播] {chunk.accumulated}")
       print()
-      print()
-    else:
-      print(chunk.chunk, end="", flush=True)
 
   def on_response(response):
     pass
@@ -155,6 +163,13 @@ async def main():
   studio.on_pre_response(on_pre_response)
   studio.on_response_chunk(on_chunk)
   studio.on_response(on_response)
+
+  if args.speech_url:
+    speech = SpeechBroadcaster(
+      api_url=args.speech_url,
+      model_type=model_type,
+    )
+    speech.attach(studio)
 
   try:
     await studio.start()

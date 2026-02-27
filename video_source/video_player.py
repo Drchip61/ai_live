@@ -229,9 +229,12 @@ class VideoPlayer:
           break
 
         # 显示帧（高频率，用于 GUI 流畅播放）
+        # 通过 to_thread 避免 OpenCV 同步 I/O 阻塞事件循环导致 MJPEG 推送延迟
         if has_display:
           if self._current_sec - self._last_display_frame_sec >= self._display_interval:
-            display_frame = self._display_extractor.extract_at(self._current_sec)
+            display_frame = await asyncio.to_thread(
+              self._display_extractor.extract_at, self._current_sec,
+            )
             if display_frame:
               self._last_display_frame_sec = self._current_sec
               for cb in self._on_display_frame_callbacks:
@@ -242,7 +245,9 @@ class VideoPlayer:
 
         # AI 采样帧（低频率，供 VLM 模型使用）
         if self._current_sec - self._last_frame_sec >= self.frame_interval:
-          frame = self._extractor.extract_at(self._current_sec)
+          frame = await asyncio.to_thread(
+            self._extractor.extract_at, self._current_sec,
+          )
           if frame:
             self._current_frame = frame
             self._last_frame_sec = self._current_sec
