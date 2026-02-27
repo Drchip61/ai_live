@@ -52,4 +52,5 @@ class StateCollector:
       "llm": llm_state,
       "memory": memory_state,
       "topics": topic_state,
+      "timing": studio_state.get("response_timing") if studio_state else None,
     }
