@@ -161,13 +161,15 @@ class LLMWrapper:
     """
     构建额外上下文
 
-    当奶凶系统模块存在时，按五分区结构组装：
-    情绪状态 → 好感度 → 检索记忆+梗 → 话题上下文
+    当奶凶系统模块存在时，按设计文档五分区结构组装：
+      ② 角色设定档 → ③ 用户画像 → ④ 检索记忆+梗 → 话题上下文
+    （① 人设指令区由 system_prompt 覆盖，⑤ 近期对话区由 pipeline 管理）
 
     无新模块时走原有逻辑，保持向下兼容。
     """
     parts: list[str] = []
 
+    # ① 情绪状态 + 好感度档位（注入人设指令区的动态补充）
     if self._emotion is not None:
       parts.append(self._emotion.state.to_prompt())
     if self._affection is not None:
@@ -175,16 +177,19 @@ class LLMWrapper:
       if hint:
         parts.append(hint)
 
-    if self._memory is not None and getattr(self._memory, "character_profile", None) is not None:
+    # ② 角色设定档（全量注入）
+    if self._memory is not None and self._memory.character_profile is not None:
       cp_text = self._memory.character_profile.to_prompt()
       if cp_text:
         parts.append(cp_text)
 
-    if self._memory is not None and getattr(self._memory, "user_profile", None) is not None:
+    # ③ 用户画像（全量注入）
+    if self._memory is not None and self._memory.user_profile is not None:
       up_text = self._memory.user_profile.to_prompt()
       if up_text:
         parts.append(up_text)
 
+    # ④ 检索记忆区
     if self._memory is not None:
       query: Union[str, list[str]] = rag_queries if rag_queries else user_input
       active_text, rag_text = self._memory.retrieve(query)
@@ -193,11 +198,13 @@ class LLMWrapper:
       if rag_text:
         parts.append(rag_text)
 
+    # 活跃梗注入
     if self._meme_manager is not None:
       meme_text = self._meme_manager.to_prompt()
       if meme_text:
         parts.append(meme_text)
 
+    # 话题上下文
     if topic_context:
       parts.append(topic_context)
 
@@ -268,7 +275,6 @@ class LLMWrapper:
       self._last_scene_understanding = text.strip()
       return self._last_scene_understanding
     except Exception as e:
-      print(f"[VLM] 场景理解调用失败: {e}", flush=True)
       logger.error("场景理解调用失败: %s", e)
       self._last_scene_understanding = ""
       return ""
@@ -408,6 +414,7 @@ class LLMWrapper:
         for processor in self.pipeline.postprocessors:
           full_response = processor(full_response)
 
+        # 生成后校验（奶凶人设专用）
         if self._checker is not None:
           mood = self._emotion.mood.value if self._emotion else "normal"
           result = self._checker.check(full_response, current_mood=mood)
@@ -415,6 +422,7 @@ class LLMWrapper:
             logger.info("回复校验自动修正: %s", result.violations)
             full_response = result.fixed_response
 
+        # 情绪 tick（每轮自动衰减）
         if self._emotion is not None:
           self._emotion.tick()
 

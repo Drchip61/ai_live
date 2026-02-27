@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,8 @@ class Topic:
   stale: bool = False
   created_at: datetime = field(default_factory=datetime.now)
   updated_at: datetime = field(default_factory=datetime.now)
+  last_discussed_at: datetime = field(default_factory=datetime.now)
+  """最近一次有弹幕关联到此话题的时间（区别于 updated_at：任何字段变更都会更新）"""
 
 
 @dataclass(frozen=True)
@@ -59,4 +62,4 @@ class RhythmAnalysisDelta:
     suggested_timing: 建议的下次等待时间 (min, max)，None 表示无建议
   """
   stale_topic_ids: list[str] = field(default_factory=list)
-  suggested_timing: tuple[float, float] | None = None
+  suggested_timing: Optional[tuple[float, float]] = None

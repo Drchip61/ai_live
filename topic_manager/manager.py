@@ -277,6 +277,12 @@ class TopicManager:
       # 1. significance 衰减（无 LLM 调用）
       self._table.decay_all(self._config.significance_decay)
 
+      # 1b. 空闲话题额外衰减
+      self._table.idle_decay(
+        self._config.idle_decay_threshold_seconds,
+        self._config.idle_decay_rate,
+      )
+
       # boost 最近弹幕提及的话题
       boosted = set()
       for comment in comments:
@@ -356,6 +362,37 @@ class TopicManager:
         delta.suggested_timing[0], delta.suggested_timing[1],
       )
 
+  def suggest_proactive_topic(self, silence_seconds: float) -> Optional["Topic"]:
+    """
+    推荐一个适合主动推进的话题
+
+    选择条件：非 stale、有 suggestion、significance 达标、空闲足够久。
+    纯内存查询，无 LLM 调用。
+
+    Args:
+      silence_seconds: 距上次回复的沉默时长（秒），仅供调用方参考，方法内不做门控
+
+    Returns:
+      最佳候选话题，无合适话题返回 None
+    """
+    now = datetime.now()
+    candidates = []
+    for topic in self._table.get_all():
+      if topic.stale:
+        continue
+      if not topic.suggestion:
+        continue
+      if topic.significance < self._config.proactive_topic_min_significance:
+        continue
+      idle = (now - topic.last_discussed_at).total_seconds()
+      if idle < self._config.proactive_topic_min_idle_seconds:
+        continue
+      candidates.append(topic)
+
+    if not candidates:
+      return None
+    return max(candidates, key=lambda t: t.significance)
+
   def debug_state(self) -> dict:
     """
     获取调试状态快照
@@ -363,6 +400,7 @@ class TopicManager:
     Returns:
       包含话题管理器当前状态的字典
     """
+    now = datetime.now()
     topics = self._table.get_all()
     return {
       "running": self._running,
@@ -380,6 +418,8 @@ class TopicManager:
           "user_count": len(t.user_ids),
           "created_at": t.created_at.strftime("%H:%M:%S"),
           "updated_at": t.updated_at.strftime("%H:%M:%S"),
+          "last_discussed_at": t.last_discussed_at.strftime("%H:%M:%S"),
+          "idle_seconds": round((now - t.last_discussed_at).total_seconds()),
         }
         for t in sorted(topics, key=lambda x: x.significance, reverse=True)
       ],

@@ -71,3 +71,17 @@ class ReplyDeciderConfig:
 
   llm_judge_urgency_threshold: float = 4.0
   """LLM 精判返回 urgency 低于此值时跳过回复"""
+
+
+@dataclass(frozen=True)
+class CommentClustererConfig:
+  """弹幕聚类器配置"""
+
+  similarity_threshold: float = 0.75
+  """语义相似度阈值（cosine similarity），高于此值合并"""
+
+  min_cluster_size: int = 2
+  """最小成簇数量，低于此值不合并"""
+
+  max_pattern_unit_length: int = 4
+  """规则阶段：循环节最大长度（超过此长度不视为循环模式）"""

@@ -20,6 +20,18 @@ class UserProfileLayer:
 
   以 JSON 结构存储用户信息，每条数据包含 value / source / confidence。
   支持冲突覆盖（新信息替换旧信息，旧信息记入变更历史）。
+
+  存储格式：
+    {
+      "likes": {
+        "food": {"value": "火锅", "source": "session_xxx", "confidence": "high"},
+        ...
+      },
+      "dislikes": {...},
+      "habits": {...},
+      "occupation": {"value": "...", "source": "...", "confidence": "..."},
+      ...
+    }
   """
 
   def __init__(self, persist_path: Optional[Path] = None) -> None:
@@ -45,6 +57,11 @@ class UserProfileLayer:
     source: str = "",
     confidence: str = "medium",
   ) -> None:
+    """
+    写入或更新一条用户信息
+
+    冲突时覆盖旧值并记录变更历史。
+    """
     if category not in self._data:
       self._data[category] = {}
 
@@ -68,6 +85,7 @@ class UserProfileLayer:
     self._maybe_persist()
 
   def set_simple(self, category: str, value: str, source: str = "") -> None:
+    """写入单值类别（如 occupation）"""
     old = self._data.get(category)
     if isinstance(old, dict) and old.get("value") and old["value"] != value:
       self._change_history.append({
@@ -82,6 +100,7 @@ class UserProfileLayer:
     self._maybe_persist()
 
   def to_prompt(self) -> str:
+    """格式化为可注入 prompt 的文本"""
     lines = ["【观众画像】"]
     empty = True
 

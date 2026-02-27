@@ -6,7 +6,6 @@
 
 import json
 import logging
-import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -19,7 +18,20 @@ class CharacterProfileLayer:
   角色设定档存储层
 
   存储角色自身在对话中表达过的偏好、观点、承诺和给用户起的外号。
-  写入后长期保持，极少更新。
+  写入后长期保持，极少更新。更新时应做成"认知更新事件"而非静默修改。
+
+  存储格式：
+    {
+      "preferences": [
+        {"content": "讨厌香菜", "source": "session_xxx", "weight": 1.0}
+      ],
+      "claims": [
+        {"content": "自称记忆力很好", "source": "session_xxx", "weight": 0.9}
+      ],
+      "nicknames_given": [
+        {"target": "观众", "nickname": "迟到大王", "origin": "...", "source": "session_xxx"}
+      ]
+    }
   """
 
   def __init__(self, persist_path: Optional[Path] = None) -> None:
@@ -85,6 +97,7 @@ class CharacterProfileLayer:
     self._maybe_persist()
 
   def get_all_flags(self) -> list[str]:
+    """获取所有设定 flag 的文本列表（用于一致性检查）"""
     flags = []
     for p in self.preferences:
       flags.append(p.get("content", ""))
@@ -93,15 +106,18 @@ class CharacterProfileLayer:
     return [f for f in flags if f]
 
   def find_relevant_flags(self, text: str) -> list[str]:
+    """查找与给定文本相关的角色 flag（简单关键词匹配）"""
     relevant = []
     text_lower = text.lower()
     for flag in self.get_all_flags():
+      keywords = [w for w in flag if len(w) > 1]
       flag_lower = flag.lower()
       if any(kw in text_lower for kw in _extract_keywords(flag_lower)):
         relevant.append(flag)
     return relevant
 
   def to_prompt(self) -> str:
+    """格式化为可注入 prompt 的文本"""
     parts = ["【角色设定档 — 我立过的 flag】"]
     empty = True
 
@@ -170,5 +186,7 @@ class CharacterProfileLayer:
 
 
 def _extract_keywords(text: str) -> list[str]:
+  """从文本中提取 >= 2 字符的词作为关键词"""
+  import re
   words = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zA-Z]{3,}", text)
   return words

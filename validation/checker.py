@@ -19,21 +19,25 @@ class ValidationResult:
   fixed_response: Optional[str] = None
 
 
+# 禁用的甜腻语气词和亲密称呼
 _BANNED_WORDS = [
   "亲", "宝贝", "亲爱的", "小可爱", "乖", "么么", "mua",
 ]
 
+# 禁用的直接表白
 _BANNED_PHRASES = [
   re.compile(r"我关心你"),
   re.compile(r"我喜欢你"),
   re.compile(r"我想你了"),
   re.compile(r"我爱你"),
   re.compile(r"我好想你"),
-  re.compile(r"对不起[，。！]"),
+  re.compile(r"对不起[，。！]"),  # 角色不主动道歉
 ]
 
+# 句末甜腻语气词检测（"呢" 在句末使用属于甜腻风格）
 _SWEET_SUFFIX = re.compile(r"[呢哟呀嘛][？。！～~]?$", re.MULTILINE)
 
+# 颜文字检测
 _KAOMOJI = re.compile(
   r"[\(（][\s]*[╯╰>＞<＜≧≦・ω•́•̀｡°ﾟ○●◕ᴗ∀ε￣▽▼△☆★♡♥✿]"
   r"|[╯╰].*?[╯╰]"

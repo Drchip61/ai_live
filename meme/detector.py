@@ -23,10 +23,10 @@ _CATCHPHRASE_REPEAT_THRESHOLD = 3
 @dataclass
 class MemeSignal:
   """梗信号"""
-  meme_type: str
+  meme_type: str  # "nickname" / "catchphrase" / "incident" / "callback"
   content: str
   origin: str
-  confidence: float
+  confidence: float  # 0-1
 
 
 class MemeDetector:

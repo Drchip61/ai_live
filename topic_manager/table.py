@@ -138,6 +138,7 @@ class TopicTable:
       topic_id,
       comment_ids=new_comment_ids,
       user_ids=new_user_ids,
+      last_discussed_at=datetime.now(),
     )
 
   def get_top_k(self, k: int) -> list[Topic]:
@@ -190,6 +191,32 @@ class TopicTable:
     for topic_id, topic in list(self._topics.items()):
       new_sig = round(topic.significance * coefficient, 3)
       self._topics[topic_id] = replace(topic, significance=new_sig)
+
+  def idle_decay(
+    self,
+    threshold_seconds: float,
+    decay_rate: float,
+  ) -> None:
+    """
+    对空闲话题施加额外 significance 衰减
+
+    超过 threshold_seconds 未收到弹幕的话题，
+    每超过 60 秒额外扣减 decay_rate。
+
+    Args:
+      threshold_seconds: 空闲衰减起始阈值（秒）
+      decay_rate: 每超过 60 秒的额外衰减量
+    """
+    now = datetime.now()
+    for topic_id, topic in list(self._topics.items()):
+      idle_seconds = (now - topic.last_discussed_at).total_seconds()
+      if idle_seconds <= threshold_seconds:
+        continue
+      excess = idle_seconds - threshold_seconds
+      penalty = decay_rate * (excess / 60.0)
+      new_sig = round(max(0.0, topic.significance - penalty), 3)
+      if new_sig != topic.significance:
+        self._topics[topic_id] = replace(topic, significance=new_sig)
 
   def boost(self, topic_id: str, boost_factor: float) -> Optional[Topic]:
     """

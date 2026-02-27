@@ -19,6 +19,7 @@ class Mood(str, Enum):
   SOFT = "soft"
 
 
+# 每种情绪在无外部刺激时自动回归 normal 的最大轮次
 _AUTO_DECAY_ROUNDS = {
   Mood.COMPETITIVE: 6,
   Mood.SULKING: 8,

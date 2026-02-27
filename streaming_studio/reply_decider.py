@@ -1,17 +1,19 @@
 """
-回复决策器
+回复决策器 + 弹幕聚类器
 两阶段判断主播是否应该回复：规则快筛（免费） + LLM 精判（Haiku）
+两阶段弹幕聚类：循环节规则快筛（免费） + 语义 embedding 精判
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
+import numpy as np
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.language_models import BaseChatModel
 
-from .config import ReplyDeciderConfig
+from .config import ReplyDeciderConfig, CommentClustererConfig
 from .models import Comment
 
 logger = logging.getLogger(__name__)
@@ -249,3 +251,252 @@ class ReplyDecider:
       return True
     unique_chars = set(content)
     return len(unique_chars) <= 2
+
+
+# ---------------------------------------------------------------------------
+# 弹幕聚类器
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CommentCluster:
+  """单个弹幕簇"""
+  representative: Comment
+  """代表弹幕（选最长内容的那条）"""
+
+  members: tuple[Comment, ...] = field(default_factory=tuple)
+  """所有成员（含代表）"""
+
+  merge_reason: str = "pattern"
+  """合并原因: "pattern"（循环节规则）或 "semantic"（语义相似）"""
+
+  @property
+  def count(self) -> int:
+    return len(self.members)
+
+
+@dataclass(frozen=True)
+class ClusterResult:
+  """弹幕聚类结果"""
+  clusters: tuple[CommentCluster, ...] = field(default_factory=tuple)
+  """聚类后的簇"""
+
+  singles: tuple[Comment, ...] = field(default_factory=tuple)
+  """未归入任何簇的独立弹幕"""
+
+  def representatives(self) -> list[Comment]:
+    """去重后的代表弹幕列表（单条 + 每簇代表），按时间排序"""
+    result = list(self.singles)
+    for cluster in self.clusters:
+      result.append(cluster.representative)
+    return sorted(result, key=lambda c: c.timestamp)
+
+  def cluster_for(self, comment_id: str) -> Optional[CommentCluster]:
+    """根据弹幕 ID 查找所属簇，不在任何簇中返回 None"""
+    for cluster in self.clusters:
+      if any(m.id == comment_id for m in cluster.members):
+        return cluster
+    return None
+
+
+class CommentClusterer:
+  """
+  两阶段弹幕聚类器
+
+  Phase 1（规则快筛，零成本）：
+    提取每条弹幕的最小循环节，循环节相同的弹幕直接归组。
+    "666"、"6666"、"66666" → 循环节 "6" → 同簇
+    "哈哈"、"哈哈哈哈" → 循环节 "哈" → 同簇
+    "233"、"233233" → 循环节 "233" → 同簇
+
+  Phase 2（语义聚类，需 embeddings）：
+    对规则阶段未归组的弹幕做 embedding + cosine similarity，
+    超阈值的合并。无 embeddings 时自动跳过此阶段。
+  """
+
+  def __init__(
+    self,
+    config: Optional[CommentClustererConfig] = None,
+    embeddings=None,
+  ):
+    """
+    Args:
+      config: 聚类器配置
+      embeddings: HuggingFaceEmbeddings 实例（可选，传入后启用语义阶段）
+    """
+    self.config = config or CommentClustererConfig()
+    self._embeddings = embeddings
+
+  def cluster(self, comments: list[Comment]) -> ClusterResult:
+    """
+    完整两阶段聚类
+
+    Args:
+      comments: 待聚类的弹幕列表
+
+    Returns:
+      ClusterResult 包含簇列表和独立弹幕
+    """
+    if not comments:
+      return ClusterResult()
+
+    # priority 弹幕不参与聚类
+    priority = [c for c in comments if c.priority]
+    normal = [c for c in comments if not c.priority]
+
+    if not normal:
+      return ClusterResult(singles=tuple(priority))
+
+    # Phase 1: 循环节规则快筛
+    rule_clusters, remaining = self._rule_cluster(normal)
+
+    # Phase 2: 语义聚类
+    semantic_clusters, still_remaining = self._semantic_cluster(remaining)
+
+    # 汇总
+    all_clusters = rule_clusters + semantic_clusters
+    all_singles = priority + still_remaining
+
+    logger.info(
+      "弹幕聚类: %d条 → %d簇 + %d条独立 (规则%d簇, 语义%d簇)",
+      len(comments), len(all_clusters), len(all_singles),
+      len(rule_clusters), len(semantic_clusters),
+    )
+
+    return ClusterResult(
+      clusters=tuple(all_clusters),
+      singles=tuple(all_singles),
+    )
+
+  def _rule_cluster(
+    self,
+    comments: list[Comment],
+  ) -> tuple[list[CommentCluster], list[Comment]]:
+    """
+    Phase 1: 按循环节归组
+
+    Returns:
+      (成功归组的簇列表, 未归组的弹幕列表)
+    """
+    groups: dict[str, list[Comment]] = {}
+    for c in comments:
+      content = c.content.strip().lower()
+      unit = self._extract_repeating_unit(content)
+
+      # 循环节长度超过阈值的不视为循环模式，按原文分组
+      if len(unit) > self.config.max_pattern_unit_length:
+        key = content
+      else:
+        key = unit
+
+      groups.setdefault(key, []).append(c)
+
+    clusters = []
+    ungrouped = []
+    for members in groups.values():
+      if len(members) >= self.config.min_cluster_size:
+        rep = max(members, key=lambda c: len(c.content))
+        clusters.append(CommentCluster(
+          representative=rep,
+          members=tuple(members),
+          merge_reason="pattern",
+        ))
+      else:
+        ungrouped.extend(members)
+
+    return clusters, ungrouped
+
+  def _semantic_cluster(
+    self,
+    comments: list[Comment],
+  ) -> tuple[list[CommentCluster], list[Comment]]:
+    """
+    Phase 2: 语义聚类（增量阈值法）
+
+    Returns:
+      (成功归组的簇列表, 未归组的弹幕列表)
+    """
+    if not comments or self._embeddings is None:
+      return [], list(comments) if comments else []
+
+    # 太少不值得做 embedding
+    if len(comments) < self.config.min_cluster_size:
+      return [], list(comments)
+
+    try:
+      texts = [c.content for c in comments]
+      vectors = self._embeddings.embed_documents(texts)
+      matrix = np.array(vectors, dtype=np.float32)
+    except Exception as e:
+      logger.warning("语义聚类 embedding 失败: %s", e)
+      return [], list(comments)
+
+    # 归一化（bge 输出通常已归一化，但安全起见）
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1, norms)
+    matrix = matrix / norms
+
+    # 增量阈值聚类
+    # cluster_indices[i] = 该簇包含的 comments 下标列表
+    # centroids[i] = 该簇的质心向量
+    cluster_indices: list[list[int]] = []
+    centroids: list[np.ndarray] = []
+
+    for idx in range(len(comments)):
+      vec = matrix[idx]
+      best_sim = -1.0
+      best_cluster = -1
+
+      for ci, centroid in enumerate(centroids):
+        sim = float(np.dot(vec, centroid))
+        if sim > best_sim:
+          best_sim = sim
+          best_cluster = ci
+
+      if best_sim >= self.config.similarity_threshold and best_cluster >= 0:
+        # 归入已有簇，更新质心（增量平均 + 重新归一化）
+        cluster_indices[best_cluster].append(idx)
+        n = len(cluster_indices[best_cluster])
+        new_centroid = centroids[best_cluster] * ((n - 1) / n) + vec / n
+        norm = np.linalg.norm(new_centroid)
+        centroids[best_cluster] = new_centroid / norm if norm > 0 else new_centroid
+      else:
+        # 新建簇
+        cluster_indices.append([idx])
+        centroids.append(vec.copy())
+
+    # 转换为 CommentCluster
+    clusters = []
+    ungrouped = []
+    for indices in cluster_indices:
+      if len(indices) >= self.config.min_cluster_size:
+        members = [comments[i] for i in indices]
+        rep = max(members, key=lambda c: len(c.content))
+        clusters.append(CommentCluster(
+          representative=rep,
+          members=tuple(members),
+          merge_reason="semantic",
+        ))
+      else:
+        for i in indices:
+          ungrouped.append(comments[i])
+
+    return clusters, ungrouped
+
+  @staticmethod
+  def _extract_repeating_unit(s: str) -> str:
+    """
+    提取最小循环节
+
+    "哈哈哈哈" → "哈"
+    "666666" → "6"
+    "233233" → "233"
+    "hello" → "hello"（无循环，返回自身）
+    "" → ""
+    """
+    if not s:
+      return s
+    n = len(s)
+    for period in range(1, n // 2 + 1):
+      if n % period == 0 and s[:period] * (n // period) == s:
+        return s[:period]
+    return s

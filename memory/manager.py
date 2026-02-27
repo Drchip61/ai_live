@@ -6,6 +6,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Union
 
 from langchain_core.language_models import BaseChatModel
@@ -293,6 +294,7 @@ class MemoryManager:
     if clear_summary:
       self._summary_layer.clear()
     self._recent_interactions.clear()
+    # 注意：user_profile 和 character_profile 不随运行期清空（它们是跨会话的）
     logger.info("已清空运行期记忆状态 (clear_summary=%s)", clear_summary)
 
   def debug_state(self) -> dict:

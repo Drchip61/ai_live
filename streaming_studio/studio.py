@@ -23,9 +23,8 @@ from langchain_wrapper import LLMWrapper, ModelType, ModelProvider
 from prompts import PromptLoader
 from .models import Comment, StreamerResponse, ResponseChunk
 from .database import CommentDatabase
-from .config import StudioConfig, ReplyDeciderConfig
-from .reply_decider import ReplyDecider
-
+from .config import StudioConfig, ReplyDeciderConfig, CommentClustererConfig
+from .reply_decider import ReplyDecider, CommentClusterer, ClusterResult
 
 if TYPE_CHECKING:
   from video_source import VideoPlayer
@@ -61,6 +60,7 @@ class StreamingStudio:
     enable_global_memory: bool = False,
     enable_topic_manager: bool = False,
     enable_reply_decider: bool = True,
+    enable_comment_clusterer: bool = False,
     # VLM 视频源（传入后启用 VLM 模式：画面+弹幕 → 多模态 LLM）
     video_player: Optional["VideoPlayer"] = None,
     # 高级定制
@@ -68,6 +68,7 @@ class StreamingStudio:
     database: Optional[CommentDatabase] = None,
     config: Optional[StudioConfig] = None,
     reply_decider_config: Optional[ReplyDeciderConfig] = None,
+    comment_clusterer_config: Optional[CommentClustererConfig] = None,
   ):
     """
     初始化虚拟直播间
@@ -79,6 +80,7 @@ class StreamingStudio:
       enable_memory: 是否启用分层记忆系统
       enable_global_memory: 是否开启全局记忆（持久化到文件），需同时开启 enable_memory
       enable_topic_manager: 是否启用话题管理器（追踪、分类和管理直播话题）
+      enable_comment_clusterer: 是否启用弹幕聚类器（合并语义相似弹幕，节省 token）
       video_player: 视频播放器（传入后启用 VLM 模式，自动从视频提取帧和弹幕）
       llm_wrapper: 自定义 LLM 封装（高级用户，传入后忽略 persona/model_type/enable_memory）
       database: 自定义数据库（高级用户）
@@ -211,6 +213,20 @@ class StreamingStudio:
         judge_prompt=rd_prompt,
       )
 
+    # 弹幕聚类器
+    self._comment_clusterer: Optional[CommentClusterer] = None
+    if enable_comment_clusterer:
+      cc_config = comment_clusterer_config or CommentClustererConfig()
+      cc_embeddings = None
+      # 尝试复用记忆模块的 embedding 模型
+      mem = self.llm_wrapper.memory_manager
+      if mem is not None:
+        cc_embeddings = getattr(mem, "embeddings", None)
+      self._comment_clusterer = CommentClusterer(
+        config=cc_config,
+        embeddings=cc_embeddings,
+      )
+
     # 表情动作语义映射器
     self._expression_mapper = None
     mapping_file = Path(__file__).resolve().parent.parent / "expression_motion_mapping.json"
@@ -224,6 +240,9 @@ class StreamingStudio:
         mapping_path=mapping_file,
         embeddings=shared_embeddings,
       )
+
+    # 最近一次聚类结果（供 debug_state 和 prompt 格式化使用）
+    self._last_cluster_result: Optional[ClusterResult] = None
 
     # Prompt 模板
     _loader = PromptLoader()
@@ -459,8 +478,6 @@ class StreamingStudio:
         else:
           remaining = random.uniform(self.min_interval, self.max_interval)
 
-        print(f"[计时] 等待 {remaining:.1f}s（区间 {self.min_interval:.1f}~{self.max_interval:.1f}s）", flush=True)
-
         while remaining > 0:
           try:
             await asyncio.wait_for(
@@ -471,11 +488,9 @@ class StreamingStudio:
             count = self._pending_comment_count
             self._pending_comment_count = 0
             self._comment_arrived.clear()
-            old_remaining = remaining
             remaining = max(0.0, remaining - count * self.config.comment_wait_reduction)
-            if remaining != old_remaining:
-              print(f"[计时] 弹幕加速 -{count * self.config.comment_wait_reduction:.1f}s → 剩余 {remaining:.1f}s", flush=True)
           except asyncio.TimeoutError:
+            # 自然超时
             break
 
         old_comments, new_comments = self._collect_comments()
@@ -498,6 +513,11 @@ class StreamingStudio:
             old_comments, new_comments = [], []
           else:
             continue
+
+        # 弹幕聚类
+        self._last_cluster_result = None
+        if self._comment_clusterer and new_comments:
+          self._last_cluster_result = self._comment_clusterer.cluster(new_comments)
 
         # 回复决策器：判断是否值得回复
         if self._reply_decider and (old_comments or new_comments):
@@ -539,9 +559,6 @@ class StreamingStudio:
           response = await self._generate_response(
             old_comments, new_comments, images=images,
           )
-
-        reply_elapsed = (datetime.now() - reply_started_at).total_seconds()
-        print(f"[计时] 回复生成总耗时 {reply_elapsed:.1f}s", flush=True)
 
         if response:
           self.database.save_response(response)
@@ -587,10 +604,9 @@ class StreamingStudio:
     """
     检查是否应主动发言
 
-    三条路径：
-    1. VLM 路径：基于画面变化 + 沉默超阈值触发
-    2. 话题路径：基于话题管理器建议触发
-    3. 奶凶情绪路径：长沉默触发真情流露
+    两条路径：
+    1. VLM 路径：基于画面变化 + 沉默超阈值触发（需要 video_player + reply_decider）
+    2. 话题路径：基于话题管理器建议触发（无需视频，需要 topic_manager）
     """
     silence = 0.0
     if self._last_reply_time:
@@ -598,6 +614,7 @@ class StreamingStudio:
     elif self._stream_start_time:
       silence = (datetime.now() - self._stream_start_time).total_seconds()
 
+    # 沉默阈值：优先用 reply_decider 配置，否则 fallback 10s
     min_silence = 10.0
     if self._reply_decider:
       min_silence = self._reply_decider.config.proactive_silence_threshold
@@ -619,14 +636,14 @@ class StreamingStudio:
           print(f"[决策器] 主动发言: {decision.reason}")
           return True
 
-    # 路径 2: 话题推进
-    if self._topic_manager and hasattr(self._topic_manager, "suggest_proactive_topic"):
+    # 路径 2: 话题推进（无需 VLM，需要话题管理器）
+    if self._topic_manager:
       topic = self._topic_manager.suggest_proactive_topic(silence)
       if topic is not None:
         print(f"[话题管理器] 主动推进话题: 「{topic.title}」 (沉默 {int(silence)}秒)")
         return True
 
-    # 路径 3: 奶凶角色情绪跟进
+    # 路径 3: 奶凶角色情绪跟进 — 长沉默触发真情流露或赌气
     emotion = self.llm_wrapper._emotion
     if emotion is not None and silence > min_silence * 2:
       from emotion.state import Mood
@@ -636,6 +653,37 @@ class StreamingStudio:
         return True
 
     return False
+
+  def _detect_emotion_from_comments(self, comments: list[Comment]) -> None:
+    """分析弹幕，触发情绪状态转换（奶凶专用）"""
+    emotion = self.llm_wrapper._emotion
+    if emotion is None:
+      return
+    from emotion.detector import EmotionTriggerDetector
+    detector = EmotionTriggerDetector()
+    for c in comments:
+      result = detector.detect(c.content, emotion.mood)
+      if result:
+        target_mood, trigger = result
+        emotion.transition(target_mood, trigger)
+        break
+
+  def _update_affection_from_comments(
+    self,
+    comments: list[Comment],
+    ai_response: str,
+  ) -> None:
+    """处理好感度更新（奶凶专用）"""
+    affection = self.llm_wrapper._affection
+    if affection is None:
+      return
+    meme_mgr = self.llm_wrapper._meme_manager
+    for c in comments:
+      meme_caught = False
+      if meme_mgr:
+        relevant = meme_mgr.find_relevant(c.content)
+        meme_caught = len(relevant) > 0
+      affection.process_interaction(c.content, ai_response, meme_caught=meme_caught)
 
   def _collect_comments(self) -> tuple[list[Comment], list[Comment]]:
     """
@@ -687,37 +735,6 @@ class StreamingStudio:
     old = old[-old_quota:] if old_quota > 0 else []
 
     return old, new
-
-  def _detect_emotion_from_comments(self, comments: list[Comment]) -> None:
-    """分析弹幕，触发情绪状态转换（奶凶专用）"""
-    emotion = self.llm_wrapper._emotion
-    if emotion is None:
-      return
-    from emotion.detector import EmotionTriggerDetector
-    detector = EmotionTriggerDetector()
-    for c in comments:
-      result = detector.detect(c.content, emotion.mood)
-      if result:
-        target_mood, trigger = result
-        emotion.transition(target_mood, trigger)
-        break
-
-  def _update_affection_from_comments(
-    self,
-    comments: list[Comment],
-    ai_response: str,
-  ) -> None:
-    """处理好感度更新（奶凶专用）"""
-    affection = self.llm_wrapper._affection
-    if affection is None:
-      return
-    meme_mgr = self.llm_wrapper._meme_manager
-    for c in comments:
-      meme_caught = False
-      if meme_mgr:
-        relevant = meme_mgr.find_relevant(c.content)
-        meme_caught = len(relevant) > 0
-      affection.process_interaction(c.content, ai_response, meme_caught=meme_caught)
 
   def _select_interaction_targets(
     self,
@@ -855,6 +872,7 @@ class StreamingStudio:
     new_comments: list[Comment],
     annotations: Optional[dict[str, str]] = None,
     interaction_targets: Optional[set[str]] = None,
+    cluster_result: Optional[ClusterResult] = None,
   ) -> str:
     """
     组合弹幕为 LLM 输入 prompt
@@ -864,13 +882,42 @@ class StreamingStudio:
       new_comments: 上次回复后的新弹幕
       annotations: 弹幕→话题标注映射（来自话题管理器）
       interaction_targets: 被选中为互动目标的弹幕 ID 集合
+      cluster_result: 弹幕聚类结果（有则折叠显示同簇弹幕）
 
     Returns:
       格式化后的 prompt 字符串
     """
     now = datetime.now()
 
+    # 预建聚类查找表：comment_id → 所属簇
+    clustered_ids: set[str] = set()
+    shown_cluster_reps: set[str] = set()
+    if cluster_result:
+      for cluster in cluster_result.clusters:
+        for m in cluster.members:
+          clustered_ids.add(m.id)
+
     def fmt(c: Comment) -> str:
+      # 聚类折叠：对同簇弹幕只显示代表，附计数
+      if cluster_result and c.id in clustered_ids:
+        cluster = cluster_result.cluster_for(c.id)
+        if cluster and cluster.representative.id not in shown_cluster_reps:
+          # 首次遇到该簇 → 显示代表弹幕，tags 基于代表查找
+          shown_cluster_reps.add(cluster.representative.id)
+          rep = cluster.representative
+          rep_base = self._format_comment(rep, now)
+          rep_tags = [f"x{cluster.count}条类似"]
+          if annotations and rep.id in annotations:
+            rep_tags.append(f"话题: {annotations[rep.id]}")
+          if interaction_targets and rep.id in interaction_targets:
+            rep_tags.append("优先回复")
+          prefix = "[" + " | ".join(rep_tags) + "] "
+          return f"- {prefix}{rep_base}"
+        else:
+          # 同簇非代表弹幕，跳过
+          return ""
+
+      # 非聚类弹幕，正常显示
       base = self._format_comment(c, now)
       tags = []
       if annotations and c.id in annotations:
@@ -886,14 +933,18 @@ class StreamingStudio:
 
     if old_comments:
       lines = [fmt(c) for c in old_comments]
-      parts.append(self._comment_headers["old_comments"] + "\n" + "\n".join(lines))
+      lines = [l for l in lines if l]  # 过滤聚类跳过的空行
+      if lines:
+        parts.append(self._comment_headers["old_comments"] + "\n" + "\n".join(lines))
 
     if new_comments:
       lines = [fmt(c) for c in new_comments]
+      lines = [l for l in lines if l]  # 过滤聚类跳过的空行
       header = self._comment_headers["new_comments"]
       if interaction_targets:
         header += "\n" + self._interaction_instruction
-      parts.append(header + "\n" + "\n".join(lines))
+      if lines:
+        parts.append(header + "\n" + "\n".join(lines))
     else:
       # 计算距离最近一条弹幕的沉默时长
       silence_msg = self._comment_headers["silence"]
@@ -1023,6 +1074,7 @@ class StreamingStudio:
 
     prompt = self._format_comments_for_prompt(
       old_comments, new_comments, annotations, interaction_targets,
+      cluster_result=self._last_cluster_result,
     )
 
     # VLM 两趟调用
@@ -1030,11 +1082,7 @@ class StreamingStudio:
     rag_queries = None
     memory_input = None
     if images and self._current_frame_b64:
-      import time as _time
-      _t0 = _time.monotonic()
       scene_description = await self._scene_understand(prompt, images)
-      _t1 = _time.monotonic()
-      print(f"[计时] 第一趟 场景理解 {_t1 - _t0:.1f}s（图片数: {len(images)}, 输出长度: {len(scene_description)}）", flush=True)
 
       rag_queries = [scene_description] if scene_description else None
 
@@ -1057,27 +1105,17 @@ class StreamingStudio:
     self._last_prompt = prompt
 
     try:
-      import time as _time
-      _t2 = _time.monotonic()
       content = await self.llm_wrapper.achat(
         prompt, save_history=False,
         rag_queries=rag_queries, topic_context=topic_context,
         images=images, memory_input=memory_input,
       )
-      _t3 = _time.monotonic()
-      print(f"[计时] 第二趟 主模型回复 {_t3 - _t2:.1f}s（输出长度={len(content)}）", flush=True)
     except Exception as e:
       print(f"LLM 调用错误: {e}")
       return None
 
     reply_ids = tuple(c.id for c in new_comments)
-    display_text, em_tags = self._apply_expression_mapping(content)
-    return StreamerResponse(
-      content=display_text,
-      reply_to=reply_ids,
-      mapped_content=display_text if em_tags else None,
-      expression_motion_tags=em_tags,
-    )
+    return self._build_response(content, reply_ids)
 
   async def _generate_response_streaming(
     self,
@@ -1111,6 +1149,7 @@ class StreamingStudio:
 
     prompt = self._format_comments_for_prompt(
       old_comments, new_comments, annotations, interaction_targets,
+      cluster_result=self._last_cluster_result,
     )
 
     # VLM 两趟调用
@@ -1118,11 +1157,7 @@ class StreamingStudio:
     rag_queries = None
     memory_input = None
     if images and self._current_frame_b64:
-      import time as _time
-      _t0 = _time.monotonic()
       scene_description = await self._scene_understand(prompt, images)
-      _t1 = _time.monotonic()
-      print(f"[计时] 第一趟 场景理解 {_t1 - _t0:.1f}s（图片数: {len(images)}, 输出长度: {len(scene_description)}）", flush=True)
 
       rag_queries = [scene_description] if scene_description else None
 
@@ -1148,16 +1183,12 @@ class StreamingStudio:
     response_id = str(uuid.uuid4())
     accumulated = ""
 
-    import time as _time
-    _t2 = _time.monotonic()
     try:
-      chunk_count = 0
       async for chunk in self.llm_wrapper.achat_stream(
         prompt, save_history=False,
         rag_queries=rag_queries, topic_context=topic_context,
         images=images, memory_input=memory_input,
       ):
-        chunk_count += 1
         accumulated += chunk
         rc = ResponseChunk(
           response_id=response_id,
@@ -1168,15 +1199,12 @@ class StreamingStudio:
           try:
             cb(rc)
           except Exception as e:
-            print(f"chunk 回调错误: {e}", flush=True)
+            print(f"chunk 回调错误: {e}")
 
-      _t3 = _time.monotonic()
-      print(f"[计时] 第二趟 主模型回复 {_t3 - _t2:.1f}s（chunks={chunk_count}, 输出长度={len(accumulated)}）", flush=True)
-
-      # 流式结束后：对完整文本做表情/动作映射
+      # 流式结束后：对完整文本做表情/动作映射，替换标签
       display_text, em_tags = self._apply_expression_mapping(accumulated)
 
-      # 发送完成标记（携带映射后文本）
+      # 发送完成标记（携带映射后文本，GUI 会用它刷新最终显示）
       done_chunk = ResponseChunk(
         response_id=response_id,
         chunk="",
@@ -1187,11 +1215,10 @@ class StreamingStudio:
         try:
           cb(done_chunk)
         except Exception as e:
-          print(f"chunk 回调错误: {e}", flush=True)
+          print(f"chunk 回调错误: {e}")
 
     except Exception as e:
-      print(f"LLM 流式调用错误: {e}", flush=True)
-      import traceback; traceback.print_exc()
+      print(f"LLM 流式调用错误: {e}")
       # 通知回调流式传输已中断
       error_chunk = ResponseChunk(
         response_id=response_id,
@@ -1206,13 +1233,14 @@ class StreamingStudio:
           pass
       return None
 
-    return StreamerResponse(
-      id=response_id,
-      content=display_text,
-      reply_to=reply_ids,
-      mapped_content=display_text if em_tags else None,
-      expression_motion_tags=em_tags,
-    )
+    kwargs: dict = {
+      "content": display_text,
+      "reply_to": reply_ids,
+      "id": response_id,
+      "mapped_content": display_text if em_tags else None,
+      "expression_motion_tags": em_tags,
+    }
+    return StreamerResponse(**kwargs)
 
   def _apply_expression_mapping(self, text: str) -> tuple[str, tuple]:
     """对文本做表情/动作语义映射，返回 (映射后文本, 标签元组)"""
@@ -1231,6 +1259,43 @@ class StreamingStudio:
     except Exception as e:
       print(f"表情动作映射失败: {e}")
       return text, ()
+
+  def _build_response(
+    self,
+    content: str,
+    reply_ids: tuple[str, ...],
+    response_id: Optional[str] = None,
+  ) -> StreamerResponse:
+    """统一构建 StreamerResponse（非流式路径），content 直接使用映射后文本"""
+    display_text, em_tags = self._apply_expression_mapping(content)
+
+    kwargs: dict = {
+      "content": display_text,
+      "reply_to": reply_ids,
+      "mapped_content": display_text if em_tags else None,
+      "expression_motion_tags": em_tags,
+    }
+    if response_id is not None:
+      kwargs["id"] = response_id
+    return StreamerResponse(**kwargs)
+
+  def _format_cluster_debug(self) -> Optional[dict]:
+    """最近一次聚类结果的调试摘要"""
+    cr = self._last_cluster_result
+    if cr is None:
+      return None
+    return {
+      "cluster_count": len(cr.clusters),
+      "single_count": len(cr.singles),
+      "clusters": [
+        {
+          "representative": c.representative.content[:30],
+          "count": c.count,
+          "reason": c.merge_reason,
+        }
+        for c in cr.clusters
+      ],
+    }
 
   def debug_state(self) -> dict:
     """
@@ -1287,6 +1352,8 @@ class StreamingStudio:
       "total_comments": self.database.get_comment_count(),
       "total_responses": self.database.get_response_count(),
       "topic_manager_enabled": self._topic_manager is not None,
+      "comment_clusterer_enabled": self._comment_clusterer is not None,
+      "last_cluster_result": self._format_cluster_debug(),
       "vlm_mode": self._video_player is not None,
       "video_player": self._video_player.debug_state() if self._video_player else None,
     }

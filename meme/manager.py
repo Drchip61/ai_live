@@ -28,7 +28,7 @@ _NEGATIVE_STREAK_FOR_RETIRE = 3
 @dataclass
 class Meme:
   id: str
-  type: str
+  type: str  # "nickname" / "catchphrase" / "incident" / "callback"
   content: str
   origin: str
   variants: list[str] = field(default_factory=list)
@@ -176,6 +176,7 @@ class MemeManager:
     if meme.lifecycle_stage == LifecycleStage.GROWING:
       return True
 
+    # MATURE: 只在契合时使用（由调用方判断契合度，这里做频率限制）
     if meme.last_used:
       try:
         last = datetime.strptime(meme.last_used, "%Y-%m-%d")
