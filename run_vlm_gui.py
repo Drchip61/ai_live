@@ -88,6 +88,10 @@ def parse_args():
     help="启用话题管理器",
   )
   parser.add_argument(
+    "--comment-clusterer", default=False,
+    help="弹幕聚类器配置文件路径（可选）",
+  )
+  parser.add_argument(
     "--port", type=int, default=8081,
     help="Web 服务端口（默认 8081）",
   )
@@ -138,6 +142,7 @@ def main():
       enable_memory=not args.no_memory,
       enable_global_memory=args.global_memory,
       enable_topic_manager=args.topic_manager,
+      enable_comment_clusterer=args.comment_clusterer,
       video_player=player,
     )
     studio.enable_streaming = True
@@ -387,12 +392,14 @@ def main():
           return
 
         switch_btn.disable()
+        switch_btn.props(add="loading")
         start_btn.disable()
         stop_btn.disable()
         _mjpeg_state["running"] = False
         _mjpeg_state["jpeg_bytes"] = b""
 
         old_studio = runtime.get("studio")
+        loading_notif = None
         try:
           _cleanup_callbacks()
           if old_studio:
@@ -409,15 +416,21 @@ def main():
             old_studio._prev_scene_description = None
             old_studio._pending_comment_count = 0
             old_studio._current_frame_b64 = None
-            old_studio._last_used_timing = None
+            old_studio._last_response_timing = None
 
             mem_mgr = old_studio.llm_wrapper.memory_manager
             if mem_mgr is not None:
               mem_mgr.clear_runtime_state(clear_summary=True)
 
           _clear_ui_state()
+          loading_notif = ui.notification(
+            "正在初始化视频源，请稍候...",
+            type="ongoing", spinner=True, timeout=None, close_button=False,
+          )
 
-          new_runtime = _build_runtime(normalized_video, normalized_danmaku)
+          # _build_runtime 含同步阻塞 I/O（cv2.VideoCapture、模型加载）；
+          # 放到线程池执行，保持事件循环畅通，避免网页无响应和 No response returned 错误
+          new_runtime = await asyncio.to_thread(_build_runtime, normalized_video, normalized_danmaku)
           runtime.update(new_runtime)
 
           video_input.value = runtime["video_path"]
@@ -441,6 +454,9 @@ def main():
             "text-sm text-red-300 font-mono whitespace-pre-wrap",
           )
         finally:
+          if loading_notif is not None:
+            loading_notif.dismiss()
+          switch_btn.props(remove="loading")
           switch_btn.enable()
           if runtime.get("studio"):
             start_btn.enable()
