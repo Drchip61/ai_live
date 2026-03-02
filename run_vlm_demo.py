@@ -29,6 +29,7 @@ if str(project_root) not in sys.path:
 
 from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio
+from streaming_studio.studio import VlmMode
 from video_source import VideoPlayer
 
 
@@ -82,6 +83,17 @@ def parse_args():
     "--topic-manager", action="store_true", default=False,
     help="启用话题管理器",
   )
+  parser.add_argument(
+    "--vlm-mode", default="two_pass",
+    choices=["two_pass", "direct", "summary_only", "two_pass_cached"],
+    help=(
+      "VLM 图像处理模式（默认 two_pass）：\n"
+      "  two_pass        — 小模型看图生成描述供RAG，大模型同时收原图\n"
+      "  direct          — 跳过小模型，直接喂原图给大模型，RAG用弹幕文字\n"
+      "  summary_only    — 小模型看图生成描述，大模型只收文字不收原图\n"
+      "  two_pass_cached — 同 two_pass，但用 dHash 检测场景变化，未变则复用上次描述"
+    ),
+  )
   return parser.parse_args()
 
 
@@ -106,6 +118,7 @@ async def main():
   print(f"  帧间隔: {args.frame_interval}s")
   print(f"  记忆: {'启用' if not args.no_memory else '禁用'}")
   print(f"  全局记忆: {'启用' if args.global_memory else '禁用'}")
+  print(f"  VLM模式: {args.vlm_mode}")
   print("=" * 60)
   print()
 
@@ -129,6 +142,7 @@ async def main():
     enable_global_memory=args.global_memory,
     enable_topic_manager=args.topic_manager,
     video_player=player,
+    vlm_mode=VlmMode(args.vlm_mode),
   )
   studio.enable_streaming = True
 

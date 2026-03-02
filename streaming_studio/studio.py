@@ -12,6 +12,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional, TYPE_CHECKING
 
@@ -29,6 +30,14 @@ from .reply_decider import ReplyDecider, CommentClusterer, ClusterResult
 
 if TYPE_CHECKING:
   from video_source import VideoPlayer
+
+
+class VlmMode(str, Enum):
+  """VLM 图像处理模式"""
+  TWO_PASS        = "two_pass"        # 默认：小模型看图生成描述（供RAG+提示词），大模型同时收原图
+  DIRECT          = "direct"          # 跳过小模型，直接喂原图给大模型，RAG 用弹幕文字
+  SUMMARY_ONLY    = "summary_only"    # 小模型看图生成描述，大模型只收文字描述不收原图
+  TWO_PASS_CACHED = "two_pass_cached" # 同 TWO_PASS，但用 dHash 检测场景变化：未变则复用上次描述跳过小模型
 
 
 _DANMAKU_INJECTION_PATTERNS = [
@@ -64,6 +73,7 @@ class StreamingStudio:
     enable_comment_clusterer: bool = False,
     # VLM 视频源（传入后启用 VLM 模式：画面+弹幕 → 多模态 LLM）
     video_player: Optional["VideoPlayer"] = None,
+    vlm_mode: VlmMode = VlmMode.TWO_PASS,
     # 高级定制
     llm_wrapper: Optional[LLMWrapper] = None,
     database: Optional[CommentDatabase] = None,
@@ -83,6 +93,7 @@ class StreamingStudio:
       enable_topic_manager: 是否启用话题管理器（追踪、分类和管理直播话题）
       enable_comment_clusterer: 是否启用弹幕聚类器（合并语义相似弹幕，节省 token）
       video_player: 视频播放器（传入后启用 VLM 模式，自动从视频提取帧和弹幕）
+      vlm_mode: VLM 图像处理模式（仅 video_player 存在时生效）
       llm_wrapper: 自定义 LLM 封装（高级用户，传入后忽略 persona/model_type/enable_memory）
       database: 自定义数据库（高级用户）
       config: 自定义行为配置（高级用户）
@@ -256,10 +267,14 @@ class StreamingStudio:
 
     # VLM 视频源
     self._video_player = video_player
+    self._vlm_mode = vlm_mode
     self._current_frame_b64: Optional[str] = None
 
     # 上一次场景描述（用于主动发言时检测画面变化）
     self._prev_scene_description: Optional[str] = None
+
+    # TWO_PASS_CACHED 模式：上一帧的 dHash 和对应场景描述
+    self._last_frame_dhash: Optional[int] = None
 
     # 直播开始时间（用于计算已开播时长）
     self._stream_start_time: Optional[datetime] = None
@@ -1009,6 +1024,51 @@ class StreamingStudio:
 
     return f"当前时间 {clock}"
 
+  @staticmethod
+  def _compute_dhash(b64_jpeg: str, hash_size: int = 8) -> int:
+    """
+    计算图像的 dHash（差分哈希）。
+
+    将图像缩放到 (hash_size+1) x hash_size 灰度图，
+    比较相邻像素亮度差，输出 hash_size² 位整数。
+    不依赖额外库，仅用 base64 + numpy + cv2（项目已有）。
+    """
+    import base64
+    import numpy as np
+    import cv2
+    data = base64.b64decode(b64_jpeg)
+    arr = np.frombuffer(data, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+      return 0
+    resized = cv2.resize(img, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+    diff = resized[:, 1:] > resized[:, :-1]
+    return int(sum(1 << i for i, v in enumerate(diff.flatten()) if v))
+
+  @staticmethod
+  def _hamming_distance(h1: int, h2: int) -> int:
+    """计算两个 dHash 之间的汉明距离（越小越相似）。"""
+    return bin(h1 ^ h2).count("1")
+
+  def _scene_changed(self, b64_jpeg: str, threshold: int = 10) -> bool:
+    """
+    检测当前帧与上一帧是否发生明显场景变化（TWO_PASS_CACHED 模式）。
+
+    Args:
+      b64_jpeg: 当前帧 base64 JPEG
+      threshold: 汉明距离阈值，默认 10（64位hash中约15%像素差异）
+
+    Returns:
+      True 表示场景已变化，需要重新调用小模型；False 表示可复用上次描述。
+    """
+    current_hash = self._compute_dhash(b64_jpeg)
+    if self._last_frame_dhash is None:
+      self._last_frame_dhash = current_hash
+      return True
+    distance = self._hamming_distance(self._last_frame_dhash, current_hash)
+    self._last_frame_dhash = current_hash
+    return distance >= threshold
+
   async def _scene_understand(
     self,
     prompt: str,
@@ -1112,32 +1172,57 @@ class StreamingStudio:
     )
     _t["prompt_format_ms"] = (time.perf_counter() - t0) * 1000
 
-    # VLM 两趟调用
+    # VLM 图像处理（根据 vlm_mode 决定行为）
     scene_description = ""
     rag_queries = None
     memory_input = None
+    images_for_llm = images  # 默认大模型收原图
+
     if images and self._current_frame_b64:
-      t0 = time.perf_counter()
-      scene_description = await self._scene_understand(prompt, images)
-      _t["scene_understand_ms"] = (time.perf_counter() - t0) * 1000
+      mode = self._vlm_mode
 
-      rag_queries = [scene_description] if scene_description else None
+      # TWO_PASS_CACHED：用 dHash 检测是否需要重新调用小模型
+      use_cached_description = False
+      if mode == VlmMode.TWO_PASS_CACHED:
+        if not self._scene_changed(self._current_frame_b64):
+          # 场景未变化，复用上次描述
+          scene_description = self._prev_scene_description or ""
+          use_cached_description = bool(scene_description)
+          _t["scene_understand_ms"] = 0.0
 
-      timestamp = self._get_stream_timestamp()
-      vlm_hint = (
-        f"[当前画面] 以下附带了直播画面截图（{timestamp}）。\n"
-        f"[场景理解] {scene_description}\n"
-        f"请结合画面内容、场景理解和弹幕进行回应。\n\n"
-      )
-      prompt = vlm_hint + prompt
+      # 需要调用小模型的情况
+      if mode in (VlmMode.TWO_PASS, VlmMode.SUMMARY_ONLY) or (
+        mode == VlmMode.TWO_PASS_CACHED and not use_cached_description
+      ):
+        t0 = time.perf_counter()
+        scene_description = await self._scene_understand(prompt, images)
+        _t["scene_understand_ms"] = (time.perf_counter() - t0) * 1000
 
-      memory_input = self._build_memory_input(
-        scene_description, old_comments + new_comments,
-      )
+      # 有场景描述时组装 RAG 查询和 prompt 注入
+      if scene_description:
+        rag_queries = [scene_description]
+        timestamp = self._get_stream_timestamp()
+        vlm_hint = (
+          f"[当前画面] 以下附带了直播画面截图（{timestamp}）。\n"
+          f"[场景理解] {scene_description}\n"
+          f"请结合画面内容、场景理解和弹幕进行回应。\n\n"
+        )
+        prompt = vlm_hint + prompt
+        memory_input = self._build_memory_input(
+          scene_description, old_comments + new_comments,
+        )
+
+      # SUMMARY_ONLY：大模型不收原图
+      if mode == VlmMode.SUMMARY_ONLY:
+        images_for_llm = None
+
+      # DIRECT：完全跳过小模型，images_for_llm 保持原图，rag_queries 用弹幕（后面填入）
 
     if rag_queries is None:
-      all_comments = old_comments + new_comments
-      rag_queries = [c.content for c in all_comments if c.content.strip()]
+      rag_queries = []
+
+    all_comments = old_comments + new_comments
+    rag_queries += [c.content for c in all_comments if c.content.strip()]
 
     self._last_prompt = prompt
 
@@ -1145,7 +1230,7 @@ class StreamingStudio:
       content = await self.llm_wrapper.achat(
         prompt, save_history=False,
         rag_queries=rag_queries, topic_context=topic_context,
-        images=images, memory_input=memory_input,
+        images=images_for_llm, memory_input=memory_input,
       )
     except Exception as e:
       print(f"LLM 调用错误: {e}")
@@ -1205,28 +1290,48 @@ class StreamingStudio:
     )
     _t["prompt_format_ms"] = (time.perf_counter() - t0) * 1000
 
-    # VLM 两趟调用
+    # VLM 图像处理（根据 vlm_mode 决定行为）
     scene_description = ""
     rag_queries = None
     memory_input = None
+    images_for_llm = images  # 默认大模型收原图
+
     if images and self._current_frame_b64:
-      t0 = time.perf_counter()
-      scene_description = await self._scene_understand(prompt, images)
-      _t["scene_understand_ms"] = (time.perf_counter() - t0) * 1000
+      mode = self._vlm_mode
 
-      rag_queries = [scene_description] if scene_description else None
+      # TWO_PASS_CACHED：用 dHash 检测是否需要重新调用小模型
+      use_cached_description = False
+      if mode == VlmMode.TWO_PASS_CACHED:
+        if not self._scene_changed(self._current_frame_b64):
+          scene_description = self._prev_scene_description or ""
+          use_cached_description = bool(scene_description)
+          _t["scene_understand_ms"] = 0.0
 
-      timestamp = self._get_stream_timestamp()
-      vlm_hint = (
-        f"[当前画面] 以下附带了直播画面截图（{timestamp}）。\n"
-        f"[场景理解] {scene_description}\n"
-        f"请结合画面内容、场景理解和弹幕进行回应。\n\n"
-      )
-      prompt = vlm_hint + prompt
+      # 需要调用小模型的情况
+      if mode in (VlmMode.TWO_PASS, VlmMode.SUMMARY_ONLY) or (
+        mode == VlmMode.TWO_PASS_CACHED and not use_cached_description
+      ):
+        t0 = time.perf_counter()
+        scene_description = await self._scene_understand(prompt, images)
+        _t["scene_understand_ms"] = (time.perf_counter() - t0) * 1000
 
-      memory_input = self._build_memory_input(
-        scene_description, old_comments + new_comments,
-      )
+      # 有场景描述时组装 RAG 查询和 prompt 注入
+      if scene_description:
+        rag_queries = [scene_description]
+        timestamp = self._get_stream_timestamp()
+        vlm_hint = (
+          f"[当前画面] 以下附带了直播画面截图（{timestamp}）。\n"
+          f"[场景理解] {scene_description}\n"
+          f"请结合画面内容、场景理解和弹幕进行回应。\n\n"
+        )
+        prompt = vlm_hint + prompt
+        memory_input = self._build_memory_input(
+          scene_description, old_comments + new_comments,
+        )
+
+      # SUMMARY_ONLY：大模型不收原图
+      if mode == VlmMode.SUMMARY_ONLY:
+        images_for_llm = None
 
     if rag_queries is None:
       all_comments = old_comments + new_comments
@@ -1242,7 +1347,7 @@ class StreamingStudio:
       async for chunk in self.llm_wrapper.achat_stream(
         prompt, save_history=False,
         rag_queries=rag_queries, topic_context=topic_context,
-        images=images, memory_input=memory_input,
+        images=images_for_llm, memory_input=memory_input,
       ):
         accumulated += chunk
         rc = ResponseChunk(
@@ -1417,7 +1522,7 @@ class StreamingStudio:
       "topic_manager_enabled": self._topic_manager is not None,
       "comment_clusterer_enabled": self._comment_clusterer is not None,
       "last_cluster_result": self._format_cluster_debug(),
-      "vlm_mode": self._video_player is not None,
+      "vlm_mode": self._vlm_mode.value if self._video_player else None,
       "video_player": self._video_player.debug_state() if self._video_player else None,
       "response_timing": (
         self._last_response_timing.to_dict()
