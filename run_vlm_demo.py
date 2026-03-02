@@ -21,6 +21,7 @@ B站弹幕获取方式:
 import argparse
 import asyncio
 import sys
+import threading
 from pathlib import Path
 
 project_root = Path(__file__).parent
@@ -84,6 +85,10 @@ def parse_args():
     help="启用话题管理器",
   )
   parser.add_argument(
+    "--gui-port", type=int, default=None,
+    help="启动 NiceGUI 调试设置面板的端口（如 8081）；不传则不启动",
+  )
+  parser.add_argument(
     "--vlm-mode", default="two_pass",
     choices=["two_pass", "direct", "summary_only", "two_pass_cached"],
     help=(
@@ -119,6 +124,8 @@ async def main():
   print(f"  记忆: {'启用' if not args.no_memory else '禁用'}")
   print(f"  全局记忆: {'启用' if args.global_memory else '禁用'}")
   print(f"  VLM模式: {args.vlm_mode}")
+  if args.gui_port:
+    print(f"  调试面板: http://localhost:{args.gui_port}")
   print("=" * 60)
   print()
 
@@ -145,6 +152,9 @@ async def main():
     vlm_mode=VlmMode(args.vlm_mode),
   )
   studio.enable_streaming = True
+
+  if args.gui_port:
+    _start_settings_gui(studio, args.gui_port)
 
   def on_chunk(chunk):
     if chunk.done:
@@ -189,6 +199,21 @@ async def main():
   finally:
     await studio.stop()
     print("直播间已关闭")
+
+
+def _start_settings_gui(studio: StreamingStudio, port: int) -> None:
+  """在独立 daemon 线程中启动 NiceGUI 调试设置面板。"""
+  def _run() -> None:
+    from nicegui import ui
+    from debug_console.pages.settings import create_settings_page
+
+    @ui.page("/")
+    def index():
+      create_settings_page(studio)
+
+    ui.run(port=port, reload=False, show=False, title="VLM 调试设置")
+
+  threading.Thread(target=_run, daemon=True).start()
 
 
 async def _input_loop(studio: StreamingStudio):

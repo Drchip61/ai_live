@@ -21,6 +21,7 @@ from .comment_broadcaster import CommentBroadcaster
 from .state_collector import StateCollector
 from .pages.monitor import create_monitor_page
 from .pages.chat import create_chat_page
+from .pages.settings import create_settings_page
 
 
 def run(
@@ -67,6 +68,10 @@ def run(
   def chat():
     _build_page(studio, collector, broadcaster, default_tab="chat")
 
+  @ui.page("/settings")
+  def settings():
+    _build_page(studio, collector, broadcaster, default_tab="settings")
+
   ui.run(
     title="调试控制台 — mio-streaming-demo",
     port=port,
@@ -94,8 +99,9 @@ def _build_page(
     ui.label("mio-streaming-demo 调试控制台").classes("text-lg font-bold")
     ui.space()
     with ui.tabs().classes("text-white") as tabs:
-      monitor_tab = ui.tab("monitor", label="监控面板")
-      chat_tab = ui.tab("chat", label="模拟直播间")
+      ui.tab("monitor", label="监控面板")
+      ui.tab("chat", label="模拟直播间")
+      ui.tab("settings", label="调试设置")
     tabs.value = default_tab
 
   # 页面内容区域
@@ -104,3 +110,5 @@ def _build_page(
       create_monitor_page(collector)
     with ui.tab_panel("chat"):
       create_chat_page(studio, broadcaster)
+    with ui.tab_panel("settings"):
+      create_settings_page(studio)
