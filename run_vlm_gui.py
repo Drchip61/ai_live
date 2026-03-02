@@ -333,28 +333,62 @@ def main():
       )
 
       def open_feedback_dialog():
-        with ui.dialog() as dlg, ui.card().classes("w-96"):
-          ui.label("提交反馈").classes("text-lg font-bold mb-2")
-          feedback_input = ui.textarea(
-            label="反馈内容",
-            placeholder="描述你遇到的问题或改进建议...",
-          ).classes("w-full").props("rows=5 outlined")
+        ratings: dict = {}
 
-          with ui.row().classes("w-full justify-end gap-2 mt-2"):
+        def _section(title: str, items: list) -> None:
+          with ui.card().classes("w-full bg-gray-50 mb-2"):
+            ui.label(title).classes("text-base font-semibold mb-2")
+            with ui.grid(columns=2).classes("w-full gap-x-8 gap-y-3"):
+              for key, label in items:
+                with ui.column().classes("gap-0"):
+                  ui.label(label).classes("text-sm text-gray-700")
+                  ratings[key] = ui.rating(value=3, max=5)
+
+        with ui.dialog() as dlg, ui.card().classes("w-[640px] max-w-full"):
+          ui.label("用户反馈问卷").classes("text-xl font-bold mb-1")
+          ui.label("请对各项进行评分（1–5 星）").classes(
+            "text-sm text-gray-500 mb-3"
+          )
+
+          _section("LLM 评测", [
+            ("llm_desc_accuracy", "描述准确性"),
+            ("llm_persona",       "人设一致性"),
+            ("llm_memory",        "记忆连续性"),
+            ("llm_fun",           "趣味性 / 观点质量"),
+          ])
+          _section("TTS 评测", [
+            ("tts_text_match",    "读音与文本一致"),
+            ("tts_emotion",       "情感匹配"),
+            ("tts_naturalness",   "自然度"),
+            ("tts_stability",     "稳定性"),
+          ])
+          _section("动作表情评测", [
+            ("motion_semantic",    "语义匹配"),
+            ("motion_sync",        "时序同步"),
+            ("motion_richness",    "丰富度"),
+            ("motion_naturalness", "自然度"),
+          ])
+          _section("总体验", [
+            ("overall_immersion", "沉浸感 / 不出戏"),
+          ])
+
+          comment_input = ui.textarea(
+            label="补充说明（可选）",
+            placeholder="如有其他意见...",
+          ).classes("w-full mt-2").props("rows=2 outlined")
+
+          with ui.row().classes("w-full justify-end gap-2 mt-3"):
             ui.button("取消", on_click=dlg.close).props("flat")
 
             def submit():
-              text = feedback_input.value.strip()
-              if not text:
-                ui.notify("反馈内容不能为空", type="warning")
-                return
               feedback_dir = project_root / "data" / "feedback"
               feedback_dir.mkdir(parents=True, exist_ok=True)
               ts = datetime.now()
               filename = ts.strftime("feedback_%Y%m%d_%H%M%S.json")
               entry = {
                 "timestamp": ts.isoformat(),
-                "content": text,
+                "scores": {k: int(r.value or 3) for k, r in ratings.items()},
+                "comment": comment_input.value.strip(),
                 "video_path": runtime.get("video_path") or "",
                 "persona": args.persona,
                 "model": args.model,
@@ -363,7 +397,7 @@ def main():
                 json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8"
               )
               dlg.close()
-              ui.notify("反馈已保存，感谢！", type="positive")
+              ui.notify("感谢反馈！", type="positive")
 
             ui.button("提交", on_click=submit).props("color=primary")
 
