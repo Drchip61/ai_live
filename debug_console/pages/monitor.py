@@ -125,22 +125,25 @@ def _build_topic_card() -> dict:
 
 # 耗时卡片的阶段定义：(字段名, 显示名, Tailwind 颜色类)
 _TIMING_STAGES = [
-  ("comment_cluster_ms",  "弹幕聚类",       "text-gray-700"),
-  ("reply_decision_ms",   "回复决策",       "text-gray-700"),
-  ("topic_context_ms",    "话题上下文",     "text-gray-700"),
-  ("prompt_format_ms",    "Prompt 格式化",  "text-gray-700"),
-  ("scene_understand_ms", "场景理解(VLM)",  "text-blue-700"),
-  ("memory_retrieval_ms", "记忆检索(RAG)",  "text-orange-700"),
-  ("llm_first_token_ms",  "主回复-首token", "text-red-700"),
-  ("llm_total_ms",        "主回复-总生成",  "text-red-700"),
-  ("expression_map_ms",   "表情映射",       "text-gray-700"),
+  ("comment_cluster_ms",  "弹幕聚类",            "text-gray-700"),
+  ("reply_decision_ms",   "回复决策",            "text-gray-700"),
+  ("topic_context_ms",    "话题上下文",          "text-gray-700"),
+  ("prompt_format_ms",    "Prompt 格式化",       "text-gray-700"),
+  ("scene_understand_ms", "场景理解 · 小模型",   "text-blue-700"),
+  ("memory_retrieval_ms", "记忆检索(RAG)",       "text-orange-700"),
+  ("llm_first_token_ms",  "主回复首token · 大模型", "text-red-700"),
+  ("llm_total_ms",        "主回复总耗时 · 大模型",  "text-red-700"),
+  ("expression_map_ms",   "表情映射",            "text-gray-700"),
 ]
 
+# VLM 模式中会实际调用小模型的模式集合
+_VLM_MODES_WITH_SMALL_MODEL = {"two_pass", "summary_only", "two_pass_cached"}
+
 # 可选阶段：studio_state 中判断是否启用的字段名 → 未启用时的显示文字
+# （scene_understand_ms 需要按 vlm_mode 值细分，在更新函数中单独处理）
 _STAGE_ENABLED_BY: dict[str, tuple[str, str]] = {
-  "comment_cluster_ms":  ("comment_clusterer_enabled", "未启用"),
-  "topic_context_ms":    ("topic_manager_enabled",     "未启用"),
-  "scene_understand_ms": ("vlm_mode",                  "非VLM模式"),
+  "comment_cluster_ms": ("comment_clusterer_enabled", "未启用"),
+  "topic_context_ms":   ("topic_manager_enabled",     "未启用"),
 }
 
 
@@ -157,7 +160,7 @@ def _build_timing_card() -> dict:
     refs["stages"] = {}
     for field_name, display_name, color_cls in _TIMING_STAGES:
       with ui.row().classes("w-full items-center gap-2"):
-        ui.label(display_name).classes(f"text-xs w-28 shrink-0 {color_cls}")
+        ui.label(display_name).classes(f"text-xs w-40 shrink-0 {color_cls}")
         bar = ui.linear_progress(value=0, show_value=False).classes("flex-grow")
         value_label = ui.label("—").classes("text-xs w-20 text-right shrink-0")
       refs["stages"][field_name] = {"bar": bar, "label": value_label}
@@ -361,6 +364,27 @@ def _update_llm_card(refs: dict, state: dict) -> None:
   refs["bg_tasks"].text = f"后台任务: {state['background_tasks']}"
 
 
+def _scene_understand_label(vlm_mode: str | None, ms: float | None) -> str:
+  """
+  根据当前 vlm_mode 和耗时值返回场景理解阶段的显示文字。
+
+  - vlm_mode=None       → 非VLM模式（无视频源）
+  - vlm_mode="direct"   → 已跳过（direct 模式不调小模型）
+  - 其余模式且 ms=0     → 缓存命中（two_pass_cached 场景未变化）
+  - 其余模式且 ms>0     → 正常显示耗时
+  - ms=None             → 等待中（尚无计时数据）
+  """
+  if vlm_mode is None:
+    return "非VLM模式"
+  if vlm_mode == "direct":
+    return "已跳过"
+  if ms is None:
+    return "—"
+  if ms == 0.0 and vlm_mode == "two_pass_cached":
+    return "缓存命中"
+  return f"{ms:.1f} ms"
+
+
 def _update_timing_card(refs: dict, state: dict, studio_state: dict = None) -> None:
   """更新回复耗时分解卡片"""
   if not refs:
@@ -374,12 +398,19 @@ def _update_timing_card(refs: dict, state: dict, studio_state: dict = None) -> N
       if not stage_refs:
         continue
       stage_refs["bar"].value = 0
-      # 未回复时也显示可选阶段的启用状态
-      if studio_state and field_name in _STAGE_ENABLED_BY:
-        enabled_key, disabled_label = _STAGE_ENABLED_BY[field_name]
-        if not studio_state.get(enabled_key, True):
-          stage_refs["label"].text = disabled_label
+      if studio_state:
+        # scene_understand_ms：按 vlm_mode 值细分
+        if field_name == "scene_understand_ms":
+          stage_refs["label"].text = _scene_understand_label(
+            studio_state.get("vlm_mode"), ms=None,
+          )
           continue
+        # 其他可选阶段
+        if field_name in _STAGE_ENABLED_BY:
+          enabled_key, disabled_label = _STAGE_ENABLED_BY[field_name]
+          if not studio_state.get(enabled_key, True):
+            stage_refs["label"].text = disabled_label
+            continue
       stage_refs["label"].text = "—"
     return
 
@@ -391,13 +422,21 @@ def _update_timing_card(refs: dict, state: dict, studio_state: dict = None) -> N
     stage_refs = refs["stages"].get(field_name)
     if not stage_refs:
       continue
-    # 可选阶段：未启用时直接标注，不显示 0 ms
-    if studio_state and field_name in _STAGE_ENABLED_BY:
-      enabled_key, disabled_label = _STAGE_ENABLED_BY[field_name]
-      if not studio_state.get(enabled_key, True):
-        stage_refs["bar"].value = 0
-        stage_refs["label"].text = disabled_label
+    if studio_state:
+      # scene_understand_ms：按 vlm_mode 值细分
+      if field_name == "scene_understand_ms":
+        ms_val = state.get(field_name, 0)
+        label = _scene_understand_label(studio_state.get("vlm_mode"), ms=ms_val)
+        stage_refs["bar"].value = min(ms_val / total, 1.0) if total > 0 else 0
+        stage_refs["label"].text = label
         continue
+      # 其他可选阶段
+      if field_name in _STAGE_ENABLED_BY:
+        enabled_key, disabled_label = _STAGE_ENABLED_BY[field_name]
+        if not studio_state.get(enabled_key, True):
+          stage_refs["bar"].value = 0
+          stage_refs["label"].text = disabled_label
+          continue
     ms = state.get(field_name, 0)
     ratio = ms / total if total > 0 else 0
     stage_refs["bar"].value = min(ratio, 1.0)
