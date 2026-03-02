@@ -84,3 +84,10 @@ class TopicManagerConfig:
   # 网络搜索（可选，默认关）
   enable_web_search: bool = False
   """是否启用网络搜索（Tavily）"""
+
+  # 话题自动生成
+  topic_gen_low_sig_threshold: float = 0.3
+  """所有话题 significance 均低于此值时，视为话题低落"""
+
+  topic_gen_idle_seconds: float = 120.0
+  """距上次新话题出现超过此秒数，才允许触发话题自动生成"""

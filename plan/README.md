@@ -134,3 +134,7 @@ python -m connection.test_chatter_web
 - [x] Phase 10: NiceGUI 调试控制台 (debug_console/)
 - [x] Phase 11: 全链路流式回复 + 模拟直播间左右分栏
 - [x] Phase 12: 监控面板排版优化 + 冷场应对策略 + 角色记忆扩充
+- [x] Phase 13: VlmMode 四模式 VLM 切换（two_pass / direct / summary_only / two_pass_cached，含 dHash 帧缓存）
+- [x] Phase 14: NiceGUI 调试设置面板（debug_console 新增调试设置标签页 + `--gui-port` 独立面板）
+- [x] Phase 15: 用户反馈结构化问卷（13 项星级评分，LLM / TTS / 动作表情 / 总体验四分类）
+- [x] Phase 16: 话题低落自动生成新话题（TopicManager `_generate_topic` + `prompts/topic/generate_topic.txt`）

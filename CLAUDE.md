@@ -17,6 +17,8 @@ pip install -r requirements.txt
 # 主入口：VLM 模式（视频 + 弹幕 → 多模态 AI 主播）
 python run_vlm_demo.py --video data/sample.mp4 --danmaku data/sample.xml
 python run_vlm_demo.py --video data/sample.mp4 --persona kuro --model anthropic --speed 4.0
+python run_vlm_demo.py --video data/sample.mp4 --vlm-mode direct        # 跳过小模型直接输图给大模型
+python run_vlm_demo.py --video data/sample.mp4 --gui-port 8081          # 同时启动独立调试设置面板
 
 # NiceGUI 调试控制台（监控面板 + 模拟直播间）
 python -m debug_console
@@ -71,6 +73,15 @@ python download_bilibili.py "https://b23.tv/xxxxx"
   MemoryManager.record_interaction() → 总结为第一人称记忆
 ```
 
+`VlmMode` 枚举（`streaming_studio/studio.py`）控制管线行为，支持运行时热切换：
+
+| 模式 | 说明 |
+|------|------|
+| `two_pass`（默认） | 完整两趟：小模型场景理解 → RAG → 大模型带图回复 |
+| `direct` | 跳过小模型，图像直接输入大模型；无 RAG |
+| `summary_only` | 跑小模型做 RAG，大模型只接受文字摘要不接受原图 |
+| `two_pass_cached` | 两趟模式 + dHash 帧缓存：画面未变化时复用上次场景描述，跳过小模型 |
+
 纯文本模式（无视频）跳过第一趟，直接用弹幕内容做 RAG 查询。
 
 ### 双轨制触发机制
@@ -112,6 +123,7 @@ python download_bilibili.py "https://b23.tv/xxxxx"
 
 - **弹幕分类**：单条模式（即时分类）或批量模式（攒够阈值一起分类），规则匹配优先、小模型降级
 - **回复后分析**：内容分析（话题进度更新、新话题发现）+ 节奏分析（标记过期话题、动态调整等待时间），两个分析并行执行
+- **话题自动生成**：所有话题 significance 均低于阈值且长时间无新话题时，小模型结合人设和近期弹幕主动生成新话题（`topic_gen_low_sig_threshold=0.3`，`topic_gen_idle_seconds=120`）
 - **格式化输出**：为 prompt 添加弹幕→话题标注和话题摘要
 
 ### 模型分级策略

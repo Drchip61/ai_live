@@ -4,11 +4,15 @@
 """
 
 import asyncio
+import json
 import logging
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage
 
 from .config import TopicManagerConfig
 from .models import Topic, ContentAnalysisDelta, RhythmAnalysisDelta
@@ -16,6 +20,7 @@ from .table import TopicTable
 from .classifier import single_classify, batch_classify
 from .analyzer import post_reply_analysis
 from .formatter import get_annotations, format_topic_context
+from .prompts import GENERATE_TOPIC_PROMPT
 
 if TYPE_CHECKING:
   from streaming_studio.database import CommentDatabase
@@ -67,6 +72,7 @@ class TopicManager:
     # 分析状态
     self._last_analysis_time: Optional[datetime] = None
     self._suggested_timing: Optional[tuple[float, float]] = None
+    self._last_new_topic_time: Optional[datetime] = None  # 上次新话题出现时间
 
     # 后台任务引用（防止 GC 回收）
     self._background_tasks: set[asyncio.Task] = set()
@@ -104,6 +110,7 @@ class TopicManager:
 
     # 初始化：生成开场话题（模板化，无模型调用）
     self._initialize()
+    self._last_new_topic_time = datetime.now()  # 以启动时间为计时起点
 
     # 批量模式：启动收集循环
     if self._config.comment_mode == "batch":
@@ -295,26 +302,29 @@ class TopicManager:
       self._table.cleanup(self._config.significance_threshold)
 
       # 2. 按需分析
-      should_analyze = self._should_run_analysis(len(comments))
-      if not should_analyze:
-        return
+      if self._should_run_analysis(len(comments)):
+        # 格式化弹幕文本
+        comments_text = "\n".join(
+          f"- {c.nickname}: {c.content}" for c in comments
+        )
 
-      # 格式化弹幕文本
-      comments_text = "\n".join(
-        f"- {c.nickname}: {c.content}" for c in comments
-      )
+        # 并行分析
+        content_delta, rhythm_delta = await post_reply_analysis(
+          self._table, comments_text, response,
+          self._get_model(), self._config,
+        )
 
-      # 并行分析
-      content_delta, rhythm_delta = await post_reply_analysis(
-        self._table, comments_text, response,
-        self._get_model(), self._config,
-      )
+        # 统一应用 delta
+        self._apply_content_delta(content_delta)
+        self._apply_rhythm_delta(rhythm_delta)
 
-      # 统一应用 delta
-      self._apply_content_delta(content_delta)
-      self._apply_rhythm_delta(rhythm_delta)
+        self._last_analysis_time = datetime.now()
 
-      self._last_analysis_time = datetime.now()
+      # 3. 话题低落时自动生成新话题（独立判断，不受分析条件限制）
+      if self._should_generate_topic():
+        task = asyncio.create_task(self._generate_topic())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     except Exception:
       logger.exception("回复后分析失败")
@@ -343,6 +353,8 @@ class TopicManager:
     for topic in delta.new_topics:
       self._table.add(topic)
       logger.info("新话题: %s - %s", topic.topic_id, topic.topic_progress)
+    if delta.new_topics:
+      self._last_new_topic_time = datetime.now()
 
     # 更新建议
     for topic_id, suggestion in delta.suggestion_updates.items():
@@ -361,6 +373,101 @@ class TopicManager:
         "动态等待时间更新: %.1f ~ %.1f 秒",
         delta.suggested_timing[0], delta.suggested_timing[1],
       )
+
+  def _should_generate_topic(self) -> bool:
+    """判断是否需要自动生成新话题"""
+    if self._last_new_topic_time is None:
+      return False
+
+    elapsed = (datetime.now() - self._last_new_topic_time).total_seconds()
+    if elapsed < self._config.topic_gen_idle_seconds:
+      return False
+
+    topics = self._table.get_all()
+    if topics:
+      max_sig = max(t.significance for t in topics)
+      if max_sig >= self._config.topic_gen_low_sig_threshold:
+        return False
+
+    return True
+
+  async def _generate_topic(self) -> None:
+    """话题低落时调用小模型自动生成新话题"""
+    try:
+      # 立即更新时间戳，防止并发重复触发
+      self._last_new_topic_time = datetime.now()
+
+      # 加载人设提示词
+      persona_path = (
+        Path(__file__).parent.parent / "personas" / self._persona / "system_prompt.txt"
+      )
+      persona_prompt = (
+        persona_path.read_text(encoding="utf-8")
+        if persona_path.exists()
+        else f"角色名称：{self._persona}"
+      )
+
+      # 格式化现有话题
+      topics = self._table.get_all()
+      existing_topics = (
+        "\n".join(
+          f"- [{t.topic_id}] {t.title}（{t.topic_progress}）"
+          for t in sorted(topics, key=lambda x: x.significance, reverse=True)
+        )
+        if topics else "（暂无话题）"
+      )
+
+      # 获取最近弹幕
+      recent = self._database.get_recent_comments(limit=8)
+      recent_comments = (
+        "\n".join(f"- {c.nickname}: {c.content}" for c in reversed(recent))
+        if recent else "（暂无弹幕）"
+      )
+
+      # 调用小模型
+      prompt_text = GENERATE_TOPIC_PROMPT.format(
+        persona_prompt=persona_prompt,
+        existing_topics=existing_topics,
+        recent_comments=recent_comments,
+      )
+      response = await self._get_model().ainvoke([HumanMessage(content=prompt_text)])
+      text = response.content.strip()
+
+      # 提取 JSON
+      match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+      if not match:
+        logger.warning("话题生成：无法提取 JSON，原始响应: %s", text[:200])
+        return
+
+      data = json.loads(match.group(0))
+      topic_id = data.get("topic_id", "").strip()
+      title = data.get("title", "").strip()
+      progress = data.get("progress", "").strip()
+      suggestion = data.get("suggestion", "").strip()
+
+      if not topic_id or not title:
+        logger.warning("话题生成返回数据不完整: %s", data)
+        return
+
+      # 避免与已有话题重复
+      if self._table.get(topic_id):
+        logger.debug("生成的话题 %s 已存在，跳过", topic_id)
+        return
+
+      topic = Topic(
+        topic_id=topic_id,
+        title=title,
+        significance=self._config.initial_significance,
+        topic_progress=progress,
+        suggestion=suggestion,
+      )
+      self._table.add(topic)
+      logger.info("自动生成新话题: %s - %s", topic_id, title)
+
+    except json.JSONDecodeError as e:
+      logger.warning("话题生成 JSON 解析失败: %s", e)
+    except Exception:
+      logger.exception("话题自动生成失败")
 
   def suggest_proactive_topic(self, silence_seconds: float) -> Optional["Topic"]:
     """
@@ -428,6 +535,10 @@ class TopicManager:
       "last_analysis_time": (
         self._last_analysis_time.strftime("%H:%M:%S")
         if self._last_analysis_time else None
+      ),
+      "last_new_topic_time": (
+        self._last_new_topic_time.strftime("%H:%M:%S")
+        if self._last_new_topic_time else None
       ),
       "background_tasks": len(self._background_tasks),
     }

@@ -99,6 +99,7 @@ class CommentDatabase:
 | `enable_topic_manager` | bool | False | 是否启用话题管理器 |
 | `enable_reply_decider` | bool | True | 是否启用回复决策器 |
 | `enable_comment_clusterer` | bool | False | 是否启用弹幕聚类器 |
+| `vlm_mode` | VlmMode | VlmMode.TWO_PASS | VLM 调用模式（非 StudioConfig，支持运行时热切换） |
 
 **高级定制：**
 
@@ -375,3 +376,4 @@ CommentClusterer.cluster(new) → ClusterResult
 - [x] ReplyDecider 两阶段回复决策器（规则快筛 + LLM 精判）
 - [x] CommentClusterer 两阶段弹幕聚类器（循环节规则 + 语义 embedding）
 - [x] prompt 格式化聚类折叠显示
+- [x] VlmMode 四模式 VLM 切换（two_pass / direct / summary_only / two_pass_cached，含 dHash 帧缓存）

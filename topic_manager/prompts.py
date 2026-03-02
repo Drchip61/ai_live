@@ -22,3 +22,7 @@ CONTENT_ANALYSIS_PROMPT = _loader.load("topic/content_analysis.txt")
 # 回复后节奏分析 prompt（任务 B）
 # 变量：{topic_table}, {recent_comments}, {response}
 RHYTHM_ANALYSIS_PROMPT = _loader.load("topic/rhythm_analysis.txt")
+
+# 话题低落时自动生成新话题
+# 变量：{persona_prompt}, {existing_topics}, {recent_comments}
+GENERATE_TOPIC_PROMPT = _loader.load("topic/generate_topic.txt")

@@ -90,7 +90,7 @@ def parse_args():
     help="启用话题管理器",
   )
   parser.add_argument(
-    "--comment-clusterer", default=False,
+    "--comment-clusterer", action="store_true", default=False,
     help="弹幕聚类器配置文件路径（可选）",
   )
   parser.add_argument(
