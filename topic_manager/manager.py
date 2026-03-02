@@ -251,9 +251,7 @@ class TopicManager:
       格式化的话题上下文文本
     """
     new_ids = [c.id for c in new_comments]
-    return format_topic_context(
-      self._table, new_ids, self._database, self._config,
-    )
+    return format_topic_context(self._table, new_ids, self._config)
 
   def get_comment_annotations(self) -> dict[str, str]:
     """
