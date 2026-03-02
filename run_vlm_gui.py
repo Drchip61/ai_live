@@ -336,18 +336,20 @@ def main():
         ratings: dict = {}
 
         def _section(title: str, items: list) -> None:
-          with ui.card().classes("w-full bg-gray-50 mb-2"):
-            ui.label(title).classes("text-base font-semibold mb-2")
-            with ui.grid(columns=2).classes("w-full gap-x-8 gap-y-3"):
+          with ui.card().classes("w-full bg-gray-50 mb-1 p-2"):
+            ui.label(title).classes("text-xs font-semibold text-gray-600 mb-1")
+            with ui.grid(columns=2).classes("w-full gap-x-2 gap-y-1"):
               for key, label in items:
-                with ui.column().classes("gap-0"):
-                  ui.label(label).classes("text-sm text-gray-700")
-                  ratings[key] = ui.rating(value=3, max=5)
+                with ui.row().classes("items-center gap-1 flex-nowrap"):
+                  ui.label(label).classes(
+                    "text-xs text-gray-700 w-20 shrink-0 leading-tight"
+                  )
+                  ratings[key] = ui.rating(value=3, max=5).props("size=xs")
 
-        with ui.dialog() as dlg, ui.card().classes("w-[640px] max-w-full"):
-          ui.label("用户反馈问卷").classes("text-xl font-bold mb-1")
-          ui.label("请对各项进行评分（1–5 星）").classes(
-            "text-sm text-gray-500 mb-3"
+        with ui.dialog() as dlg, ui.card().classes("w-80 max-w-full p-3"):
+          ui.label("用户反馈问卷").classes("text-sm font-bold mb-0")
+          ui.label("各项评分（1–5 星）").classes(
+            "text-xs text-gray-400 mb-2"
           )
 
           _section("LLM 评测", [
@@ -375,7 +377,7 @@ def main():
           comment_input = ui.textarea(
             label="补充说明（可选）",
             placeholder="如有其他意见...",
-          ).classes("w-full mt-2").props("rows=2 outlined")
+          ).classes("w-full mt-1").props("rows=2 outlined dense")
 
           with ui.row().classes("w-full justify-end gap-2 mt-3"):
             ui.button("取消", on_click=dlg.close).props("flat")
