@@ -826,6 +826,34 @@ def main():
 
     ui.timer(0.5, update_progress)
 
+  # ── 关闭检测：关窗口或 Ctrl+C 均可退出 ──
+  _active_client_ids: set[str] = set()
+
+  def _on_app_connect(client) -> None:
+    _active_client_ids.add(client.id)
+
+  async def _on_app_disconnect(client) -> None:
+    _active_client_ids.discard(client.id)
+    if not _active_client_ids:
+      try:
+        await asyncio.sleep(3.0)  # 等待刷新/跳转
+      except asyncio.CancelledError:
+        return
+      if not _active_client_ids:
+        app.shutdown()
+
+  async def _on_app_shutdown() -> None:
+    studio = runtime.get("studio")
+    if studio and studio.is_running:
+      try:
+        await asyncio.wait_for(studio.stop(), timeout=5.0)
+      except (asyncio.TimeoutError, Exception):
+        pass
+
+  app.on_connect(_on_app_connect)
+  app.on_disconnect(_on_app_disconnect)
+  app.on_shutdown(_on_app_shutdown)
+
   ui.run(port=args.port, host=host, reload=False, title="VLM 直播间")
 
 

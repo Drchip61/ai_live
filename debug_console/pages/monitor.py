@@ -24,6 +24,7 @@ def create_monitor_page(collector: StateCollector) -> None:
       state = collector.snapshot()
       _update_studio_card(containers.get("studio"), state.get("studio"))
       _update_timing_card(containers.get("timing"), state.get("timing"), state.get("studio"))
+      _update_cluster_card(containers.get("cluster"), state.get("studio"))
       _update_memory_card(containers.get("memory"), state.get("memory"))
       _update_topic_card(containers.get("topics"), state.get("topics"))
       _update_llm_card(containers.get("llm"), state.get("llm"))
@@ -42,6 +43,9 @@ def create_monitor_page(collector: StateCollector) -> None:
 
     # 回复耗时分解（紧跟在直播间状态之后，便于一眼看到）
     containers["timing"] = _build_timing_card()
+
+    # 弹幕聚类结果
+    containers["cluster"] = _build_cluster_card()
 
     # LLM 状态
     containers["llm"] = _build_llm_card()
@@ -451,3 +455,98 @@ def _update_prompt_card(refs: dict, state: dict) -> None:
   # 使用完整 prompt（包含系统提示词）
   prompt = state.get("last_full_prompt") or state.get("last_prompt")
   refs["prompt_text"].content = prompt if prompt else "（等待首次触发）"
+
+
+# ============================================================
+# 弹幕聚类卡片
+# ============================================================
+
+# 单元归属标签样式
+_TAG_STYLE: dict[str, str] = {
+  "new":   "bg-blue-100 text-blue-800",
+  "old":   "bg-gray-100 text-gray-600",
+  "mixed": "bg-purple-100 text-purple-800",
+}
+_TAG_LABEL: dict[str, str] = {
+  "new":   "新",
+  "old":   "旧",
+  "mixed": "跨新旧",
+}
+
+
+def _build_cluster_card() -> dict:
+  """构建弹幕聚类结果卡片"""
+  refs = {}
+  with ui.card().classes("w-full"):
+    ui.label("弹幕聚类").classes("text-lg font-bold")
+    ui.separator()
+    with ui.column().classes("gap-1"):
+      refs["summary"] = ui.label("（未启用）").classes("text-sm")
+      refs["counts"] = ui.label().classes("text-xs text-gray-500")
+    ui.separator()
+    with ui.expansion("聚类详情", icon="account_tree").classes("w-full"):
+      refs["cluster_list"] = ui.column().classes("gap-1 max-h-[300px] overflow-auto")
+    with ui.expansion("独立弹幕", icon="chat_bubble_outline").classes("w-full"):
+      refs["single_list"] = ui.column().classes("gap-1 max-h-[200px] overflow-auto")
+  return refs
+
+
+def _update_cluster_card(refs: dict, state: dict) -> None:
+  """更新弹幕聚类结果卡片"""
+  if not refs:
+    return
+
+  cr = state.get("last_cluster_result") if state else None
+
+  if cr is None:
+    refs["summary"].text = "（未启用或本轮未触发）"
+    refs["counts"].text = ""
+    refs["cluster_list"].clear()
+    refs["single_list"].clear()
+    return
+
+  cluster_count = cr.get("cluster_count", 0)
+  single_count = cr.get("single_count", 0)
+  new_units = cr.get("new_unit_count", 0)
+  old_units = cr.get("old_unit_count", 0)
+  mixed = cr.get("mixed_cluster_count", 0)
+
+  refs["summary"].text = (
+    f"簇: {cluster_count}  独立: {single_count}  "
+    f"→  新单元: {new_units}  旧单元: {old_units}"
+    + (f"  跨新旧簇: {mixed}" if mixed else "")
+  )
+  refs["counts"].text = f"合计输入 {cluster_count + single_count} 个单元"
+
+  # 聚类列表
+  cluster_list = refs["cluster_list"]
+  cluster_list.clear()
+  with cluster_list:
+    clusters = cr.get("clusters", [])
+    if not clusters:
+      ui.label("（无聚类）").classes("text-xs text-gray-400 italic")
+    for c in clusters:
+      tag = c.get("tag", "old")
+      tag_cls = _TAG_STYLE.get(tag, "")
+      tag_text = _TAG_LABEL.get(tag, tag)
+      with ui.row().classes("items-start gap-2 w-full"):
+        ui.badge(tag_text).classes(f"text-xs shrink-0 {tag_cls}")
+        with ui.column().classes("gap-0"):
+          ui.label(f"×{c['count']}  {c['representative']}").classes("text-xs")
+          if c.get("reason"):
+            ui.label(c["reason"]).classes("text-xs text-gray-400 italic")
+
+  # 独立弹幕列表
+  single_list = refs["single_list"]
+  single_list.clear()
+  with single_list:
+    singles = cr.get("singles", [])
+    if not singles:
+      ui.label("（无独立弹幕）").classes("text-xs text-gray-400 italic")
+    for s in singles:
+      tag = s.get("tag", "old")
+      tag_cls = _TAG_STYLE.get(tag, "")
+      tag_text = _TAG_LABEL.get(tag, tag)
+      with ui.row().classes("items-center gap-2"):
+        ui.badge(tag_text).classes(f"text-xs shrink-0 {tag_cls}")
+        ui.label(s["content"]).classes("text-xs text-gray-700")

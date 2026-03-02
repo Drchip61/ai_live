@@ -26,7 +26,7 @@ from prompts import PromptLoader
 from .models import Comment, StreamerResponse, ResponseChunk, ResponseTiming
 from .database import CommentDatabase
 from .config import StudioConfig, ReplyDeciderConfig, CommentClustererConfig
-from .reply_decider import ReplyDecider, CommentClusterer, ClusterResult
+from .reply_decider import ReplyDecider, CommentClusterer, CommentCluster, ClusterResult
 
 if TYPE_CHECKING:
   from video_source import VideoPlayer
@@ -255,6 +255,7 @@ class StreamingStudio:
 
     # 最近一次聚类结果（供 debug_state 和 prompt 格式化使用）
     self._last_cluster_result: Optional[ClusterResult] = None
+    self._last_cluster_new_ids: set[str] = set()  # 对应那次聚类的新弹幕 id 集合
 
     # Prompt 模板
     _loader = PromptLoader()
@@ -512,7 +513,10 @@ class StreamingStudio:
             # 自然超时
             break
 
-        old_comments, new_comments = self._collect_comments()
+        # 若启用了聚类器，先收集全量新弹幕，聚类后再定量；否则按正常上限截断
+        old_comments, new_comments = self._collect_comments(
+          limit_new=self._comment_clusterer is None
+        )
 
         # VLM 模式下视频播完且无新弹幕（含优先弹幕）时停止
         if self._video_player and self._video_player.is_finished:
@@ -536,11 +540,18 @@ class StreamingStudio:
         # 本轮耗时累加器
         _t: dict[str, float] = {}
 
-        # 弹幕聚类
+        # 弹幕聚类（新旧合并聚类：一次 cluster 调用，跨新旧边界去重，按单元数定量）
         self._last_cluster_result = None
-        if self._comment_clusterer and new_comments:
+        if self._comment_clusterer and (new_comments or old_comments):
           t0 = time.perf_counter()
-          self._last_cluster_result = self._comment_clusterer.cluster(new_comments)
+          new_ids = {c.id for c in new_comments}
+          self._last_cluster_new_ids = new_ids
+          self._last_cluster_result = self._comment_clusterer.cluster(
+            old_comments + new_comments
+          )
+          new_comments, old_comments = self._trim_by_cluster_units(
+            self._last_cluster_result, new_ids,
+          )
           _t["comment_cluster_ms"] = (time.perf_counter() - t0) * 1000
 
         # 回复决策器：判断是否值得回复
@@ -727,11 +738,19 @@ class StreamingStudio:
         meme_caught = len(relevant) > 0
       affection.process_interaction(c.content, ai_response, meme_caught=meme_caught)
 
-  def _collect_comments(self) -> tuple[list[Comment], list[Comment]]:
+  def _collect_comments(
+    self,
+    limit_new: bool = True,
+  ) -> tuple[list[Comment], list[Comment]]:
     """
     从缓冲区收集最近弹幕，按"上次开始回复时间"分割为旧弹幕和新弹幕
 
+    Args:
+      limit_new: True 时对新弹幕按 recent_comments_limit 截断（默认行为）；
+                 False 时返回全量新弹幕，由调用方（聚类器）负责后续定量。
+
     实际弹幕上限 = min(recent_comments_limit, 新弹幕数 * new_comment_context_ratio)
+    （仅 limit_new=True 时生效）
 
     Returns:
       (old_comments, new_comments) 元组
@@ -739,7 +758,8 @@ class StreamingStudio:
       - new_comments: 上次回复之后的新弹幕
     """
     all_buffered = list(self._comment_buffer)
-    recent = all_buffered[-self.recent_comments_limit:]
+    # limit_new=True：只看最近 N 条；limit_new=False：看全部缓冲区（聚类后外部定量）
+    recent = all_buffered[-self.recent_comments_limit:] if limit_new else all_buffered
     recent_ids = {c.id for c in recent}
 
     # 优先弹幕始终包含在收集范围内（不受 recent_comments_limit 截断）
@@ -764,17 +784,23 @@ class StreamingStudio:
     if total_new == 0:
       return [], []
 
-    # 动态上限：根据新弹幕数量限制总弹幕数（优先弹幕计入总数但不被截断）
-    dynamic_limit = max(1, int(total_new * self.config.new_comment_context_ratio))
-    total_limit = min(self.recent_comments_limit, dynamic_limit)
+    if limit_new:
+      # 动态上限：根据新弹幕数量限制总弹幕数（优先弹幕计入总数但不被截断）
+      dynamic_limit = max(1, int(total_new * self.config.new_comment_context_ratio))
+      total_limit = min(self.recent_comments_limit, dynamic_limit)
 
-    # 新弹幕优先，优先弹幕始终保留，剩余配额给普通新弹幕
-    normal_quota = max(0, total_limit - len(promoted))
-    new = new[-normal_quota:] if normal_quota > 0 else []
-    new = promoted + new
+      # 新弹幕优先，优先弹幕始终保留，剩余配额给普通新弹幕
+      normal_quota = max(0, total_limit - len(promoted))
+      new = new[-normal_quota:] if normal_quota > 0 else []
+      new = promoted + new
 
-    old_quota = max(0, total_limit - len(new))
-    old = old[-old_quota:] if old_quota > 0 else []
+      old_quota = max(0, total_limit - len(new))
+      old = old[-old_quota:] if old_quota > 0 else []
+    else:
+      # limit_new=False：新弹幕全量返回（由聚类器+_trim_by_cluster_units 后续定量）
+      # 旧弹幕保留合理上限，避免无谓传输
+      new = promoted + new
+      old = old[-self.recent_comments_limit:]
 
     return old, new
 
@@ -1447,22 +1473,102 @@ class StreamingStudio:
       kwargs["id"] = response_id
     return StreamerResponse(**kwargs)
 
+  def _trim_by_cluster_units(
+    self,
+    cluster_result: ClusterResult,
+    new_ids: set[str],
+  ) -> tuple[list[Comment], list[Comment]]:
+    """
+    新旧合并聚类后按"单元数"定量，再按新旧分区输出。
+
+    规则：
+    - 每个 cluster / single 算 1 个单元
+    - 含 ≥1 条新弹幕的单元 → new_unit；全为旧弹幕的单元 → old_unit
+    - 新单元优先，old 填充剩余配额；总单元数不超过 recent_comments_limit
+    - 跨新旧边界的 cluster 归入 new（因为含新内容，需要互动关注）
+
+    Args:
+      cluster_result: 对 old+new 合并后做聚类的结果
+      new_ids: 新弹幕的 id 集合（由调用方在聚类前记录）
+
+    Returns:
+      (new_comments, old_comments) — 展开后按时间排序的两组弹幕
+    """
+    limit = self.recent_comments_limit
+
+    new_units: list[tuple[Comment, Optional[CommentCluster]]] = []
+    old_units: list[tuple[Comment, Optional[CommentCluster]]] = []
+
+    for s in cluster_result.singles:
+      (new_units if s.id in new_ids else old_units).append((s, None))
+
+    for c in cluster_result.clusters:
+      is_new = any(m.id in new_ids for m in c.members)
+      (new_units if is_new else old_units).append((c.representative, c))
+
+    new_units.sort(key=lambda u: u[0].timestamp)
+    old_units.sort(key=lambda u: u[0].timestamp)
+
+    selected_new = new_units[-limit:]
+    old_quota = max(0, limit - len(selected_new))
+    selected_old = old_units[-old_quota:] if old_quota > 0 else []
+
+    def expand(units: list[tuple[Comment, Optional[CommentCluster]]]) -> list[Comment]:
+      comments: list[Comment] = []
+      for rep, cluster in units:
+        if cluster is None:
+          comments.append(rep)
+        else:
+          comments.extend(cluster.members)
+      comments.sort(key=lambda c: c.timestamp)
+      return comments
+
+    return expand(selected_new), expand(selected_old)
+
   def _format_cluster_debug(self) -> Optional[dict]:
-    """最近一次聚类结果的调试摘要"""
+    """最近一次聚类结果的调试摘要（新旧合并聚类版）"""
     cr = self._last_cluster_result
     if cr is None:
       return None
+    new_ids = self._last_cluster_new_ids
+
+    def unit_tag(members: list[Comment]) -> str:
+      """判断单元新旧归属"""
+      ids = {m.id for m in members}
+      if ids & new_ids:
+        return "new" if ids <= new_ids else "mixed"
+      return "old"
+
+    cluster_infos = [
+      {
+        "representative": c.representative.content[:40],
+        "count": c.count,
+        "reason": c.merge_reason,
+        "tag": unit_tag(list(c.members)),
+      }
+      for c in cr.clusters
+    ]
+    single_infos = [
+      {
+        "content": s.content[:40],
+        "tag": "new" if s.id in new_ids else "old",
+      }
+      for s in cr.singles
+    ]
+
+    new_cluster = sum(1 for c in cluster_infos if c["tag"] in ("new", "mixed"))
+    old_cluster = len(cluster_infos) - new_cluster
+    new_single = sum(1 for s in single_infos if s["tag"] == "new")
+    old_single = len(single_infos) - new_single
+
     return {
       "cluster_count": len(cr.clusters),
       "single_count": len(cr.singles),
-      "clusters": [
-        {
-          "representative": c.representative.content[:30],
-          "count": c.count,
-          "reason": c.merge_reason,
-        }
-        for c in cr.clusters
-      ],
+      "new_unit_count": new_cluster + new_single,
+      "old_unit_count": old_cluster + old_single,
+      "mixed_cluster_count": sum(1 for c in cluster_infos if c["tag"] == "mixed"),
+      "clusters": cluster_infos,
+      "singles": single_infos,
     }
 
   def debug_state(self) -> dict:
