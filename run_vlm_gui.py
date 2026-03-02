@@ -17,7 +17,9 @@ import argparse
 import asyncio
 import base64
 import collections
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -329,6 +331,47 @@ def main():
       ui.link("监控面板", "/monitor", new_tab=True).classes(
         "text-sm text-blue-600 no-underline hover:underline"
       )
+
+      def open_feedback_dialog():
+        with ui.dialog() as dlg, ui.card().classes("w-96"):
+          ui.label("提交反馈").classes("text-lg font-bold mb-2")
+          feedback_input = ui.textarea(
+            label="反馈内容",
+            placeholder="描述你遇到的问题或改进建议...",
+          ).classes("w-full").props("rows=5 outlined")
+
+          with ui.row().classes("w-full justify-end gap-2 mt-2"):
+            ui.button("取消", on_click=dlg.close).props("flat")
+
+            def submit():
+              text = feedback_input.value.strip()
+              if not text:
+                ui.notify("反馈内容不能为空", type="warning")
+                return
+              feedback_dir = project_root / "data" / "feedback"
+              feedback_dir.mkdir(parents=True, exist_ok=True)
+              ts = datetime.now()
+              filename = ts.strftime("feedback_%Y%m%d_%H%M%S.json")
+              entry = {
+                "timestamp": ts.isoformat(),
+                "content": text,
+                "video_path": runtime.get("video_path") or "",
+                "persona": args.persona,
+                "model": args.model,
+              }
+              (feedback_dir / filename).write_text(
+                json.dumps(entry, ensure_ascii=False, indent=2), encoding="utf-8"
+              )
+              dlg.close()
+              ui.notify("反馈已保存，感谢！", type="positive")
+
+            ui.button("提交", on_click=submit).props("color=primary")
+
+        dlg.open()
+
+      ui.button("反馈", on_click=open_feedback_dialog).props(
+        "dense flat icon=feedback"
+      ).classes("text-sm")
 
       progress = ui.linear_progress(value=0, show_value=False).classes("flex-1")
       _init_player = runtime.get("player")
