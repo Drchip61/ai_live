@@ -44,6 +44,10 @@ def main():
     "--topic-manager", action="store_true", default=True,
     help="启用话题管理器（追踪和管理直播话题，默认关闭）",
   )
+  parser.add_argument(
+    "--comment-clusterer", action="store_true", default=True,
+    help="弹幕聚类器配置文件路径（可选）",
+  )
 
   args = parser.parse_args()
 
@@ -61,6 +65,7 @@ def main():
       port=args.port,
       enable_global_memory=args.global_memory,
       enable_topic_manager=args.topic_manager,
+      enable_comment_clusterer=args.comment_clusterer,
     )
   except KeyboardInterrupt:
     print("\n正在关闭...")

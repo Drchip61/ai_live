@@ -477,7 +477,9 @@ _TAG_LABEL: dict[str, str] = {
 def _build_cluster_card() -> dict:
   """构建弹幕聚类结果卡片"""
   refs = {}
-  with ui.card().classes("w-full"):
+  card = ui.card().classes("w-full")
+  refs["card"] = card
+  with card:
     ui.label("弹幕聚类").classes("text-lg font-bold")
     ui.separator()
     with ui.column().classes("gap-1"):
@@ -496,10 +498,16 @@ def _update_cluster_card(refs: dict, state: dict) -> None:
   if not refs:
     return
 
+  # 聚类器未启用时隐藏整个卡片
+  clusterer_enabled = state.get("comment_clusterer_enabled", True) if state else True
+  refs["card"].set_visibility(clusterer_enabled)
+  if not clusterer_enabled:
+    return
+
   cr = state.get("last_cluster_result") if state else None
 
   if cr is None:
-    refs["summary"].text = "（未启用或本轮未触发）"
+    refs["summary"].text = "（本轮未触发）"
     refs["counts"].text = ""
     refs["cluster_list"].clear()
     refs["single_list"].clear()

@@ -104,6 +104,8 @@ class AutoViewer:
     self._response_cb = self._on_response
     self.studio.on_response(self._response_cb)
     self._task = asyncio.create_task(self._generation_loop())
+    # 立即发出一批开场弹幕，不依赖主播先回复，破开"互等"死锁
+    asyncio.create_task(self._send_opening_comments())
     logger.info("自动观众已启动")
 
   async def stop(self) -> None:
@@ -135,6 +137,37 @@ class AutoViewer:
     max_ctx = self.config.max_responses_context
     if len(self._recent_responses) > max_ctx:
       self._recent_responses = self._recent_responses[-max_ctx:]
+
+  async def _send_opening_comments(self) -> None:
+    """启动后立即发一批开场弹幕，不依赖主播先回复"""
+    await asyncio.sleep(random.uniform(1.5, 3.0))
+    if not self._running:
+      return
+    opening_prompt = (
+      "直播刚开始，还没有主播发言。请生成几条观众刚进直播间时会说的开场弹幕。"
+    )
+    messages = [
+      SystemMessage(content=self._prompt_template),
+      HumanMessage(content=opening_prompt),
+    ]
+    try:
+      result = await self._model.ainvoke(messages)
+      text = result.content if hasattr(result, "content") else str(result)
+      lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+      for line in lines[:3]:
+        if not self._running:
+          break
+        user_id, nickname = random.choice(self._viewer_pool)
+        comment = Comment(user_id=user_id, nickname=nickname, content=line)
+        self.studio.send_comment(comment)
+        for cb in self._comment_callbacks:
+          try:
+            cb(comment)
+          except Exception:
+            pass
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+    except Exception as e:
+      logger.error("开场弹幕生成失败: %s", e)
 
   async def _generation_loop(self) -> None:
     """生成循环：随机间隔生成弹幕批次"""

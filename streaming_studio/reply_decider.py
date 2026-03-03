@@ -141,7 +141,7 @@ class ReplyDecider:
       return self._parse_judge_response(text)
     except Exception as e:
       logger.error("LLM 精判调用失败: %s", e)
-      return ReplyDecision(False, 2, f"精判异常({e})，默认跳过", "llm")
+      return ReplyDecision(True, 5, f"精判异常({e})，默认回复", "llm")
 
   async def should_reply(
     self,
@@ -242,7 +242,7 @@ class ReplyDecider:
       return ReplyDecision(False, 1, "LLM判断", "llm")
 
     logger.warning("LLM 精判响应解析失败: %s", text[:100])
-    return ReplyDecision(False, 2, "响应解析失败，默认跳过", "llm")
+    return ReplyDecision(True, 5, "响应解析失败，默认回复", "llm")
 
   @staticmethod
   def _is_repetitive(content: str) -> bool:

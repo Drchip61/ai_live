@@ -31,6 +31,7 @@ def run(
   port: int = 8080,
   enable_global_memory: bool = False,
   enable_topic_manager: bool = False,
+  **kwargs
 ) -> None:
   """
   启动调试控制台
@@ -51,6 +52,7 @@ def run(
     enable_memory=True,
     enable_global_memory=enable_global_memory,
     enable_topic_manager=enable_topic_manager,
+    **kwargs,
   )
   studio.enable_streaming = True
   collector = StateCollector(studio)
