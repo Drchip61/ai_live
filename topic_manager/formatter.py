@@ -4,7 +4,9 @@
 """
 
 import logging
+import random
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
 from prompts import PromptLoader
@@ -18,6 +20,15 @@ _loader = PromptLoader()
 _STALE_INSTRUCTION = _loader.load("topic/stale_instruction.txt")
 _FOLLOWUP_INSTRUCTION = _loader.load("topic/followup_instruction.txt")
 _PROACTIVE_CONTINUATION = _loader.load("topic/proactive_continuation.txt")
+_ASK_AUDIENCE_INSTRUCTION = _loader.load("topic/ask_audience_instruction.txt")
+_NEW_TOPIC_INSTRUCTION = _loader.load("topic/new_topic_instruction.txt")
+
+
+class ProactiveSpeakStrategy(str, Enum):
+  """主动发言策略"""
+  CONTINUE_TOPIC = "continue"  # 继续推进当前话题
+  ASK_AUDIENCE   = "ask"       # 向观众提问
+  NEW_TOPIC      = "new"       # 挑起新话题
 
 
 def _significance_label(sig: float) -> str:
@@ -157,6 +168,37 @@ def _format_topic_summary(
   return "\n".join(lines)
 
 
+def _pick_proactive_strategy(
+  topics: list[Topic],
+  config: TopicManagerConfig,
+) -> tuple[ProactiveSpeakStrategy, Optional[Topic]]:
+  """
+  根据话题状态加权随机选择主动发言策略
+
+  Returns:
+    (strategy, topic) — NEW_TOPIC 时 topic 为 None
+  """
+  active = [
+    t for t in topics
+    if not t.stale and t.significance >= config.proactive_topic_min_significance
+  ]
+
+  if not active:
+    return ProactiveSpeakStrategy.NEW_TOPIC, None
+
+  best = max(active, key=lambda t: t.significance)
+  strategy = random.choices(
+    [
+      ProactiveSpeakStrategy.CONTINUE_TOPIC,
+      ProactiveSpeakStrategy.ASK_AUDIENCE,
+      ProactiveSpeakStrategy.NEW_TOPIC,
+    ],
+    weights=[0.40, 0.35, 0.25],
+  )[0]
+
+  return strategy, (None if strategy == ProactiveSpeakStrategy.NEW_TOPIC else best)
+
+
 def _format_instructions(
   topics: list[Topic],
   new_comment_ids: list[str],
@@ -175,16 +217,24 @@ def _format_instructions(
   # 冷场 / 弹幕稀疏时的话题跟进建议
   comment_count = len(new_comment_ids)
   if comment_count <= config.sparse_comment_threshold:
-    followup_topics = [t for t in topics if t.suggestion and not t.stale]
-    if followup_topics:
-      best = max(followup_topics, key=lambda t: t.significance)
-      if comment_count == 0:
-        # 完全没弹幕：用现有冷场跟进指令
+    if comment_count == 0:
+      # 完全没弹幕：三选一策略（继续话题 / 向观众提问 / 挑起新话题）
+      strategy, pick = _pick_proactive_strategy(topics, config)
+      if strategy == ProactiveSpeakStrategy.CONTINUE_TOPIC and pick and pick.suggestion:
         instructions.append(
-          _FOLLOWUP_INSTRUCTION.format(title=best.title, suggestion=best.suggestion)
+          _FOLLOWUP_INSTRUCTION.format(title=pick.title, suggestion=pick.suggestion)
+        )
+      elif strategy == ProactiveSpeakStrategy.ASK_AUDIENCE and pick:
+        instructions.append(
+          _ASK_AUDIENCE_INSTRUCTION.format(title=pick.title)
         )
       else:
-        # 有少量弹幕但很稀疏：用更温和的推进引导
+        instructions.append(_NEW_TOPIC_INSTRUCTION)
+    else:
+      # 有少量弹幕但很稀疏：温和推进（保持原有逻辑）
+      followup_topics = [t for t in topics if t.suggestion and not t.stale]
+      if followup_topics:
+        best = max(followup_topics, key=lambda t: t.significance)
         instructions.append(
           _PROACTIVE_CONTINUATION.format(title=best.title, suggestion=best.suggestion)
         )
