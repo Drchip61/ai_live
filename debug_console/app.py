@@ -17,6 +17,7 @@ if str(project_root) not in sys.path:
 from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio
 
+from .auto_viewer import AutoViewer
 from .comment_broadcaster import CommentBroadcaster
 from .state_collector import StateCollector
 from .pages.monitor import create_monitor_page
@@ -57,22 +58,25 @@ def run(
   studio.enable_streaming = True
   collector = StateCollector(studio)
   broadcaster = CommentBroadcaster()
+  # AutoViewer 在应用层创建，生命周期与 studio 绑定，不随客户端重连重置
+  auto_viewer = AutoViewer(studio)
+  auto_viewer.on_comment(broadcaster.broadcast)
 
   @ui.page("/")
   def index():
-    _build_page(studio, collector, broadcaster, default_tab="monitor")
+    _build_page(studio, collector, broadcaster, auto_viewer, default_tab="monitor")
 
   @ui.page("/monitor")
   def monitor():
-    _build_page(studio, collector, broadcaster, default_tab="monitor")
+    _build_page(studio, collector, broadcaster, auto_viewer, default_tab="monitor")
 
   @ui.page("/chat")
   def chat():
-    _build_page(studio, collector, broadcaster, default_tab="chat")
+    _build_page(studio, collector, broadcaster, auto_viewer, default_tab="chat")
 
   @ui.page("/settings")
   def settings():
-    _build_page(studio, collector, broadcaster, default_tab="settings")
+    _build_page(studio, collector, broadcaster, auto_viewer, default_tab="settings")
 
   ui.run(
     title="调试控制台 — mio-streaming-demo",
@@ -85,6 +89,7 @@ def _build_page(
   studio: StreamingStudio,
   collector: StateCollector,
   broadcaster: CommentBroadcaster,
+  auto_viewer: AutoViewer,
   default_tab: str = "monitor",
 ) -> None:
   """
@@ -94,6 +99,7 @@ def _build_page(
     studio: 直播间实例
     collector: 状态收集器
     broadcaster: 弹幕广播器
+    auto_viewer: 自动观众引擎（应用层单例）
     default_tab: 默认激活的标签页
   """
   # 顶部菜单栏
@@ -111,6 +117,6 @@ def _build_page(
     with ui.tab_panel("monitor"):
       create_monitor_page(collector)
     with ui.tab_panel("chat"):
-      create_chat_page(studio, broadcaster)
+      create_chat_page(studio, broadcaster, auto_viewer)
     with ui.tab_panel("settings"):
       create_settings_page(studio)

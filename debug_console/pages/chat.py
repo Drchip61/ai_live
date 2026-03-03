@@ -10,7 +10,6 @@ from datetime import datetime
 from coolname import generate
 from nicegui import ui, context
 
-from debug_console.auto_viewer import AutoViewer
 from debug_console.comment_broadcaster import CommentBroadcaster
 from streaming_studio import StreamingStudio, Comment
 from streaming_studio.models import ResponseChunk
@@ -29,13 +28,18 @@ def _random_identity() -> tuple[str, str]:
   return user_id, nickname
 
 
-def create_chat_page(studio: StreamingStudio, broadcaster: CommentBroadcaster) -> None:
+def create_chat_page(
+  studio: StreamingStudio,
+  broadcaster: CommentBroadcaster,
+  auto_viewer: "AutoViewer",
+) -> None:
   """
   构建模拟直播间 UI（左右分栏）
 
   Args:
     studio: 直播间实例
     broadcaster: 弹幕广播器（跨客户端同步弹幕显示）
+    auto_viewer: 应用层单例自动观众引擎（生命周期跨客户端重连）
   """
   # 页面局部状态
   state = {
@@ -46,9 +50,6 @@ def create_chat_page(studio: StreamingStudio, broadcaster: CommentBroadcaster) -
     "next_nick": "",
   }
   state["next_id"], state["next_nick"] = _random_identity()
-
-  # 自动观众引擎
-  auto_viewer = AutoViewer(studio)
 
   # 回调引用（stop / disconnect 时移除）
   callback_ref = {"fn": None, "chunk_fn": None}
@@ -109,8 +110,13 @@ def create_chat_page(studio: StreamingStudio, broadcaster: CommentBroadcaster) -
           auto_label.text = "已停止"
           auto_label.classes(replace="text-xs text-gray-400")
 
-      auto_switch = ui.switch("自动观众", on_change=on_auto_toggle).props("dense")
-      auto_label = ui.label("已停止").classes("text-xs text-gray-400")
+      _is_running = auto_viewer.is_running
+      auto_switch = ui.switch("自动观众", value=_is_running, on_change=on_auto_toggle).props("dense")
+      auto_label = (
+        ui.label("运行中").classes("text-xs text-green-600")
+        if _is_running
+        else ui.label("已停止").classes("text-xs text-gray-400")
+      )
 
     # ── 用户模式切换 ──
     with ui.row().classes("w-full items-center gap-4 flex-wrap"):
@@ -286,17 +292,10 @@ def create_chat_page(studio: StreamingStudio, broadcaster: CommentBroadcaster) -
 
   broadcaster.register(on_broadcast_comment)
 
-  # 自动观众弹幕也通过广播器同步到所有客户端
-  auto_viewer.on_comment(broadcaster.broadcast)
-
-  # ── 清理 ──
+  # ── 清理（仅移除本客户端 UI 回调，auto_viewer 生命周期由应用层管理）──
 
   def cleanup():
     broadcaster.unregister(on_broadcast_comment)
-    auto_viewer.remove_comment_callback(broadcaster.broadcast)
-    if auto_viewer.is_running:
-      import asyncio
-      asyncio.create_task(auto_viewer.stop())
     if callback_ref["fn"]:
       studio.remove_callback(callback_ref["fn"])
       callback_ref["fn"] = None
