@@ -1,0 +1,14 @@
+{
+  "description": "风格参考库",
+  "retrieval_count": 3,
+  "injection_probability": 0.2,
+  "injection_header": "【风格灵感——必须参考以下示例的脑洞和逻辑方式，用你自己的语气讲出来】",
+  "categories": {
+    "classic_question": "经典荒诞假设问题",
+    "reasoning_chain": "完整推理链示范",
+    "comment_reaction": "对弹幕的反应方式",
+    "scene_reaction": "对画面的反应方式",
+    "ice_breaker": "冷场时的主动发言",
+    "comeback": "被质疑时的回击方式"
+  }
+}

@@ -15,6 +15,7 @@ from .layers.active import ActiveLayer
 from .layers.temporary import TemporaryLayer
 from .layers.summary import SummaryLayer
 from .layers.static import StaticLayer
+from .layers.stance import StanceLayer
 
 
 def _dedup_entries(entries: list[MemoryEntry], top_k: int) -> list[MemoryEntry]:
@@ -58,6 +59,7 @@ class MemoryRetriever:
     temporary: TemporaryLayer,
     summary: SummaryLayer,
     static: StaticLayer,
+    stance: Optional[StanceLayer] = None,
     config: Optional[RetrievalConfig] = None,
   ):
     """
@@ -68,12 +70,14 @@ class MemoryRetriever:
       temporary: temporary 层实例
       summary: summary 层实例
       static: static 层实例
+      stance: stance 层实例（立场记忆，可选）
       config: 检索配置
     """
     self._active = active
     self._temporary = temporary
     self._summary = summary
     self._static = static
+    self._stance = stance
     self._config = config or RetrievalConfig()
     self.session_id: Optional[str] = None
 
@@ -129,6 +133,31 @@ class MemoryRetriever:
 
     return active_text, rag_text
 
+  def retrieve_active_only(self) -> tuple[str, str]:
+    """
+    仅返回 Active 层记忆，不触发任何 RAG 检索和 significance 衰减
+
+    Returns:
+      (active_text, "") 元组
+    """
+    active_memories = self._active.get_all()
+    active_entries = [
+      MemoryEntry(
+        id=m.id,
+        content=m.content,
+        layer="active",
+        timestamp=m.timestamp,
+        metadata={"response": m.response},
+      )
+      for m in active_memories
+    ]
+    active_text = format_active_memories(
+      active_entries,
+      include_response=self._config.include_response_in_active,
+      response_max_length=self._config.response_display_max_length,
+    )
+    return active_text, ""
+
   def _retrieve_quota(self, queries: list[str]) -> list[MemoryEntry]:
     """
     per-layer quota 模式：每层逐条查询，去重后取 quota 数量
@@ -162,6 +191,14 @@ class MemoryRetriever:
         )
       entries.extend(_dedup_entries(all_stat, self._config.quota_static))
 
+    if self._stance is not None and self._config.quota_stance > 0:
+      all_stance = []
+      for q in queries:
+        all_stance.extend(
+          self._stance.retrieve(q, top_k=self._config.quota_stance)
+        )
+      entries.extend(_dedup_entries(all_stance, self._config.quota_stance))
+
     return entries
 
   def _retrieve_weighted(self, queries: list[str]) -> list[MemoryEntry]:
@@ -177,17 +214,20 @@ class MemoryRetriever:
       self._config.quota_temporary
       + self._config.quota_summary
       + self._config.quota_static
+      + (self._config.quota_stance if self._stance is not None else 0)
     )
+    layer_count = 3 + (1 if self._stance is not None else 0)
     overfetch = total_quota * self._config.weighted_overfetch_multiplier
 
-    # 每层多取回
-    per_layer = max(1, overfetch // 3)
+    per_layer = max(1, overfetch // layer_count)
     all_entries = []
 
     for q in queries:
       all_entries.extend(self._temporary.retrieve(q, top_k=per_layer))
       all_entries.extend(self._summary.retrieve(q, top_k=per_layer))
       all_entries.extend(self._static.retrieve(q, top_k=per_layer))
+      if self._stance is not None:
+        all_entries.extend(self._stance.retrieve(q, top_k=per_layer))
 
     # 按 ID 去重（保留最佳 score）
     best: dict[str, MemoryEntry] = {}
@@ -201,6 +241,7 @@ class MemoryRetriever:
       "temporary": self._config.weight_temporary,
       "summary": self._config.weight_summary,
       "static": self._config.weight_static,
+      "stance": self._config.weight_stance,
     }
 
     weighted = []

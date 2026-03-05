@@ -8,6 +8,8 @@ import json
 import logging
 from typing import Optional
 
+import json_repair
+
 from langchain_core.language_models import BaseChatModel
 
 from .models import Topic
@@ -192,7 +194,9 @@ async def batch_classify(
       text = text.rsplit("```", 1)[0]
     text = text.strip()
 
-    mapping = json.loads(text)
+    mapping = json_repair.loads(text)
+    if not isinstance(mapping, dict):
+      raise ValueError(f"LLM 返回了非 dict 类型: {type(mapping).__name__}")
 
     # 将编号映射回 comment_id
     idx_to_cid = {str(idx): cid for idx, cid, _ in unmatched}

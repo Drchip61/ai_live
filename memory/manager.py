@@ -1,18 +1,18 @@
 """
 记忆系统编排器
-统一管理四层初始化、记忆读写、定时汇总和清理
+统一管理五层初始化、记忆读写、定时汇总和清理
 """
 
 import asyncio
+import json
 import logging
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
 from langchain_core.language_models import BaseChatModel
 from langchain_huggingface import HuggingFaceEmbeddings
-
-from pathlib import Path
 
 from .config import MemoryConfig, EmbeddingConfig
 from .store import VectorStore
@@ -21,10 +21,15 @@ from .layers.active import ActiveLayer
 from .layers.temporary import TemporaryLayer
 from .layers.summary import SummaryLayer
 from .layers.static import StaticLayer
+from .layers.stance import StanceLayer
 from .layers.user_profile import UserProfileLayer
 from .layers.character_profile import CharacterProfileLayer
 from .retriever import MemoryRetriever
-from .prompts import INTERACTION_SUMMARY_PROMPT, PERIODIC_SUMMARY_PROMPT
+from .prompts import (
+  INTERACTION_SUMMARY_PROMPT,
+  PERIODIC_SUMMARY_PROMPT,
+  STANCE_EXTRACTION_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +39,16 @@ class MemoryManager:
   记忆系统顶层编排器
 
   职责：
-  - 初始化四层记忆 + 共享 embeddings
-  - 编排记忆读取（检索）和写入（交互记录）
+  - 初始化五层记忆（active / temporary / summary / static / stance）+ 共享 embeddings
+  - 编排记忆读取（检索）和写入（交互记录 + 立场提取）
   - 管理定时汇总和清理任务的生命周期
   """
+
+  _STANCE_INDICATORS = re.compile(
+    r"我觉得|我认为|我喜欢|我讨厌|我比较|在我看来|我的看法|"
+    r"我偏向|我支持|我反对|说实话我|我个人|依我看|"
+    r"我更.{1,6}一些|我不太.{1,6}|我挺.{1,6}的|我是.{1,6}派|我站"
+  )
 
   def __init__(
     self,
@@ -119,6 +130,15 @@ class MemoryManager:
         persist_path = Path(config.embedding.persist_directory) / config.character_profile.persist_filename
       self._character_profile = CharacterProfileLayer(persist_path=persist_path)
 
+    # 立场记忆层（默认启用）
+    self._stance: Optional[StanceLayer] = None
+    if config.stance.enabled:
+      self._stance = StanceLayer(
+        VectorStore("stance", embedding_config, embeddings=embeddings),
+        self._archive,
+        config.stance,
+      )
+
     # 当前会话 ID（由 studio 在 start() 时设置）
     self._session_id: Optional[str] = None
 
@@ -128,6 +148,7 @@ class MemoryManager:
       self._temporary,
       self._summary_layer,
       self._static,
+      stance=self._stance,
       config=config.retrieval,
     )
 
@@ -166,6 +187,8 @@ class MemoryManager:
     self._session_id = value
     self._temporary.session_id = value
     self._summary_layer.session_id = value
+    if self._stance is not None:
+      self._stance.session_id = value
     self._retriever.session_id = value
 
   def _get_summary_model(self) -> BaseChatModel:
@@ -193,13 +216,25 @@ class MemoryManager:
     """
     return self._retriever.retrieve(query)
 
+  def retrieve_active_only(self) -> tuple[str, str]:
+    """
+    仅返回 Active 层记忆（不触发任何 RAG 检索和 significance 衰减）
+
+    用于主动发言等无弹幕场景：主播需要知道"我刚才说过什么"以避免重复，
+    但不应触发 Temporary/Summary/Static/Stance 的 RAG 检索和衰减。
+
+    Returns:
+      (active_text, "") 元组，rag_text 始终为空
+    """
+    return self._retriever.retrieve_active_only()
+
   async def record_interaction(
     self,
     user_input: str,
     response: str,
   ) -> None:
     """
-    异步记录一次交互
+    异步记录一次交互（仅交互记忆，不含立场提取）
 
     使用小 LLM 将对话总结为第一人称记忆，写入 active 层，
     同时加入近期交互缓冲供定时汇总使用。
@@ -227,6 +262,30 @@ class MemoryManager:
     except Exception as e:
       logger.error("记录交互记忆失败: %s", e)
 
+  async def extract_stances(
+    self,
+    response: str,
+    context: str = "",
+  ) -> None:
+    """
+    从 AI 回复中提取立场/观点并写入 Stance 层（独立于交互记忆）
+
+    先做正则预筛，通过后调用小 LLM 提取结构化立场数据。
+    无论是否有弹幕（包括主动发言场景）都应调用。
+
+    Args:
+      response: AI 的回复文本
+      context: 触发回复的上下文描述（有弹幕时为弹幕摘要，主动发言时可为空）
+    """
+    if self._stance is None:
+      return
+    if not self._may_contain_stance(response):
+      return
+    try:
+      await self._extract_and_store_stances(context, response)
+    except Exception as e:
+      logger.error("立场提取失败: %s", e)
+
   def record_interaction_sync(
     self,
     user_input: str,
@@ -246,6 +305,54 @@ class MemoryManager:
     self._recent_interactions.append(
       (user_input, response, datetime.now())
     )
+
+  def _may_contain_stance(self, response: str) -> bool:
+    """规则预筛：检测回复中是否可能包含观点/立场性表达"""
+    return bool(self._STANCE_INDICATORS.search(response))
+
+  async def _extract_and_store_stances(
+    self,
+    user_input: str,
+    response: str,
+  ) -> None:
+    """
+    用小模型从回复中提取立场并写入 StanceLayer
+
+    仅在 _may_contain_stance() 预筛通过后调用。
+    """
+    model = self._get_summary_model()
+    prompt = STANCE_EXTRACTION_PROMPT.format(
+      input=user_input,
+      response=response,
+    )
+    result = await model.ainvoke(prompt)
+    text = result.content if hasattr(result, "content") else str(result)
+    text = text.strip()
+
+    # 尝试从回复中提取 JSON（兼容被 markdown 代码块包裹的情况）
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not json_match:
+      return
+
+    try:
+      data = json.loads(json_match.group())
+    except json.JSONDecodeError:
+      logger.debug("立场提取 JSON 解析失败: %s", text[:100])
+      return
+
+    if not data.get("has_stance"):
+      return
+
+    stances = data.get("stances", [])
+    for item in stances:
+      topic = item.get("topic", "").strip()
+      stance_text = item.get("stance", "").strip()
+      if topic and stance_text:
+        self._stance.add(
+          content=stance_text,
+          topic=topic,
+          response_excerpt=response[:200],
+        )
 
   async def start(self) -> None:
     """启动定时汇总和清理任务"""
@@ -294,7 +401,7 @@ class MemoryManager:
     if clear_summary:
       self._summary_layer.clear()
     self._recent_interactions.clear()
-    # 注意：user_profile 和 character_profile 不随运行期清空（它们是跨会话的）
+    # 注意：stance / user_profile / character_profile 不随运行期清空（它们是跨会话的长期记忆）
     logger.info("已清空运行期记忆状态 (clear_summary=%s)", clear_summary)
 
   def debug_state(self) -> dict:
@@ -374,6 +481,27 @@ class MemoryManager:
       "summary_task_running": self._summary_task is not None and not self._summary_task.done(),
       "cleanup_task_running": self._cleanup_task is not None and not self._cleanup_task.done(),
     }
+
+    if self._stance is not None:
+      stance_memories = []
+      try:
+        stance_data = self._stance._store.get_all()
+        for content, meta in zip(
+          stance_data.get("documents", []),
+          stance_data.get("metadatas", []),
+        ):
+          stance_memories.append({
+            "content": content or "",
+            "topic": (meta or {}).get("topic", ""),
+            "timestamp": (meta or {}).get("timestamp", ""),
+            "significance": (meta or {}).get("significance", 0),
+            "superseded_by": (meta or {}).get("superseded_by", ""),
+          })
+      except Exception as e:
+        logger.debug("读取 stance 层记忆失败: %s", e)
+      result["stance_count"] = self._stance.count()
+      result["stance_active_count"] = self._stance.count_active()
+      result["stance_memories"] = stance_memories
 
     if self._user_profile is not None:
       result["user_profile"] = self._user_profile.debug_state()

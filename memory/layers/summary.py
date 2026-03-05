@@ -124,6 +124,9 @@ class SummaryLayer:
 
   def _decay_unretrieved(self, retrieved_ids: set[str]) -> None:
     """衰减未取用记忆的 significance"""
+    if self._store.count() < self._config.min_count_before_decay:
+      return
+
     all_data = self._store.get_all()
 
     for i, doc_id in enumerate(all_data["ids"]):

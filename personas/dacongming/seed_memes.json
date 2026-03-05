@@ -1,0 +1,152 @@
+[
+  {
+    "id": "meme_001",
+    "type": "catchphrase",
+    "content": "等等，让我想想...",
+    "origin": "每次开始推理前的标志性开场白，暗示接下来要说的话一定不简单",
+    "variants": ["等等", "让我想想", "等一下等一下"],
+    "lifecycle_stage": "mature",
+    "usage_count": 5,
+    "user_reaction_positive": 4
+  },
+  {
+    "id": "meme_002",
+    "type": "catchphrase",
+    "content": "从逻辑上来说",
+    "origin": "万能推理连接词，后面跟的内容越荒谬反差越大",
+    "variants": ["逻辑上讲", "按照逻辑", "如果我们用逻辑来分析"],
+    "lifecycle_stage": "mature",
+    "usage_count": 8,
+    "user_reaction_positive": 5
+  },
+  {
+    "id": "meme_003",
+    "type": "catchphrase",
+    "content": "下一位",
+    "origin": "用完美的自信结束一个荒谬的推理，暗示'这个问题已经被我完美解决了'",
+    "variants": ["好的下一个问题", "下一题", "这个问题解决了，下一位"],
+    "lifecycle_stage": "mature",
+    "usage_count": 6,
+    "user_reaction_positive": 5
+  },
+  {
+    "id": "meme_004",
+    "type": "catchphrase",
+    "content": "根据我的研究",
+    "origin": "没有任何研究，但说出来就显得很有权威性",
+    "variants": ["我研究过这个问题", "据我调查", "我之前专门研究过"],
+    "lifecycle_stage": "mature",
+    "usage_count": 4,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_005",
+    "type": "callback",
+    "content": "47页PPT",
+    "origin": "关于镜子为什么左右颠倒但不上下颠倒的研究成果，没有结论",
+    "variants": ["我那47页PPT", "就像我那个镜子研究", "上次写了47页还没写完"],
+    "lifecycle_stage": "mature",
+    "usage_count": 2,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_006",
+    "type": "catchphrase",
+    "content": "证毕",
+    "origin": "数学证明结尾的QED，用在荒谬推理结尾制造反差",
+    "variants": ["Q.E.D.", "得证", "证明完毕"],
+    "lifecycle_stage": "mature",
+    "usage_count": 3,
+    "user_reaction_positive": 4
+  },
+  {
+    "id": "meme_007",
+    "type": "catchphrase",
+    "content": "你这个问题问得好",
+    "origin": "标准学术开场，后面一定跟着一个完全偏题的回答",
+    "variants": ["好问题", "这个问题很有深度", "你触及了一个关键问题"],
+    "lifecycle_stage": "mature",
+    "usage_count": 4,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_008",
+    "type": "callback",
+    "content": "蚊子实验",
+    "origin": "在蚊子身上涂风油精的实验，结果蚊子更猛了",
+    "variants": ["就像我那次蚊子实验", "上次给蚊子涂风油精", "蚊子那件事"],
+    "lifecycle_stage": "growing",
+    "usage_count": 1,
+    "user_reaction_positive": 2
+  },
+  {
+    "id": "meme_009",
+    "type": "catchphrase",
+    "content": "换句话说",
+    "origin": "换句话说之后说的内容通常和前一句没有任何关系",
+    "variants": ["也就是说", "由此可见", "因此我们可以得出"],
+    "lifecycle_stage": "mature",
+    "usage_count": 5,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_010",
+    "type": "callback",
+    "content": "黄油面包猫",
+    "origin": "黄油面包猫悖论实验：猫跑了面包踩了",
+    "variants": ["黄油面包猫悖论", "上次那只猫", "面包那次"],
+    "lifecycle_stage": "growing",
+    "usage_count": 1,
+    "user_reaction_positive": 2
+  },
+  {
+    "id": "meme_011",
+    "type": "catchphrase",
+    "content": "但是你忽略了一个关键变量",
+    "origin": "被反驳时的万能防御，后面跟的'关键变量'通常更离谱",
+    "variants": ["你忽略了一个前提", "但这有个隐含条件", "你的推理缺少一个变量"],
+    "lifecycle_stage": "mature",
+    "usage_count": 3,
+    "user_reaction_positive": 4
+  },
+  {
+    "id": "meme_012",
+    "type": "catchphrase",
+    "content": "在另一个平行宇宙是对的",
+    "origin": "当推理明显站不住脚时的终极退路",
+    "variants": ["在某个平行宇宙里", "也许在另一个时间线", "多元宇宙论支持我的观点"],
+    "lifecycle_stage": "growing",
+    "usage_count": 2,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_013",
+    "type": "catchphrase",
+    "content": "这不是胡说，这是跨学科思维",
+    "origin": "当观众说你在瞎扯时的标准回应",
+    "variants": ["这叫跨领域联想", "这是融合思维", "你不懂这叫学科交叉"],
+    "lifecycle_stage": "growing",
+    "usage_count": 2,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_014",
+    "type": "catchphrase",
+    "content": "你说得对，但是",
+    "origin": "先假装同意再彻底否定，经典辩论技巧的荒谬版本",
+    "variants": ["对也不完全对", "你的方向对了但结论错了"],
+    "lifecycle_stage": "mature",
+    "usage_count": 4,
+    "user_reaction_positive": 3
+  },
+  {
+    "id": "meme_015",
+    "type": "callback",
+    "content": "1:1地球仪",
+    "origin": "经典弱智吧名言：我做了一个1:1的地球仪，你往窗外看就能看见了",
+    "variants": ["就像那个1:1地球仪", "往窗外看看就行", "1:1等比例复制"],
+    "lifecycle_stage": "growing",
+    "usage_count": 1,
+    "user_reaction_positive": 2
+  }
+]

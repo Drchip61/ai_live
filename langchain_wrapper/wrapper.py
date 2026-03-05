@@ -11,10 +11,9 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Optional, Union, TYPE_CHECKING
 
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from .model_provider import ModelType, ModelProvider
-from .pipeline import StreamingPipeline, _build_multimodal_content
+from .pipeline import StreamingPipeline
 
 # 将项目根目录添加到路径
 project_root = Path(__file__).parent.parent
@@ -29,6 +28,7 @@ if TYPE_CHECKING:
   from emotion.affection import AffectionBank
   from meme.manager import MemeManager
   from validation.checker import ResponseChecker
+  from style_bank import StyleBank
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,7 @@ class LLMWrapper:
     affection_bank: Optional["AffectionBank"] = None,
     meme_manager: Optional["MemeManager"] = None,
     response_checker: Optional["ResponseChecker"] = None,
+    style_bank: Optional["StyleBank"] = None,
   ):
     """
     初始化 LLM 包装器
@@ -72,6 +73,7 @@ class LLMWrapper:
       affection_bank: 好感度银行（可选，奶凶人设专用）
       meme_manager: 梗管理器（可选，奶凶人设专用）
       response_checker: 回复校验器（可选，奶凶人设专用）
+      style_bank: 风格参考库（可选，按情境检索语料示例注入 prompt）
     """
     self.model_type = model_type
     self.model_name = model_name
@@ -81,18 +83,15 @@ class LLMWrapper:
     self._affection = affection_bank
     self._meme_manager = meme_manager
     self._checker = response_checker
+    self._style_bank = style_bank
 
     # 加载提示词
     prompt_loader = PromptLoader()
     system_prompt = prompt_loader.get_full_system_prompt(persona)
-    self._scene_prompt = prompt_loader.load("studio/scene_understanding.txt")
 
     # 创建模型
     provider = ModelProvider()
     model = provider.get_model(model_type, model_name)
-
-    # 场景理解用小模型（快速 + 低成本）
-    self._scene_model = ModelProvider.remote_small(provider=model_type)
 
     # 创建管道
     self.pipeline = StreamingPipeline(
@@ -107,11 +106,14 @@ class LLMWrapper:
     # 最近一次使用的记忆上下文（供调试监控）
     self._last_extra_context: str = ""
 
-    # 最近一次场景理解结果（供调试监控）
-    self._last_scene_understanding: str = ""
-
     # 后台任务引用集合（防止被 GC 回收）
     self._background_tasks: set[asyncio.Task] = set()
+
+  def roll_style_bank(self) -> bool:
+    """预判本轮风格参考库是否触发，供 studio 调整句数"""
+    if self._style_bank is None:
+      return False
+    return self._style_bank.pre_roll()
 
   @property
   def has_memory(self) -> bool:
@@ -127,11 +129,6 @@ class LLMWrapper:
   def last_extra_context(self) -> str:
     """最近一次使用的记忆上下文（供调试监控）"""
     return self._last_extra_context
-
-  @property
-  def last_scene_understanding(self) -> str:
-    """最近一次场景理解结果（供调试监控）"""
-    return self._last_scene_understanding
 
   async def start_memory(self) -> None:
     """启动记忆系统定时任务（需在 asyncio 上下文中调用）"""
@@ -152,17 +149,18 @@ class LLMWrapper:
     """清空对话历史"""
     self._history = []
 
-  def _build_extra_context(
+  async def _build_extra_context(
     self,
     user_input: str,
     rag_queries: Optional[list[str]] = None,
     topic_context: Optional[str] = None,
+    situation: Optional[str] = None,
   ) -> str:
     """
     构建额外上下文
 
     当奶凶系统模块存在时，按设计文档五分区结构组装：
-      ② 角色设定档 → ③ 用户画像 → ④ 检索记忆+梗 → 话题上下文
+      ② 角色设定档 → ③ 用户画像 → ④ 检索记忆+梗 → 话题上下文 → 风格参考
     （① 人设指令区由 system_prompt 覆盖，⑤ 近期对话区由 pipeline 管理）
 
     无新模块时走原有逻辑，保持向下兼容。
@@ -189,10 +187,16 @@ class LLMWrapper:
       if up_text:
         parts.append(up_text)
 
-    # ④ 检索记忆区
+    # ④ 检索记忆区（Chroma 向量查询是同步的，放到线程池避免阻塞事件循环）
     if self._memory is not None:
-      query: Union[str, list[str]] = rag_queries if rag_queries else user_input
-      active_text, rag_text = self._memory.retrieve(query)
+      if rag_queries:
+        active_text, rag_text = await asyncio.to_thread(
+          self._memory.retrieve, rag_queries,
+        )
+      else:
+        active_text, rag_text = await asyncio.to_thread(
+          self._memory.retrieve_active_only,
+        )
       if active_text:
         parts.append(active_text)
       if rag_text:
@@ -208,6 +212,60 @@ class LLMWrapper:
     if topic_context:
       parts.append(topic_context)
 
+    # 风格参考库：按情境语义检索示例
+    if self._style_bank is not None:
+      style_query = " ".join(rag_queries) if rag_queries else user_input
+      style_text = await asyncio.to_thread(
+        self._style_bank.retrieve, style_query, situation,
+      )
+      if style_text:
+        parts.append(style_text)
+
+    return "\n\n".join(parts)
+
+  def _build_extra_context_sync(
+    self,
+    user_input: str,
+    rag_queries: Optional[list[str]] = None,
+    topic_context: Optional[str] = None,
+    situation: Optional[str] = None,
+  ) -> str:
+    """同步版 _build_extra_context，供 chat() 等同步入口使用"""
+    parts: list[str] = []
+    if self._emotion is not None:
+      parts.append(self._emotion.state.to_prompt())
+    if self._affection is not None:
+      hint = self._affection.to_prompt()
+      if hint:
+        parts.append(hint)
+    if self._memory is not None and self._memory.character_profile is not None:
+      cp_text = self._memory.character_profile.to_prompt()
+      if cp_text:
+        parts.append(cp_text)
+    if self._memory is not None and self._memory.user_profile is not None:
+      up_text = self._memory.user_profile.to_prompt()
+      if up_text:
+        parts.append(up_text)
+    if self._memory is not None:
+      if rag_queries:
+        active_text, rag_text = self._memory.retrieve(rag_queries)
+      else:
+        active_text, rag_text = self._memory.retrieve_active_only()
+      if active_text:
+        parts.append(active_text)
+      if rag_text:
+        parts.append(rag_text)
+    if self._meme_manager is not None:
+      meme_text = self._meme_manager.to_prompt()
+      if meme_text:
+        parts.append(meme_text)
+    if topic_context:
+      parts.append(topic_context)
+    if self._style_bank is not None:
+      style_query = " ".join(rag_queries) if rag_queries else user_input
+      style_text = self._style_bank.retrieve(style_query, situation)
+      if style_text:
+        parts.append(style_text)
     return "\n\n".join(parts)
 
   @staticmethod
@@ -246,39 +304,6 @@ class LLMWrapper:
       "[END_USER_INPUT]"
     )
 
-  async def ascene_understand(
-    self,
-    danmaku_text: str,
-    images: list[str],
-  ) -> str:
-    """
-    第一趟调用：轻量场景理解
-
-    只发送画面和弹幕给模型，获取客观场景描述。
-    不使用人设、记忆、历史，纯粹做视觉+文本理解。
-
-    Args:
-      danmaku_text: 格式化后的弹幕文本
-      images: base64 JPEG 图片列表
-
-    Returns:
-      场景描述文本
-    """
-    content = _build_multimodal_content(danmaku_text, images)
-    messages = [
-      SystemMessage(content=self._scene_prompt),
-      HumanMessage(content=content),
-    ]
-    try:
-      result = await self._scene_model.ainvoke(messages)
-      text = result.content if hasattr(result, "content") else str(result)
-      self._last_scene_understanding = text.strip()
-      return self._last_scene_understanding
-    except Exception as e:
-      logger.error("场景理解调用失败: %s", e)
-      self._last_scene_understanding = ""
-      return ""
-
   def chat(
     self,
     user_input: str,
@@ -287,6 +312,7 @@ class LLMWrapper:
     topic_context: Optional[str] = None,
     images: Optional[list[str]] = None,
     memory_input: Optional[str] = None,
+    situation: Optional[str] = None,
   ) -> str:
     """
     同步聊天
@@ -299,13 +325,16 @@ class LLMWrapper:
       images: base64 JPEG 图片列表（VLM 多模态输入）
       memory_input: 用于记忆记录的清洗输入（VLM 模式下传入场景理解+弹幕摘要，
         替代原始 prompt；不传时使用 user_input）
+      situation: 情境标签（react_comment/react_scene/proactive），用于风格参考库检索
 
     Returns:
       模型回复
     """
     normalized_input = self._normalize_untrusted_text(user_input)
     guarded_input = self._guard_user_input(user_input)
-    extra_context = self._build_extra_context(normalized_input, rag_queries, topic_context)
+    extra_context = self._build_extra_context_sync(
+      normalized_input, rag_queries, topic_context, situation,
+    )
     self._last_extra_context = extra_context
     response = self.pipeline.invoke(
       guarded_input, self._history, extra_context=extra_context,
@@ -330,6 +359,7 @@ class LLMWrapper:
     topic_context: Optional[str] = None,
     images: Optional[list[str]] = None,
     memory_input: Optional[str] = None,
+    situation: Optional[str] = None,
   ) -> str:
     """
     异步聊天
@@ -342,13 +372,16 @@ class LLMWrapper:
       images: base64 JPEG 图片列表（VLM 多模态输入）
       memory_input: 用于记忆记录的清洗输入（VLM 模式下传入场景理解+弹幕摘要，
         替代原始 prompt；不传时使用 user_input）
+      situation: 情境标签（react_comment/react_scene/proactive），用于风格参考库检索
 
     Returns:
       模型回复
     """
     normalized_input = self._normalize_untrusted_text(user_input)
     guarded_input = self._guard_user_input(user_input)
-    extra_context = self._build_extra_context(normalized_input, rag_queries, topic_context)
+    extra_context = await self._build_extra_context(
+      normalized_input, rag_queries, topic_context, situation,
+    )
     self._last_extra_context = extra_context
     response = await self.pipeline.ainvoke(
       guarded_input, self._history, extra_context=extra_context,
@@ -360,11 +393,20 @@ class LLMWrapper:
 
     if self._memory is not None:
       mem_text = self._normalize_untrusted_text(memory_input or user_input)
-      task = asyncio.create_task(
-        self._memory.record_interaction(mem_text, response)
+      has_danmaku = bool(rag_queries) and bool(memory_input)
+
+      if has_danmaku:
+        task = asyncio.create_task(
+          self._memory.record_interaction(mem_text, response)
+        )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+      stance_task = asyncio.create_task(
+        self._memory.extract_stances(response, context=mem_text if has_danmaku else "")
       )
-      self._background_tasks.add(task)
-      task.add_done_callback(self._background_tasks.discard)
+      self._background_tasks.add(stance_task)
+      stance_task.add_done_callback(self._background_tasks.discard)
 
     return response
 
@@ -376,6 +418,7 @@ class LLMWrapper:
     topic_context: Optional[str] = None,
     images: Optional[list[str]] = None,
     memory_input: Optional[str] = None,
+    situation: Optional[str] = None,
   ) -> AsyncIterator[str]:
     """
     异步流式聊天，逐 token yield
@@ -390,13 +433,16 @@ class LLMWrapper:
       images: base64 JPEG 图片列表（VLM 多模态输入）
       memory_input: 用于记忆记录的清洗输入（VLM 模式下传入场景理解+弹幕摘要，
         替代原始 prompt；不传时使用 user_input）
+      situation: 情境标签（react_comment/react_scene/proactive），用于风格参考库检索
 
     Yields:
       模型输出的文本片段
     """
     normalized_input = self._normalize_untrusted_text(user_input)
     guarded_input = self._guard_user_input(user_input)
-    extra_context = self._build_extra_context(normalized_input, rag_queries, topic_context)
+    extra_context = await self._build_extra_context(
+      normalized_input, rag_queries, topic_context, situation,
+    )
     self._last_extra_context = extra_context
     full_response = ""
     completed = False
@@ -431,11 +477,22 @@ class LLMWrapper:
 
         if self._memory is not None:
           mem_text = self._normalize_untrusted_text(memory_input or user_input)
-          task = asyncio.create_task(
-            self._memory.record_interaction(mem_text, full_response)
+          has_danmaku = bool(rag_queries) and bool(memory_input)
+
+          if has_danmaku:
+            task = asyncio.create_task(
+              self._memory.record_interaction(mem_text, full_response)
+            )
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+          stance_task = asyncio.create_task(
+            self._memory.extract_stances(
+              full_response, context=mem_text if has_danmaku else "",
+            )
           )
-          self._background_tasks.add(task)
-          task.add_done_callback(self._background_tasks.discard)
+          self._background_tasks.add(stance_task)
+          stance_task.add_done_callback(self._background_tasks.discard)
 
   def chat_with_context(
     self,

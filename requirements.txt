@@ -16,4 +16,5 @@ coolname
 nicegui
 opencv-python
 requests
+aiohttp
 yt-dlp

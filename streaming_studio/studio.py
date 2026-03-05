@@ -5,14 +5,18 @@
 """
 
 import asyncio
+import base64
 import random
 import re
 import sys
 import uuid
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Callable, Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Optional, TYPE_CHECKING
+
+import cv2
+import numpy as np
 
 # 将项目根目录添加到路径
 project_root = Path(__file__).parent.parent
@@ -21,14 +25,50 @@ if str(project_root) not in sys.path:
 
 from langchain_wrapper import LLMWrapper, ModelType, ModelProvider
 from prompts import PromptLoader
-from .models import Comment, StreamerResponse, ResponseChunk
+from .models import Comment, StreamerResponse, ResponseChunk, EventType, GUARD_LEVEL_NAMES, EVENT_PRIORITY_ORDER
 from .database import CommentDatabase
 from .config import StudioConfig, ReplyDeciderConfig, CommentClustererConfig
 from .reply_decider import ReplyDecider, CommentClusterer, ClusterResult
+from .timer import PipelineTimer
+from .guard_roster import GuardRoster
 
 if TYPE_CHECKING:
   from video_source import VideoPlayer
 
+
+_STYLE_INSTRUCTIONS = {
+  "reaction": (
+    "[回复风格] 这一轮用极简短的反应回复——语气词、感叹词、笑声即可。"
+    "比如「哈哈哈哈哈」「哇噢」「草」「好耶」「ahahaha」「真的假的」。"
+    "不需要完整句子，甚至可以只是一串笑声。只输出一个表情标签+反应词。\n\n"
+  ),
+  "brief": "[回复风格] 这一轮简短回复，一句话即可，不需要展开。\n\n",
+  "normal": "",
+  "detailed": "[回复风格] 观众在认真讨论或提问，请展开回答，可以多说两句。\n\n",
+  "guard_thanks": (
+    "[回复风格] 有观众开通了舰长/提督/总督！这是最重要的事件。"
+    "请用最隆重、最真诚的方式感谢，一定要念出名字，表达激动和感动。"
+    "先感谢上舰，然后可以简短回应其他弹幕。\n\n"
+  ),
+  "style_bank": (
+    "[回复风格] 弱智吧时间！这一轮请**必须**参考下方【风格灵感】中的示例，"
+    "借鉴其中的脑洞、反转逻辑或荒诞推理方式，用你自己的语气和角色风格表达出来。"
+    "可以适当展开（2句话），确保有铺垫和反转的完整结构。字数限制本轮放宽到50字以内。\n\n"
+  ),
+}
+
+_ENGAGING_QUESTION_HINT = (
+  "[互动引导] 这一轮请在回复末尾自然地加一句引导式反问或提问，"
+  "引导观众参与讨论。例如「你们觉得呢？」「有没有人也这样？」"
+  "「大家会选哪个？」。反问要简短自然，不要生硬。\n\n"
+)
+
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _beijing_time_tag() -> str:
+  now = datetime.now(_BEIJING_TZ)
+  return f"[当前北京时间] {now.strftime('%Y-%m-%d %A %H:%M')}\n"
 
 _DANMAKU_INJECTION_PATTERNS = [
   re.compile(r"(?i)\bignore\b.{0,40}\b(instruction|rule|prompt)s?\b"),
@@ -38,6 +78,13 @@ _DANMAKU_INJECTION_PATTERNS = [
   re.compile(r"(?i)\b(do\s+anything\s+now|dan)\b"),
   re.compile(r"(?i)(系统提示|提示词|忽略之前|忽略以上|越狱|注入|管理员通知)"),
 ]
+
+_NOISE_DANMAKU_PATTERN = re.compile(
+  r"^(哈+|6+|[?？!！.。~～、，]+|草+|好家伙|啊+|呜+|嗯+|ww+|hhh+|lol+|emm+|"
+  r"nb|tql|xswl|yyds|awsl|dd|ddd+|[Oo0]+|233+|7777*|牛|强|绝|顶|冲|来了|"
+  r"[👍👏🔥❤️💯😂🤣😭😍]+)$",
+  re.IGNORECASE,
+)
 
 
 class StreamingStudio:
@@ -58,7 +105,7 @@ class StreamingStudio:
     model_name: Optional[str] = None,
     enable_memory: bool = False,
     enable_global_memory: bool = False,
-    enable_topic_manager: bool = False,
+    enable_topic_manager: bool = True,
     enable_reply_decider: bool = True,
     enable_comment_clusterer: bool = False,
     # VLM 视频源（传入后启用 VLM 模式：画面+弹幕 → 多模态 LLM）
@@ -125,13 +172,25 @@ class StreamingStudio:
       response_checker = None
       if persona.lower() == "naixiong":
         from emotion import EmotionMachine, AffectionBank
-        from meme import MemeManager as MemeManagerCls
         from validation import ResponseChecker
         emotion_machine = EmotionMachine()
         affection_bank = AffectionBank()
-        seed_memes = Path(__file__).resolve().parent.parent / "personas" / "naixiong" / "seed_memes.json"
-        meme_manager = MemeManagerCls(seed_path=seed_memes)
         response_checker = ResponseChecker()
+
+      # 梗管理器：任何角色只要有 seed_memes.json 即启用
+      persona_dir = Path(__file__).resolve().parent.parent / "personas" / persona
+      seed_memes_path = persona_dir / "seed_memes.json"
+      if seed_memes_path.exists():
+        from meme import MemeManager as MemeManagerCls
+        meme_manager = MemeManagerCls(seed_path=seed_memes_path)
+
+      # 风格参考库：角色有 style_bank/meta.json 即启用
+      style_bank = None
+      style_bank_meta = persona_dir / "style_bank" / "meta.json"
+      if style_bank_meta.exists():
+        from style_bank import StyleBank
+        shared_embeddings = memory_manager.embeddings if memory_manager else None
+        style_bank = StyleBank(persona_dir, embeddings=shared_embeddings)
 
       self.llm_wrapper = LLMWrapper(
         model_type=model_type,
@@ -142,6 +201,7 @@ class StreamingStudio:
         affection_bank=affection_bank,
         meme_manager=meme_manager,
         response_checker=response_checker,
+        style_bank=style_bank,
       )
 
     # 数据库：全局记忆关闭时使用内存数据库
@@ -163,6 +223,9 @@ class StreamingStudio:
     # 弹幕缓冲区（环形，保留足够历史）
     self._comment_buffer: deque[Comment] = deque(maxlen=self.config.buffer_maxlen)
 
+    # 弹幕密度跟踪（滑动窗口，保留最近 2 分钟的到达时间戳）
+    self._comment_timestamps: deque[datetime] = deque()
+
     # 新弹幕到达通知（延迟到 start() 创建，避免 Python 3.9 event loop 绑定问题）
     self._comment_arrived: Optional[asyncio.Event] = None
     self._pending_comment_count: int = 0
@@ -171,6 +234,14 @@ class StreamingStudio:
     self._last_reply_time: Optional[datetime] = None
     # 上次进入回复生成的起始时间（用于区分新旧弹幕）
     self._last_collect_time: Optional[datetime] = None
+
+    # 主动发言快捷等待：_check_proactive_speak 失败时记录距阈值的差值，
+    # 下一轮定时器用此值替代 random(min, max)，避免空轮后重新等完整周期
+    self._proactive_shortcut: Optional[float] = None
+    # 上一轮是否被跳过（无回复生成），用于 TTS 路径缩短等待
+    self._last_round_skipped: bool = False
+    # 上一轮弹幕收集是否为空，用于"首条弹幕唤醒"判断
+    self._was_silent: bool = True
 
     # 最近一次发给模型的完整 prompt（供调试监控）
     self._last_prompt: Optional[str] = None
@@ -191,13 +262,18 @@ class StreamingStudio:
     # 停止回调（主循环结束时通知外部，如视频播完自动停止）
     self._stop_callbacks: list[Callable] = []
 
+    # 语音完播门控（由 SpeechBroadcaster 注入，回复后等待语音播完再进下一轮）
+    self._speech_gate: Optional[Callable[..., Awaitable[None]]] = None
+
     # 话题管理器
     self._topic_manager = None
     if enable_topic_manager:
       from topic_manager import TopicManager
+      topic_model = ModelProvider.remote_small(provider=model_type)
       self._topic_manager = TopicManager(
         persona=persona,
         database=self.database,
+        model=topic_model,
       )
 
     # 回复决策器
@@ -244,11 +320,18 @@ class StreamingStudio:
     # 最近一次聚类结果（供 debug_state 和 prompt 格式化使用）
     self._last_cluster_result: Optional[ClusterResult] = None
 
+    # 已回复特殊事件 ID（防止礼物/SC/上舰等事件被反复提升导致循环感谢）
+    self._responded_event_ids: set[str] = set()
+
     # Prompt 模板
     _loader = PromptLoader()
     self._comment_headers = _loader.load_headers("studio/comment_headers.txt")
     self._interaction_instruction = _loader.load("studio/interaction_instruction.txt")
     self._silence_notice = _loader.load("studio/silence_notice.txt")
+    self._guard_thanks_reference = _loader.load_optional("studio/guard_thanks_reference.txt") or ""
+
+    # 会员名册（舰长/提督/总督）
+    self._guard_roster = GuardRoster()
 
     # 上次已使用的动态等待时间（避免同一个建议重复使用）
     self._last_used_timing: Optional[tuple[float, float]] = None
@@ -256,9 +339,10 @@ class StreamingStudio:
     # VLM 视频源
     self._video_player = video_player
     self._current_frame_b64: Optional[str] = None
+    self._current_frame_is_blank: bool = True
 
-    # 上一次场景描述（用于主动发言时检测画面变化）
-    self._prev_scene_description: Optional[str] = None
+    # 管线阶段计时器
+    self._timer = PipelineTimer()
 
     # 直播开始时间（用于计算已开播时长）
     self._stream_start_time: Optional[datetime] = None
@@ -268,12 +352,53 @@ class StreamingStudio:
 
     # 运行状态
     self._running = False
+    self._paused = False
     self._main_task: Optional[asyncio.Task] = None
 
   @property
   def is_running(self) -> bool:
     """是否正在运行"""
     return self._running
+
+  @property
+  def is_paused(self) -> bool:
+    """是否处于暂停状态（会话和子系统仍存活，可用 resume 恢复）"""
+    return self._paused
+
+  @staticmethod
+  def _is_blank_frame(b64_jpeg: str) -> bool:
+    """
+    检测 base64 JPEG 帧是否为黑屏/纯色（无有效画面内容）
+
+    判定条件：灰度均值 < 15 且标准差 < 10
+    """
+    try:
+      raw = base64.b64decode(b64_jpeg)
+      arr = np.frombuffer(raw, dtype=np.uint8)
+      img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
+      if img is None:
+        return True
+      mean_val = float(np.mean(img))
+      std_val = float(np.std(img))
+      return mean_val < 15 and std_val < 10
+    except Exception:
+      return True
+
+  @property
+  def _in_conversation_mode(self) -> bool:
+    """
+    是否处于对话聚焦模式（无有效画面时自动启用）
+
+    触发条件：无 video_player / 视频已播完 / 当前帧为黑屏
+    黑屏检测结果在 _on_video_frame 中缓存，此处零开销读取。
+    """
+    if self._video_player is None:
+      return True
+    if self._video_player.is_finished:
+      return True
+    if not self._current_frame_b64:
+      return True
+    return self._current_frame_is_blank
 
   def send_comment(self, comment: Comment) -> None:
     """
@@ -285,12 +410,35 @@ class StreamingStudio:
     self.database.save_comment(comment)
     self._comment_buffer.append(comment)
     self._pending_comment_count += 1
+    self._comment_timestamps.append(datetime.now())
     if self._comment_arrived is not None:
       self._comment_arrived.set()
+
+    # 上舰事件 → 更新会员名册
+    if comment.event_type == EventType.GUARD_BUY:
+      self._guard_roster.add_or_extend(
+        uid=comment.user_id,
+        nickname=comment.nickname,
+        guard_level=comment.guard_level,
+        num_months=max(1, comment.gift_num),
+      )
 
     # 转发给话题管理器（非阻塞）
     if self._topic_manager:
       self._topic_manager.on_comment(comment)
+
+  def _get_comment_rate(self, window_seconds: float = 120.0) -> float:
+    """
+    计算最近 window_seconds 内的弹幕到达速率（条/分钟）
+
+    清理过期时间戳以保持窗口大小。
+    """
+    now = datetime.now()
+    while self._comment_timestamps and \
+        (now - self._comment_timestamps[0]).total_seconds() > window_seconds:
+      self._comment_timestamps.popleft()
+    count = len(self._comment_timestamps)
+    return count / (window_seconds / 60.0)
 
   def _on_video_danmaku(self, danmaku) -> None:
     """视频弹幕到达回调：将视频中的弹幕转为 Comment 注入缓冲区"""
@@ -301,9 +449,14 @@ class StreamingStudio:
     )
     self.send_comment(comment)
 
+  def _on_remote_comment(self, comment: Comment) -> None:
+    """远程数据源事件到达回调：Comment 已含事件类型元数据，直接注入"""
+    self.send_comment(comment)
+
   def _on_video_frame(self, frame) -> None:
-    """视频新帧回调：缓存最新帧的 base64 数据"""
+    """视频新帧回调：缓存最新帧的 base64 数据和黑屏检测结果"""
     self._current_frame_b64 = frame.base64_jpeg
+    self._current_frame_is_blank = self._is_blank_frame(frame.base64_jpeg)
 
   async def get_response(self, timeout: Optional[float] = None) -> Optional[StreamerResponse]:
     """
@@ -373,6 +526,10 @@ class StreamingStudio:
     """
     self._pre_response_callbacks.append(callback)
 
+  def set_speech_gate(self, gate: Callable[..., Awaitable[None]]) -> None:
+    """注入语音完播门控，主循环回复后 await gate() 再进下一轮"""
+    self._speech_gate = gate
+
   def on_stop(self, callback: Callable) -> None:
     """注册停止回调（主循环自然结束时触发，如视频播完）"""
     self._stop_callbacks.append(callback)
@@ -413,18 +570,21 @@ class StreamingStudio:
 
     # 启动视频播放器（VLM 模式）
     if self._video_player:
-      self._video_player.on_danmaku(self._on_video_danmaku)
+      # 远程数据源优先使用富事件回调（Comment 含事件类型元数据）
+      if hasattr(self._video_player, "on_comment"):
+        self._video_player.on_comment(self._on_remote_comment)
+      else:
+        self._video_player.on_danmaku(self._on_video_danmaku)
       self._video_player.on_frame(self._on_video_frame)
       await self._video_player.start()
 
     self._main_task = asyncio.create_task(self._main_loop())
 
-  async def stop(self) -> None:
-    """停止直播间"""
-    self._running = False
-    self._stream_start_time = None
+  async def pause(self) -> None:
+    """暂停直播间（保留会话、记忆、话题管理器等子系统，可用 resume 恢复）"""
+    if not self._running:
+      return
 
-    # 先取消主循环，确保不会在 LLM 调用中阻塞
     if self._main_task:
       self._main_task.cancel()
       try:
@@ -433,21 +593,60 @@ class StreamingStudio:
         pass
       self._main_task = None
 
+    if self._video_player:
+      self._video_player.pause()
+
+    self._running = False
+    self._paused = True
+
+  async def resume(self) -> None:
+    """从暂停处恢复直播间"""
+    if self._running or not self._paused:
+      return
+
+    if self._video_player:
+      self._video_player.resume()
+
+    self._running = True
+    self._paused = False
+    self._comment_arrived = asyncio.Event()
+    self._pending_comment_count = 0
+    self._main_task = asyncio.create_task(self._main_loop())
+
+  async def stop(self) -> None:
+    """停止直播间（完全销毁会话和子系统，不可恢复）"""
+    self._running = False
+    self._paused = False
+    self._stream_start_time = None
+
+    # 先取消主循环
+    if self._main_task:
+      self._main_task.cancel()
+      try:
+        await asyncio.wait({self._main_task}, timeout=5.0)
+      except asyncio.CancelledError:
+        pass
+      self._main_task = None
+
     # 停止视频播放器
     if self._video_player:
-      await self._video_player.stop()
+      try:
+        await asyncio.wait_for(self._video_player.stop(), timeout=3.0)
+      except (asyncio.TimeoutError, Exception):
+        pass
 
     # 结束会话记录
     if self._session_id:
       self.database.end_session(self._session_id)
       self._session_id = None
 
-    # 停止话题管理器
+    # 并行停止话题管理器和记忆系统（各自内部已有超时保护）
+    subsystem_tasks = []
     if self._topic_manager:
-      await self._topic_manager.stop()
-
-    # 停止记忆定时任务
-    await self.llm_wrapper.stop_memory()
+      subsystem_tasks.append(asyncio.create_task(self._topic_manager.stop()))
+    subsystem_tasks.append(asyncio.create_task(self.llm_wrapper.stop_memory()))
+    if subsystem_tasks:
+      await asyncio.wait(subsystem_tasks, timeout=5.0)
 
     # 取消并等待后台任务（超时 3 秒避免挂起）
     for task in self._background_tasks:
@@ -466,52 +665,89 @@ class StreamingStudio:
     """
     while self._running:
       try:
-        # 动态等待时间（话题管理器建议 > 默认值，同一个建议只用一次）
-        timing = self._topic_manager.suggested_timing if self._topic_manager else None
-        if timing and timing != self._last_used_timing:
-          self._last_used_timing = timing
-          min_t, max_t = timing
-          if min_t > 0 and max_t >= min_t:
-            remaining = random.uniform(min_t, max_t)
+        self._timer.start_round()
+
+        # ── 等待上一轮 TTS 完播 / 定时器等待 ──
+        if self._speech_gate:
+          # 有 TTS：播放时间已足够间隔，完播后直接进入下一轮
+          self._timer.mark("等待TTS完播")
+          await self._speech_gate()
+          self._timer.mark("定时器等待")
+          # TTS 期间已积累足够弹幕 → 只做最小 yield 即可处理
+          if self._pending_comment_count >= self.config.tts_skip_timer_threshold:
+            await asyncio.sleep(0)
           else:
-            remaining = random.uniform(self.min_interval, self.max_interval)
-        else:
-          remaining = random.uniform(self.min_interval, self.max_interval)
-
-        while remaining > 0:
-          try:
-            await asyncio.wait_for(
-              self._comment_arrived.wait(),
-              timeout=remaining,
-            )
-            # 有新弹幕到达，先读计数再清除事件
-            count = self._pending_comment_count
-            self._pending_comment_count = 0
+            # 上轮被跳过（无回复、无 TTS 需播放）→ 缩短等待
+            wait_timeout = 0.2 if self._last_round_skipped else 2.0
             self._comment_arrived.clear()
-            remaining = max(0.0, remaining - count * self.config.comment_wait_reduction)
-          except asyncio.TimeoutError:
-            # 自然超时
-            break
+            try:
+              await asyncio.wait_for(
+                self._comment_arrived.wait(),
+                timeout=wait_timeout,
+              )
+            except asyncio.TimeoutError:
+              pass
+          self._pending_comment_count = 0
+          self._comment_arrived.clear()
+        else:
+          # 无 TTS：用定时器控制回复节奏
+          self._timer.mark("定时器等待")
+          # 主动发言快捷路径：空轮后按需等待，而非重跑完整定时器
+          if self._proactive_shortcut is not None:
+            remaining = self._proactive_shortcut
+            self._proactive_shortcut = None
+          else:
+            timing = self._topic_manager.suggested_timing if self._topic_manager else None
+            if timing and timing != self._last_used_timing:
+              self._last_used_timing = timing
+              min_t, max_t = timing
+              if min_t > 0 and max_t >= min_t:
+                remaining = random.uniform(min_t, max_t)
+              else:
+                remaining = random.uniform(self.min_interval, self.max_interval)
+            else:
+              remaining = random.uniform(self.min_interval, self.max_interval)
 
+          while remaining > 0:
+            try:
+              await asyncio.wait_for(
+                self._comment_arrived.wait(),
+                timeout=remaining,
+              )
+              count = self._pending_comment_count
+              self._pending_comment_count = 0
+              self._comment_arrived.clear()
+              # 首条弹幕唤醒：无弹幕状态下首条弹幕到达时立即进入收集
+              if self._was_silent:
+                break
+              remaining = max(0.0, remaining - count * self.config.comment_wait_reduction)
+            except asyncio.TimeoutError:
+              break
+
+        self._timer.mark("弹幕收集")
         old_comments, new_comments = self._collect_comments()
 
-        # VLM 模式下视频播完且无新弹幕（含优先弹幕）时停止
+        # 视频播完处理：对话模式下继续运行，否则停止
         if self._video_player and self._video_player.is_finished:
           has_priority = any(c.priority for c in old_comments)
           if not new_comments and not has_priority:
-            print("视频播放完毕，直播间停止")
-            for cb in self._stop_callbacks:
-              try:
-                cb()
-              except Exception as e:
-                print(f"停止回调错误: {e}")
-            break
+            if not self._in_conversation_mode:
+              print("视频播放完毕，直播间停止")
+              for cb in self._stop_callbacks:
+                try:
+                  cb()
+                except Exception as e:
+                  print(f"停止回调错误: {e}")
+              break
 
         if not old_comments and not new_comments:
           # 无弹幕 → 检查是否应主动发言（VLM 模式下场景变化触发）
           if await self._check_proactive_speak():
             old_comments, new_comments = [], []
           else:
+            self._last_round_skipped = True
+            self._was_silent = True
+            self._timer.finish(skipped=True)
             continue
 
         # 弹幕聚类
@@ -519,18 +755,29 @@ class StreamingStudio:
         if self._comment_clusterer and new_comments:
           self._last_cluster_result = self._comment_clusterer.cluster(new_comments)
 
-        # 回复决策器：判断是否值得回复
+        # 回复决策器：判断是否值得回复 + 回复风格
+        self._timer.mark("回复决策")
+        response_style = "normal"
+        # 主动发言（无弹幕）限制 1 句，画面变化快时保证 TTS 时效性
+        sentences = 1 if (not old_comments and not new_comments) else 0
         if self._reply_decider and (old_comments or new_comments):
           all_texts = [c.content for c in (old_comments + new_comments)][:3]
+          comment_rate = self._get_comment_rate()
           decision = await self._reply_decider.should_reply(
             old_comments, new_comments,
             last_reply_time=self._last_reply_time,
+            comment_rate=comment_rate,
           )
           preview = " | ".join(all_texts)
           if not decision.should_reply:
             print(f"[决策器] 跳过({decision.phase}): {decision.reason} ← {preview[:40]}")
+            self._last_round_skipped = True
+            timings = self._timer.finish(skipped=True)
+            print(timings.format_summary())
             continue
-          print(f"[决策器] 回复({decision.phase},u={decision.urgency:.0f}): {decision.reason} ← {preview[:40]}")
+          response_style = decision.response_style
+          sentences = decision.sentences
+          print(f"[决策器] 回复({decision.phase},u={decision.urgency:.0f},s={response_style},n={sentences}): {decision.reason} ← {preview[:40]}")
 
         # 触发生成回复前回调
         for cb in self._pre_response_callbacks:
@@ -554,20 +801,17 @@ class StreamingStudio:
         if self.enable_streaming:
           response = await self._generate_response_streaming(
             old_comments, new_comments, images=images,
+            response_style=response_style, sentences=sentences,
           )
         else:
           response = await self._generate_response(
             old_comments, new_comments, images=images,
+            response_style=response_style, sentences=sentences,
           )
 
         if response:
           self.database.save_response(response)
           await self._response_queue.put(response)
-
-          # 缓存场景描述，用于主动发言的场景变化检测
-          scene = self.llm_wrapper.last_scene_understanding
-          if scene:
-            self._prev_scene_description = scene
 
           for callback in self._response_callbacks:
             try:
@@ -577,6 +821,15 @@ class StreamingStudio:
 
           self._last_collect_time = reply_started_at
           self._last_reply_time = datetime.now()
+          self._last_round_skipped = False
+          self._was_silent = not (old_comments or new_comments)
+
+          # 标记本轮回复中包含的特殊事件，防止下一轮被重复提升
+          for c in (old_comments + new_comments):
+            if c.event_type != EventType.DANMAKU or c.priority:
+              self._responded_event_ids.add(c.id)
+          if len(self._responded_event_ids) > 500:
+            self._responded_event_ids = set(list(self._responded_event_ids)[-200:])
 
           # 奶凶系统：好感度更新
           self._update_affection_from_comments(new_comments, response.content)
@@ -594,6 +847,17 @@ class StreamingStudio:
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
 
+            # 独白追踪（与 post_reply 的衰减/分析逻辑完全独立）
+            if all_comments and self._topic_manager.is_in_monologue():
+              self._topic_manager.exit_monologue()
+            elif not all_comments and self._topic_manager.is_in_monologue():
+              if not self._topic_manager.record_monologue_turn(response.content):
+                self._topic_manager.exit_monologue()
+
+        # 本轮耗时统计
+        timings = self._timer.finish()
+        print(timings.format_summary())
+
       except asyncio.CancelledError:
         break
       except Exception as e:
@@ -604,10 +868,19 @@ class StreamingStudio:
     """
     检查是否应主动发言
 
-    两条路径：
-    1. VLM 路径：基于画面变化 + 沉默超阈值触发（需要 video_player + reply_decider）
-    2. 话题路径：基于话题管理器建议触发（无需视频，需要 topic_manager）
+    五条路径（按优先级）：
+    -1. 独白延续：已在独白中则直接继续（不重新选话题）
+    0. 对话模式路径：无画面时沉默超阈值即触发（门槛更低）
+    1. 话题路径：基于话题管理器建议触发（需要 topic_manager）
+    2. 奶凶情绪路径
+    3. 兜底路径：话题资源耗尽后长沉默仍主动发言
     """
+    # 独白延续：已在独白中则直接继续，跳过话题选择
+    if self._topic_manager and self._topic_manager.is_in_monologue():
+      r = self._topic_manager.monologue_round
+      print(f"[独白模式] 继续 (第{r + 1}轮)")
+      return True
+
     silence = 0.0
     if self._last_reply_time:
       silence = (datetime.now() - self._last_reply_time).total_seconds()
@@ -618,32 +891,38 @@ class StreamingStudio:
     min_silence = 10.0
     if self._reply_decider:
       min_silence = self._reply_decider.config.proactive_silence_threshold
-    if silence < min_silence:
+
+    # 路径 0: 对话模式（无有效画面时门槛降低 40%，不依赖场景变化）
+    if self._in_conversation_mode:
+      conversation_threshold = min_silence * 0.6
+      if silence >= conversation_threshold:
+        # 优先尝试话题推进
+        if self._topic_manager:
+          topic = self._topic_manager.suggest_proactive_topic(silence)
+          if topic is not None:
+            self._topic_manager.enter_monologue(topic)
+            print(f"[对话模式] 开始独白: 「{topic.title}」 (沉默 {int(silence)}秒)")
+            return True
+        # 无话题可推时也直接触发主动发言，让 LLM 自由发挥
+        print(f"[对话模式] 主动发言: 沉默 {int(silence)}秒")
+        return True
+      # 未达阈值 → 记录距阈值的差值，下轮按需等待
+      self._proactive_shortcut = conversation_threshold - silence + 0.5
       return False
 
-    # 路径 1: VLM 模式（画面变化触发）
-    if self._reply_decider and self._video_player and self._current_frame_b64:
-      images = [self._current_frame_b64]
-      timestamp = self._get_stream_timestamp()
-      current_scene = await self.llm_wrapper.ascene_understand(
-        f"[当前画面] {timestamp}", images,
-      )
-      if current_scene:
-        decision = await self._reply_decider.should_proactive_speak(
-          self._prev_scene_description, current_scene, silence,
-        )
-        if decision.should_reply:
-          print(f"[决策器] 主动发言: {decision.reason}")
-          return True
+    if silence < min_silence:
+      self._proactive_shortcut = min_silence - silence + 0.5
+      return False
 
-    # 路径 2: 话题推进（无需 VLM，需要话题管理器）
+    # 路径 1: 话题推进（需要话题管理器）
     if self._topic_manager:
       topic = self._topic_manager.suggest_proactive_topic(silence)
       if topic is not None:
-        print(f"[话题管理器] 主动推进话题: 「{topic.title}」 (沉默 {int(silence)}秒)")
+        self._topic_manager.enter_monologue(topic)
+        print(f"[话题管理器] 开始独白: 「{topic.title}」 (沉默 {int(silence)}秒)")
         return True
 
-    # 路径 3: 奶凶角色情绪跟进 — 长沉默触发真情流露或赌气
+    # 路径 2: 奶凶角色情绪跟进 — 长沉默触发真情流露或赌气
     emotion = self.llm_wrapper._emotion
     if emotion is not None and silence > min_silence * 2:
       from emotion.state import Mood
@@ -652,6 +931,13 @@ class StreamingStudio:
         print(f"[奶凶] 主动发言(真情流露): 沉默 {int(silence)}秒")
         return True
 
+    # 路径 3: 兜底 — 话题资源耗尽后长沉默仍应主动发言
+    fallback_threshold = min_silence * self.config.proactive_fallback_silence_multiplier
+    if silence >= fallback_threshold:
+      print(f"[兜底] 主动发言: 沉默 {int(silence)}秒，话题资源已耗尽")
+      return True
+
+    self._proactive_shortcut = fallback_threshold - silence + 0.5
     return False
 
   def _detect_emotion_from_comments(self, comments: list[Comment]) -> None:
@@ -712,10 +998,17 @@ class StreamingStudio:
     old = [c for c in recent if c.timestamp < self._last_collect_time]
     new = [c for c in recent if c.timestamp >= self._last_collect_time]
 
-    # 优先弹幕：无论时间戳如何，始终归入新弹幕
-    promoted = [c for c in old if c.priority]
+    # 优先弹幕 + 未回复的特殊事件：无论时间戳如何，始终归入新弹幕
+    # 防止礼物/入场等事件在回复生成期间到达后卡在 old 里不被处理
+    # 已回复的事件不再提升，避免循环感谢
+    def _should_promote(c: Comment) -> bool:
+      if c.id in self._responded_event_ids:
+        return False
+      return c.priority or c.event_type != EventType.DANMAKU
+
+    promoted = [c for c in old if _should_promote(c)]
     if promoted:
-      old = [c for c in old if not c.priority]
+      old = [c for c in old if not _should_promote(c)]
 
     # 无新弹幕也无优先弹幕 → 返回空，让主循环的沉默逻辑处理
     total_new = len(new) + len(promoted)
@@ -835,18 +1128,20 @@ class StreamingStudio:
     return text
 
   @staticmethod
-  def _format_comment(comment: Comment, now: datetime) -> str:
+  def _is_noise_danmaku(text: str) -> bool:
+    """检测弹幕是否为纯反应词/无语义噪声（不适合作为 RAG query）"""
+    return bool(_NOISE_DANMAKU_PATTERN.match(text.strip()))
+
+  def _format_comment(self, comment: Comment, now: datetime) -> str:
     """
-    格式化单条弹幕
+    格式化单条弹幕/事件
 
-    格式: [14:23:05 / 35秒前] 花凛 (id: user_abc): 主播唱首歌
-
-    Args:
-      comment: 弹幕对象
-      now: 当前时间（用于计算相对时间）
-
-    Returns:
-      格式化后的字符串
+    普通弹幕: [14:23:05 / 35秒前] 花凛 (id: user_abc): 主播唱首歌
+    会员弹幕: [14:23:05 / 35秒前] [舰长] 花凛 (id: user_abc): 主播唱首歌
+    上舰事件: [上舰] 花凛 开通了提督！
+    SC 事件:  [SC ¥100] 花凛: 主播加油
+    礼物事件: [礼物] 花凛 赠送了 人气票 x7
+    入场事件: [进入直播间] 花凛
     """
     time_str = comment.timestamp.strftime("%H:%M:%S")
     delta = now - comment.timestamp
@@ -863,8 +1158,28 @@ class StreamingStudio:
       minutes = (total_seconds % 3600) // 60
       relative = f"{hours}小时{minutes}分前"
 
+    time_prefix = f"[{time_str} / {relative}]"
+
+    if comment.event_type == EventType.GUARD_BUY:
+      level = GUARD_LEVEL_NAMES.get(comment.guard_level, "舰长")
+      return f"[上舰] {comment.nickname} 开通了{level}！"
+
+    if comment.event_type == EventType.SUPER_CHAT:
+      safe_content = StreamingStudio._sanitize_comment_for_prompt(comment.content)
+      return f"[SC ¥{comment.price:.0f}] {time_prefix} {comment.nickname}: {safe_content}"
+
+    if comment.event_type == EventType.GIFT:
+      return f"[礼物] {comment.nickname} 赠送了 {comment.gift_name} x{comment.gift_num}"
+
+    if comment.event_type == EventType.ENTRY:
+      return f"[进入直播间] {comment.nickname}"
+
+    # 普通弹幕：查询会员身份，有则加徽章
     safe_content = StreamingStudio._sanitize_comment_for_prompt(comment.content)
-    return f"[{time_str} / {relative}] {comment.nickname} (id: {comment.user_id}): {safe_content}"
+    badge = self._guard_roster.get_level_name(comment.user_id)
+    if badge:
+      return f"{time_prefix} [{badge}] {comment.nickname} (id: {comment.user_id}): {safe_content}"
+    return f"{time_prefix} {comment.nickname} (id: {comment.user_id}): {safe_content}"
 
   def _format_comments_for_prompt(
     self,
@@ -920,9 +1235,13 @@ class StreamingStudio:
       # 非聚类弹幕，正常显示
       base = self._format_comment(c, now)
       tags = []
+      if c.event_type == EventType.GUARD_BUY:
+        tags.append("隆重感谢")
+      elif c.event_type == EventType.SUPER_CHAT:
+        tags.append("优先回复")
       if annotations and c.id in annotations:
         tags.append(f"话题: {annotations[c.id]}")
-      if interaction_targets and c.id in interaction_targets:
+      if interaction_targets and c.id in interaction_targets and not c.is_paid_event:
         tags.append("优先回复")
       if tags:
         prefix = "[" + " | ".join(tags) + "] "
@@ -933,13 +1252,14 @@ class StreamingStudio:
 
     if old_comments:
       lines = [fmt(c) for c in old_comments]
-      lines = [l for l in lines if l]  # 过滤聚类跳过的空行
+      lines = [l for l in lines if l]
       if lines:
         parts.append(self._comment_headers["old_comments"] + "\n" + "\n".join(lines))
 
     if new_comments:
-      lines = [fmt(c) for c in new_comments]
-      lines = [l for l in lines if l]  # 过滤聚类跳过的空行
+      sorted_new = sorted(new_comments, key=lambda c: EVENT_PRIORITY_ORDER.get(c.event_type, 3))
+      lines = [fmt(c) for c in sorted_new]
+      lines = [l for l in lines if l]
       header = self._comment_headers["new_comments"]
       if interaction_targets:
         header += "\n" + self._interaction_instruction
@@ -982,83 +1302,80 @@ class StreamingStudio:
 
     return f"当前时间 {clock}"
 
-  async def _scene_understand(
-    self,
-    prompt: str,
-    images: list[str],
+  def _build_style_hint(self, response_style: str, sentences: int) -> str:
+    """组装风格指令 + 句数提示 + 上舰感谢参考（如适用）"""
+    hint = _STYLE_INSTRUCTIONS.get(response_style, "")
+    if sentences > 0:
+      count_hint = f"[本轮句数] 回复{sentences}句话。"
+      hint = f"{count_hint}\n{hint}" if hint else f"{count_hint}\n\n"
+    if response_style == "guard_thanks" and self._guard_thanks_reference:
+      hint = hint + f"[上舰感谢参考]\n{self._guard_thanks_reference}\n\n"
+    if (
+      response_style not in ("reaction", "guard_thanks")
+      and random.random() < self.config.engaging_question_probability
+    ):
+      hint = _ENGAGING_QUESTION_HINT + hint
+    return hint
+
+  @staticmethod
+  def _infer_situation(
+    new_comments: list[Comment],
+    reply_images: Optional[list[str]],
   ) -> str:
-    """
-    VLM 两趟调用 — 第一趟：场景理解
-
-    发送画面+弹幕给模型，获取客观场景描述，
-    用于后续记忆检索和丰富第二趟 prompt。
-
-    Args:
-      prompt: 格式化后的弹幕文本
-      images: base64 JPEG 图片列表
-
-    Returns:
-      场景描述文本（失败时返回空字符串）
-    """
-    timestamp = self._get_stream_timestamp()
-    danmaku_with_hint = (
-      f"[当前画面] {timestamp}\n\n"
-      f"{prompt}"
-    )
-    return await self.llm_wrapper.ascene_understand(danmaku_with_hint, images)
+    """根据当前轮次的弹幕和画面推断情境标签，供 StyleBank 过滤检索"""
+    if new_comments:
+      return "react_comment"
+    if reply_images:
+      return "react_scene"
+    return "proactive"
 
   @staticmethod
   def _build_memory_input(
-    scene_description: str,
     comments: list[Comment],
     max_danmaku: int = 5,
   ) -> str:
     """
     构造干净的记忆输入文本（替代原始格式化 prompt）
 
-    将场景理解 + 关键弹幕摘要合并为一段简洁的自然语言，
-    方便小 LLM 生成高质量的第一人称记忆。
+    将关键弹幕摘要合并为带昵称的自然语言，
+    方便小 LLM 生成包含用户身份信息的第一人称记忆。
 
     Args:
-      scene_description: 第一趟 VLM 输出的场景描述
       comments: 本轮的全部弹幕
       max_danmaku: 最多保留几条弹幕内容
 
     Returns:
-      干净的记忆输入文本
+      带昵称的记忆输入文本
     """
     parts = []
-    if scene_description:
-      parts.append(f"画面内容：{scene_description}")
-
-    danmaku_contents = [
-      StreamingStudio._sanitize_comment_for_prompt(c.content)
-      for c in comments
-      if c.content.strip()
-    ]
-    if danmaku_contents:
-      sampled = danmaku_contents[-max_danmaku:]
-      parts.append(f"观众弹幕：{'、'.join(sampled)}")
-
-    return "\n".join(parts) if parts else ""
+    for c in comments[-max_danmaku:]:
+      if c.content.strip():
+        sanitized = StreamingStudio._sanitize_comment_for_prompt(c.content)
+        parts.append(f"观众「{c.nickname}」说：{sanitized}")
+    if parts:
+      return "；".join(parts)
+    return ""
 
   async def _generate_response(
     self,
     old_comments: list[Comment],
     new_comments: list[Comment],
     images: Optional[list[str]] = None,
+    response_style: str = "normal",
+    sentences: int = 0,
   ) -> Optional[StreamerResponse]:
     """
     根据弹幕（和视频帧）生成回复
 
-    VLM 模式下采用两趟调用：
-      第一趟：场景理解（画面+弹幕 → 客观描述）
-      第二趟：用场景描述搜索记忆，再结合原始输入生成完整回复
+    单次 VLM 调用：图片直传模型，弹幕文本做 RAG 检索记忆，
+    模型一次性结合画面+弹幕+记忆生成回复。
 
     Args:
       old_comments: 上次回复前的弹幕（背景参考）
       new_comments: 上次回复后的新弹幕
       images: base64 JPEG 图片列表（VLM 模式下的视频帧）
+      response_style: 回复风格 (reaction/brief/normal/detailed)
+      sentences: 建议句数（0 = 无建议）
 
     Returns:
       回复对象
@@ -1077,43 +1394,87 @@ class StreamingStudio:
       cluster_result=self._last_cluster_result,
     )
 
-    # VLM 两趟调用
-    scene_description = ""
-    rag_queries = None
-    memory_input = None
-    if images and self._current_frame_b64:
-      scene_description = await self._scene_understand(prompt, images)
+    # 对话模式检测：黑屏/无视频时跳过 VLM，聚焦弹幕互动
+    conversation_mode = self._in_conversation_mode
+    effective_images = None if conversation_mode else images
 
-      rag_queries = [scene_description] if scene_description else None
+    # 弹幕优先模式：有新弹幕时跳过画面，专注弹幕互动
+    comment_priority = (
+      self.config.comment_priority_mode
+      and not conversation_mode
+      and bool(new_comments)
+    )
+    if comment_priority:
+      effective_images = None
 
+    # 注入实时北京时间 + 模式/画面前缀
+    reply_images = None
+    time_tag = _beijing_time_tag()
+    if effective_images and self._current_frame_b64:
       timestamp = self._get_stream_timestamp()
-      vlm_hint = (
+      prompt = (
+        f"{time_tag}"
         f"[当前画面] 以下附带了直播画面截图（{timestamp}）。\n"
-        f"[场景理解] {scene_description}\n"
-        f"请结合画面内容、场景理解和弹幕进行回应。\n\n"
-      )
-      prompt = vlm_hint + prompt
+        f"请结合画面内容和弹幕进行回应。\n\n"
+      ) + prompt
+      reply_images = effective_images
+    elif comment_priority:
+      prompt = (
+        f"{time_tag}"
+        "[弹幕互动] 当前有观众发弹幕，请专注回复弹幕内容。\n\n"
+      ) + prompt
+    elif conversation_mode:
+      prompt = (
+        f"{time_tag}"
+        "[当前模式] 纯对话模式，没有直播画面。"
+        "请专注于和观众的弹幕互动。"
+        "如果没有弹幕，请主动找话题和观众聊天。\n\n"
+      ) + prompt
+    else:
+      prompt = f"{time_tag}\n" + prompt
 
-      memory_input = self._build_memory_input(
-        scene_description, old_comments + new_comments,
-      )
+    all_comments = old_comments + new_comments
+    meaningful = [
+      c for c in all_comments
+      if c.content.strip() and len(c.content.strip()) > 2
+      and not self._is_noise_danmaku(c.content)
+    ]
+    if meaningful:
+      parts = [f"{c.nickname}：{c.content}" for c in meaningful[-5:]]
+      rag_queries = [" ".join(parts)]
+    else:
+      rag_queries = []
+    memory_input = self._build_memory_input(all_comments)
 
-    if rag_queries is None:
-      all_comments = old_comments + new_comments
-      rag_queries = [c.content for c in all_comments if c.content.strip()]
+    # 弱智吧时间：pre-roll 触发判定，触发时覆盖风格和句数
+    style_bank_active = self.llm_wrapper.roll_style_bank()
+    if style_bank_active and response_style not in ("guard_thanks",):
+      response_style = "style_bank"
+      sentences = 2
+
+    style_hint = self._build_style_hint(response_style, sentences)
+    if sentences > 0:
+      prompt = prompt + f"\n\n[本轮句数] 回复{sentences}句话。"
+    if style_hint:
+      prompt = style_hint + prompt
 
     self._last_prompt = prompt
 
+    situation = self._infer_situation(new_comments, reply_images)
+
+    self._timer.mark("LLM生成")
     try:
       content = await self.llm_wrapper.achat(
         prompt, save_history=False,
         rag_queries=rag_queries, topic_context=topic_context,
-        images=images, memory_input=memory_input,
+        images=reply_images, memory_input=memory_input,
+        situation=situation,
       )
     except Exception as e:
       print(f"LLM 调用错误: {e}")
       return None
 
+    self._timer.mark("后处理")
     reply_ids = tuple(c.id for c in new_comments)
     return self._build_response(content, reply_ids)
 
@@ -1122,18 +1483,21 @@ class StreamingStudio:
     old_comments: list[Comment],
     new_comments: list[Comment],
     images: Optional[list[str]] = None,
+    response_style: str = "normal",
+    sentences: int = 0,
   ) -> Optional[StreamerResponse]:
     """
     流式生成回复，逐 token 分发 ResponseChunk
 
-    VLM 模式下采用两趟调用：
-      第一趟：场景理解（画面+弹幕 → 客观描述，非流式）
-      第二趟：用场景描述搜索记忆，再结合原始输入流式生成完整回复
+    单次 VLM 调用：图片直传模型，弹幕文本做 RAG 检索记忆，
+    模型一次性结合画面+弹幕+记忆流式生成回复。
 
     Args:
       old_comments: 上次回复前的弹幕（背景参考）
       new_comments: 上次回复后的新弹幕
       images: base64 JPEG 图片列表（VLM 模式下的视频帧）
+      response_style: 回复风格 (reaction/brief/normal/detailed)
+      sentences: 建议句数（0 = 无建议）
 
     Returns:
       完整回复对象（流结束后组装）
@@ -1152,43 +1516,90 @@ class StreamingStudio:
       cluster_result=self._last_cluster_result,
     )
 
-    # VLM 两趟调用
-    scene_description = ""
-    rag_queries = None
-    memory_input = None
-    if images and self._current_frame_b64:
-      scene_description = await self._scene_understand(prompt, images)
+    # 对话模式检测：黑屏/无视频时跳过 VLM，聚焦弹幕互动
+    conversation_mode = self._in_conversation_mode
+    effective_images = None if conversation_mode else images
 
-      rag_queries = [scene_description] if scene_description else None
+    # 弹幕优先模式：有新弹幕时跳过画面，专注弹幕互动
+    comment_priority = (
+      self.config.comment_priority_mode
+      and not conversation_mode
+      and bool(new_comments)
+    )
+    if comment_priority:
+      effective_images = None
 
+    # 注入实时北京时间 + 模式/画面前缀
+    reply_images = None
+    time_tag = _beijing_time_tag()
+    if effective_images and self._current_frame_b64:
       timestamp = self._get_stream_timestamp()
-      vlm_hint = (
+      prompt = (
+        f"{time_tag}"
         f"[当前画面] 以下附带了直播画面截图（{timestamp}）。\n"
-        f"[场景理解] {scene_description}\n"
-        f"请结合画面内容、场景理解和弹幕进行回应。\n\n"
-      )
-      prompt = vlm_hint + prompt
+        f"请结合画面内容和弹幕进行回应。\n\n"
+      ) + prompt
+      reply_images = effective_images
+    elif comment_priority:
+      prompt = (
+        f"{time_tag}"
+        "[弹幕互动] 当前有观众发弹幕，请专注回复弹幕内容。\n\n"
+      ) + prompt
+    elif conversation_mode:
+      prompt = (
+        f"{time_tag}"
+        "[当前模式] 纯对话模式，没有直播画面。"
+        "请专注于和观众的弹幕互动。"
+        "如果没有弹幕，请主动找话题和观众聊天。\n\n"
+      ) + prompt
+    else:
+      prompt = f"{time_tag}\n" + prompt
 
-      memory_input = self._build_memory_input(
-        scene_description, old_comments + new_comments,
-      )
+    all_comments = old_comments + new_comments
+    meaningful = [
+      c for c in all_comments
+      if c.content.strip() and len(c.content.strip()) > 2
+      and not self._is_noise_danmaku(c.content)
+    ]
+    if meaningful:
+      parts = [f"{c.nickname}：{c.content}" for c in meaningful[-5:]]
+      rag_queries = [" ".join(parts)]
+    else:
+      rag_queries = []
+    memory_input = self._build_memory_input(all_comments)
 
-    if rag_queries is None:
-      all_comments = old_comments + new_comments
-      rag_queries = [c.content for c in all_comments if c.content.strip()]
+    # 弱智吧时间：pre-roll 触发判定，触发时覆盖风格和句数
+    style_bank_active = self.llm_wrapper.roll_style_bank()
+    if style_bank_active and response_style not in ("guard_thanks",):
+      response_style = "style_bank"
+      sentences = 2
+
+    style_hint = self._build_style_hint(response_style, sentences)
+    if sentences > 0:
+      prompt = prompt + f"\n\n[本轮句数] 回复{sentences}句话。"
+    if style_hint:
+      prompt = style_hint + prompt
 
     self._last_prompt = prompt
+
+    situation = self._infer_situation(new_comments, reply_images)
 
     reply_ids = tuple(c.id for c in new_comments)
     response_id = str(uuid.uuid4())
     accumulated = ""
 
+    self._timer.mark("LLM首token")
+    first_token_received = False
     try:
       async for chunk in self.llm_wrapper.achat_stream(
         prompt, save_history=False,
         rag_queries=rag_queries, topic_context=topic_context,
-        images=images, memory_input=memory_input,
+        images=reply_images, memory_input=memory_input,
+        situation=situation,
       ):
+        if not first_token_received:
+          self._timer.mark("LLM流式输出")
+          first_token_received = True
         accumulated += chunk
         rc = ResponseChunk(
           response_id=response_id,
@@ -1202,6 +1613,7 @@ class StreamingStudio:
             print(f"chunk 回调错误: {e}")
 
       # 流式结束后：对完整文本做表情/动作映射，替换标签
+      self._timer.mark("后处理")
       display_text, em_tags = self._apply_expression_mapping(accumulated)
 
       # 发送完成标记（携带映射后文本，GUI 会用它刷新最终显示）
@@ -1316,12 +1728,8 @@ class StreamingStudio:
 
       parts = [f"=== 系统提示词 ===\n{system_prompt}\n"]
 
-      scene = self.llm_wrapper.last_scene_understanding
-      if scene:
-        parts.append(f"=== 场景理解（第一趟 VLM 输出）===\n{scene}\n")
-
       if extra_context:
-        parts.append(f"=== 记忆上下文（基于场景理解检索）===\n{extra_context}\n")
+        parts.append(f"=== 记忆上下文（RAG 检索）===\n{extra_context}\n")
 
       parts.append(f"=== 当前用户消息 ===\n{self._last_prompt}")
       full_prompt = "\n".join(parts)
@@ -1356,6 +1764,8 @@ class StreamingStudio:
       "last_cluster_result": self._format_cluster_debug(),
       "vlm_mode": self._video_player is not None,
       "video_player": self._video_player.debug_state() if self._video_player else None,
+      "pipeline_timer": self._timer.debug_state(),
+      "guard_roster": self._guard_roster.debug_state(),
     }
 
   def topic_debug_state(self) -> Optional[dict]:

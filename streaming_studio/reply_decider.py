@@ -14,7 +14,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.language_models import BaseChatModel
 
 from .config import ReplyDeciderConfig, CommentClustererConfig
-from .models import Comment
+from .models import Comment, EventType, GUARD_LEVEL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,8 @@ class ReplyDecision:
   urgency: float
   reason: str
   phase: str  # "rule" or "llm"
+  response_style: str = "normal"  # "reaction" | "brief" | "normal" | "detailed"
+  sentences: int = 0  # 建议句数（0 = 无建议，由 style 决定）
 
 
 class ReplyDecider:
@@ -54,9 +56,13 @@ class ReplyDecider:
     self,
     old_comments: list[Comment],
     new_comments: list[Comment],
+    comment_rate: float = -1.0,
   ) -> Optional[ReplyDecision]:
     """
     Phase 1: 规则快筛
+
+    Args:
+      comment_rate: 弹幕到达速率（条/分钟），< 0 表示未提供
 
     Returns:
       明确决策时返回 ReplyDecision，不确定时返回 None
@@ -66,20 +72,61 @@ class ReplyDecider:
     if not all_comments:
       return ReplyDecision(False, 0, "无弹幕", "rule")
 
+    # ── 事件类型优先级规则 ──
+
+    guard_buys = [c for c in all_comments if c.event_type == EventType.GUARD_BUY]
+    if guard_buys:
+      max_level = max(c.guard_level for c in guard_buys)
+      level_name = GUARD_LEVEL_NAMES.get(max_level, "舰长")
+      sentences = 3 if max_level >= 3 else 2
+      return ReplyDecision(True, 10, f"上舰事件({level_name})", "rule",
+                           response_style="guard_thanks", sentences=sentences)
+
+    super_chats = [c for c in all_comments if c.event_type == EventType.SUPER_CHAT]
+    if super_chats:
+      max_price = max(c.price for c in super_chats)
+      sentences = 3 if max_price >= 100 else 2
+      return ReplyDecision(True, 9, f"SC(¥{max_price:.0f})", "rule",
+                           response_style="detailed", sentences=sentences)
+
+    gifts_only = [c for c in new_comments if c.event_type == EventType.GIFT]
+    has_danmaku = any(c.event_type == EventType.DANMAKU for c in new_comments)
+    if gifts_only and not has_danmaku:
+      return ReplyDecision(True, 6, "收到礼物", "rule",
+                           response_style="brief", sentences=1)
+
+    entries_only = all(c.event_type == EventType.ENTRY for c in new_comments) if new_comments else False
+    if entries_only:
+      if 0 <= comment_rate >= self.config.sparse_chat_threshold:
+        return ReplyDecision(False, 1, "仅入场通知，弹幕密集跳过", "rule")
+      return ReplyDecision(True, 3, "新观众进入", "rule",
+                           response_style="brief", sentences=1)
+
     # 优先弹幕（手动输入）→ 必须回复
-    if any(c.priority for c in all_comments):
-      return ReplyDecision(True, 9, "有优先弹幕", "rule")
+    if any(c.priority and c.event_type == EventType.DANMAKU for c in all_comments):
+      return ReplyDecision(True, 9, "有优先弹幕", "rule", sentences=2)
 
     # 新弹幕数量超过阈值 → 直接回复（聊天很活跃）
     if len(new_comments) >= self.config.must_reply_comment_count:
-      return ReplyDecision(True, 8, f"新弹幕数量多({len(new_comments)}条)", "rule")
+      return ReplyDecision(True, 8, f"新弹幕数量多({len(new_comments)}条)", "rule",
+                           sentences=2)
 
-    # 包含提问（问号） → 必须回复
+    # 包含提问（问号） → 必须回复，详细回答
     for c in new_comments:
       if "?" in c.content or "？" in c.content:
         stripped = c.content.replace("?", "").replace("？", "").strip()
         if len(stripped) >= 2:
-          return ReplyDecision(True, 8, f"观众提问: {c.content[:20]}", "rule")
+          return ReplyDecision(True, 8, f"观众提问: {c.content[:20]}", "rule",
+                               response_style="detailed", sentences=2)
+
+    # 极稀疏模式：直播间非常冷清，有人说话就直接回复，省掉 LLM 判断
+    if 0 <= comment_rate < self.config.very_sparse_threshold:
+      return ReplyDecision(True, 7, f"极稀疏({comment_rate:.1f}/min)，直接回复", "rule",
+                           sentences=1)
+
+    # 稀疏模式：弹幕较少时不做低质量过滤，交给 Phase 2 综合判断
+    if 0 <= comment_rate < self.config.sparse_chat_threshold:
+      return None
 
     # 检查是否全是低质量内容
     low_quality_count = 0
@@ -94,6 +141,8 @@ class ReplyDecider:
         low_quality_count += 1
 
     if new_comments and low_quality_count == len(new_comments):
+      if len(new_comments) >= 3:
+        return ReplyDecision(True, 4, "刷屏反应", "rule", response_style="reaction")
       return ReplyDecision(False, 1, "全部为低质量弹幕", "rule")
 
     # 不确定 → 交给 Phase 2
@@ -105,6 +154,7 @@ class ReplyDecider:
     new_comments: list[Comment],
     scene_description: Optional[str] = None,
     silence_seconds: float = 0,
+    comment_rate: float = -1.0,
   ) -> ReplyDecision:
     """
     Phase 2: LLM 精判
@@ -117,6 +167,8 @@ class ReplyDecider:
     parts = []
     if scene_description:
       parts.append(f"[当前画面] {scene_description}")
+    if comment_rate >= 0:
+      parts.append(f"[弹幕密度] 当前约 {comment_rate:.1f} 条/分钟")
     if silence_seconds > 0:
       parts.append(f"[沉默时长] 距上次回复已过 {int(silence_seconds)} 秒")
 
@@ -141,6 +193,9 @@ class ReplyDecider:
       return self._parse_judge_response(text)
     except Exception as e:
       logger.error("LLM 精判调用失败: %s", e)
+      # 稀疏模式下异常时默认回复（不能因为 API 故障就无视观众）
+      if 0 <= comment_rate < self.config.sparse_chat_threshold:
+        return ReplyDecision(True, 6, f"精判异常，稀疏模式默认回复", "llm")
       return ReplyDecision(False, 2, f"精判异常({e})，默认跳过", "llm")
 
   async def should_reply(
@@ -149,34 +204,32 @@ class ReplyDecider:
     new_comments: list[Comment],
     scene_description: Optional[str] = None,
     last_reply_time: Optional[datetime] = None,
+    comment_rate: float = -1.0,
   ) -> ReplyDecision:
     """
-    完整两阶段决策
+    规则决策（不调用 LLM，零延迟）
+
+    Phase 1 规则快筛能决定时直接返回；无法决定时默认回复，
+    避免 Phase 2 LLM 调用带来的 1-3 秒额外延迟。
 
     Args:
       old_comments: 上次回复前的弹幕
       new_comments: 新弹幕
       scene_description: 当前场景描述（VLM 模式）
       last_reply_time: 上次回复时间（用于计算沉默时长）
+      comment_rate: 弹幕到达速率（条/分钟），< 0 表示未提供
     """
-    # Phase 1
-    decision = self.rule_check(old_comments, new_comments)
+    decision = self.rule_check(old_comments, new_comments, comment_rate)
     if decision is not None:
       logger.info("回复决策[规则]: %s (urgency=%.0f, %s)",
                   "回复" if decision.should_reply else "跳过",
                   decision.urgency, decision.reason)
       return decision
 
-    # Phase 2
-    silence = 0.0
-    if last_reply_time:
-      silence = (datetime.now() - last_reply_time).total_seconds()
-
-    decision = await self.llm_judge(
-      old_comments, new_comments, scene_description, silence,
-    )
-    logger.info("回复决策[LLM]: %s (urgency=%.0f, %s)",
-                "回复" if decision.should_reply else "跳过",
+    # 规则无法决定 → 默认回复（有实质内容的弹幕值得回应）
+    decision = ReplyDecision(True, 5, "规则未匹配，默认回复", "rule",
+                             response_style="normal", sentences=1)
+    logger.info("回复决策[默认]: 回复 (urgency=%.0f, %s)",
                 decision.urgency, decision.reason)
     return decision
 
@@ -234,8 +287,35 @@ class ReplyDecider:
       return ReplyDecision(False, 0, f"判断异常({e})", "llm")
 
   def _parse_judge_response(self, text: str) -> ReplyDecision:
-    """解析 LLM 精判的 true/false 响应"""
-    normalized = text.strip().lower()
+    """解析 LLM 精判的 JSON 响应（兼容旧 true/false 格式）"""
+    import json as _json
+
+    raw = text.strip()
+    # 处理 markdown code fence 包裹
+    if raw.startswith("```"):
+      lines = raw.split("\n")
+      raw = "\n".join(l for l in lines if not l.startswith("```")).strip()
+
+    try:
+      data = _json.loads(raw)
+      should_reply = bool(data.get("reply", False))
+      style = data.get("style", "normal")
+      reason = data.get("reason", "LLM判断")
+      if style not in ("reaction", "brief", "normal", "detailed"):
+        style = "normal"
+      sentences = int(data.get("sentences", 1))
+      if sentences < 1:
+        sentences = 1
+      elif sentences > 2:
+        sentences = 2
+      urgency = 5 if should_reply else 1
+      return ReplyDecision(should_reply, urgency, reason, "llm",
+                           response_style=style, sentences=sentences)
+    except (ValueError, AttributeError, TypeError):
+      pass
+
+    # 降级：兼容旧格式 true/false
+    normalized = raw.lower()
     if normalized.startswith("true"):
       return ReplyDecision(True, 5, "LLM判断", "llm")
     if normalized.startswith("false"):

@@ -34,7 +34,7 @@ MODEL_MAP = {
 def main():
   parser = argparse.ArgumentParser(description="mio-streaming-demo 调试控制台")
   parser.add_argument("--port", type=int, default=8080, help="监听端口 (默认 8080)")
-  parser.add_argument("--persona", default="karin", help="角色名称 (karin/sage/kuro)")
+  parser.add_argument("--persona", default="karin", help="角色名称 (karin/sage/kuro/naixiong/dacongming)")
   parser.add_argument(
     "--model", default="openai", choices=list(MODEL_MAP.keys()),
     help="模型类型 (默认 openai)",
@@ -43,10 +43,6 @@ def main():
   parser.add_argument(
     "--global-memory", action="store_true", default=False,
     help="开启全局记忆（持久化到文件，默认关闭）",
-  )
-  parser.add_argument(
-    "--topic-manager", action="store_true", default=True,
-    help="启用话题管理器（追踪和管理直播话题，默认关闭）",
   )
   parser.add_argument(
     "--speech-url", default=None,
@@ -68,7 +64,6 @@ def main():
       persona=args.persona,
       port=args.port,
       enable_global_memory=args.global_memory,
-      enable_topic_manager=args.topic_manager,
       speech_url=args.speech_url,
     )
   except KeyboardInterrupt:

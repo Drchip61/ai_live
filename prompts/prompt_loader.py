@@ -55,6 +55,13 @@ class PromptLoader:
       raise FileNotFoundError(f"提示词文件不存在: {file_path}")
     return file_path.read_text(encoding="utf-8")
 
+  def load_optional(self, filename: str) -> Optional[str]:
+    """加载指定文件，不存在时返回 None 而非抛异常"""
+    file_path = self.prompts_dir / filename
+    if not file_path.exists():
+      return None
+    return file_path.read_text(encoding="utf-8")
+
   def load_template(self, path: str, **kwargs: str) -> str:
     """
     加载 txt 模板并填充变量

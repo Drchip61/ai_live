@@ -1,0 +1,15 @@
+{
+  "description": "共享弱智吧风格参考（偶尔触发，给日常对话加点意外感）",
+  "corpus_path": "personas/dacongming/style_bank/corpus.jsonl",
+  "retrieval_count": 2,
+  "injection_probability": 0.2,
+  "injection_header": "【风格灵感——必须参考以下示例的脑洞和逻辑方式，用你自己的语气讲出来】",
+  "categories": {
+    "classic_question": "经典荒诞假设问题",
+    "reasoning_chain": "完整推理链示范",
+    "comment_reaction": "对弹幕的反应方式",
+    "scene_reaction": "对画面的反应方式",
+    "ice_breaker": "冷场时的主动发言",
+    "comeback": "被质疑时的回击方式"
+  }
+}

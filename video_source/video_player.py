@@ -100,6 +100,7 @@ class VideoPlayer:
     self._start_time: Optional[datetime] = None
     self._current_sec: float = 0.0
     self._paused = False
+    self._pause_time: Optional[datetime] = None
 
     # 最新帧缓存（AI 帧）
     self._current_frame: Optional[VideoFrame] = None
@@ -141,9 +142,30 @@ class VideoPlayer:
     return self._current_sec >= self._extractor.duration
 
   @property
+  def is_paused(self) -> bool:
+    return self._paused
+
+  @property
   def current_frame(self) -> Optional[VideoFrame]:
     """最新一帧"""
     return self._current_frame
+
+  def pause(self) -> None:
+    """暂停播放（保持时钟循环但跳过帧提取和弹幕投递，可用 resume 恢复）"""
+    if not self._running or self._paused:
+      return
+    self._paused = True
+    self._pause_time = datetime.now()
+
+  def resume(self) -> None:
+    """从暂停位置恢复播放"""
+    if not self._running or not self._paused:
+      return
+    if self._pause_time and self._start_time:
+      pause_duration = datetime.now() - self._pause_time
+      self._start_time += pause_duration
+    self._paused = False
+    self._pause_time = None
 
   def on_danmaku(self, callback: Callable[[Danmaku], None]) -> None:
     """注册弹幕到达回调"""

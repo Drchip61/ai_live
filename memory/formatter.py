@@ -127,6 +127,7 @@ def format_retrieved_memories(
     ("temporary", "【相关短期回忆】"),
     ("summary", "【相关长期回忆】"),
     ("static", "【关于自己】"),
+    ("stance", "【我之前表达过的观点】"),
   ]
 
   parts = []
@@ -147,6 +148,12 @@ def format_retrieved_memories(
       if entry.layer == "static":
         # static 层已带 category 前缀
         lines.append(f"- {cross_session_prefix}{entry.content}")
+      elif entry.layer == "stance":
+        # stance 层加话题标签和相对时间
+        rel_time = _relative_time(entry.timestamp, now)
+        topic = entry.metadata.get("topic", "") if entry.metadata else ""
+        topic_prefix = f"【关于{topic}】" if topic else ""
+        lines.append(f"- {cross_session_prefix}{topic_prefix}{entry.content}（{rel_time}）")
       else:
         # temporary / summary 层加相对时间前缀
         rel_time = _relative_time(entry.timestamp, now)

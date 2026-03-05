@@ -1,6 +1,6 @@
 """
 memory 模块
-分层记忆系统：active / temporary / summary / static
+分层记忆系统：active / temporary / summary / static / stance
 
 提供基于 RAG 的长期记忆能力，独立于 langchain_wrapper 和 streaming_studio，
 桥接两层之间的记忆读写需求。
@@ -11,6 +11,7 @@ from .config import (
   ActiveConfig,
   TemporaryConfig,
   SummaryConfig,
+  StanceConfig,
   RetrievalConfig,
   EmbeddingConfig,
   STATIC_CATEGORY_PREFIXES,
@@ -28,6 +29,7 @@ from .layers import (
   TemporaryLayer,
   SummaryLayer,
   StaticLayer,
+  StanceLayer,
 )
 from .retriever import MemoryRetriever
 from .manager import MemoryManager
@@ -39,6 +41,7 @@ __all__ = [
   "ActiveConfig",
   "TemporaryConfig",
   "SummaryConfig",
+  "StanceConfig",
   "RetrievalConfig",
   "EmbeddingConfig",
   "STATIC_CATEGORY_PREFIXES",
@@ -55,6 +58,7 @@ __all__ = [
   "TemporaryLayer",
   "SummaryLayer",
   "StaticLayer",
+  "StanceLayer",
   # 检索
   "MemoryRetriever",
   # 管理器

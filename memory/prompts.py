@@ -14,3 +14,7 @@ INTERACTION_SUMMARY_PROMPT = _loader.load("memory/interaction_summary.txt")
 # 定时汇总 prompt
 # 变量：{active_memories}, {recent_interactions}
 PERIODIC_SUMMARY_PROMPT = _loader.load("memory/periodic_summary.txt")
+
+# 立场提取 prompt
+# 变量：{input}, {response}
+STANCE_EXTRACTION_PROMPT = _loader.load("memory/stance_extraction.txt")

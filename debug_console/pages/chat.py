@@ -13,7 +13,7 @@ from nicegui import ui, context
 from debug_console.auto_viewer import AutoViewer
 from debug_console.comment_broadcaster import CommentBroadcaster
 from streaming_studio import StreamingStudio, Comment
-from streaming_studio.models import ResponseChunk
+from streaming_studio.models import ResponseChunk, EventType
 
 
 def _random_identity() -> tuple[str, str]:
@@ -212,6 +212,67 @@ def create_chat_page(studio: StreamingStudio, broadcaster: CommentBroadcaster) -
           ui.button("发送", on_click=send).props("dense")
           msg_input.on("keydown.enter", send)
 
+        # 特殊事件模拟按钮
+        with ui.row().classes("w-full gap-1 flex-wrap"):
+          ui.label("模拟事件:").classes("text-xs text-gray-400 self-center")
+
+          def _get_identity():
+            if state["multi_user"]:
+              uid, nick = state["next_id"], state["next_nick"]
+              state["next_id"], state["next_nick"] = _random_identity()
+              preview_label.text = f"下一个身份: {state['next_nick']} ({state['next_id']})"
+              return uid, nick
+            return state["user_id"] or "test_user", state["nickname"] or "测试用户"
+
+          def send_entry():
+            if not studio.is_running:
+              return
+            uid, nick = _get_identity()
+            comment = Comment(user_id=uid, nickname=nick, content="",
+                              event_type=EventType.ENTRY)
+            studio.send_comment(comment)
+            broadcaster.broadcast(comment)
+
+          def send_gift():
+            if not studio.is_running:
+              return
+            uid, nick = _get_identity()
+            comment = Comment(user_id=uid, nickname=nick, content="",
+                              event_type=EventType.GIFT,
+                              gift_name="小花花", gift_num=5)
+            studio.send_comment(comment)
+            broadcaster.broadcast(comment)
+
+          def send_sc():
+            if not studio.is_running:
+              return
+            uid, nick = _get_identity()
+            content = msg_input.value.strip() or "主播加油！"
+            comment = Comment(user_id=uid, nickname=nick, content=content,
+                              event_type=EventType.SUPER_CHAT, price=30.0)
+            studio.send_comment(comment)
+            broadcaster.broadcast(comment)
+            msg_input.value = ""
+
+          def send_guard(level: int, name: str):
+            def _send():
+              if not studio.is_running:
+                return
+              uid, nick = _get_identity()
+              comment = Comment(user_id=uid, nickname=nick, content="",
+                                event_type=EventType.GUARD_BUY,
+                                guard_level=level, gift_name=name, gift_num=1)
+              studio.send_comment(comment)
+              broadcaster.broadcast(comment)
+            return _send
+
+          ui.button("进入", on_click=send_entry).props("dense flat size=sm color=grey")
+          ui.button("礼物", on_click=send_gift).props("dense flat size=sm color=orange")
+          ui.button("SC", on_click=send_sc).props("dense flat size=sm color=deep-purple")
+          ui.button("舰长", on_click=send_guard(1, "舰长")).props("dense flat size=sm color=blue")
+          ui.button("提督", on_click=send_guard(2, "提督")).props("dense flat size=sm color=indigo")
+          ui.button("总督", on_click=send_guard(3, "总督")).props("dense flat size=sm color=red")
+
   # ── 辅助函数 ──
 
   def _add_comment_bubble(nickname: str, content: str, timestamp: str):
@@ -277,10 +338,11 @@ def create_chat_page(studio: StreamingStudio, broadcaster: CommentBroadcaster) -
   # ── 弹幕广播回调注册 ──
 
   def on_broadcast_comment(comment: Comment):
-    """广播弹幕 → 显示到本客户端右栏"""
+    """广播弹幕/事件 → 显示到本客户端右栏"""
+    display = comment.format_for_llm()
     _add_comment_bubble(
       comment.nickname,
-      comment.content,
+      display,
       comment.timestamp.strftime("%H:%M:%S"),
     )
 

@@ -33,6 +33,7 @@ if str(project_root) not in sys.path:
 
 from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio
+from streaming_studio.models import EventType
 from video_source import VideoPlayer
 from connection import SpeechBroadcaster
 
@@ -51,7 +52,7 @@ def parse_args():
   )
   parser.add_argument(
     "--persona", default="karin",
-    choices=["karin", "sage", "kuro", "naixiong"],
+    choices=["karin", "sage", "kuro", "naixiong", "dacongming"],
     help="主播人设（默认 karin）",
   )
   parser.add_argument(
@@ -82,10 +83,6 @@ def parse_args():
   parser.add_argument(
     "--global-memory", action="store_true", default=False,
     help="开启全局记忆（持久化到文件，默认关闭）",
-  )
-  parser.add_argument(
-    "--topic-manager", action="store_true", default=False,
-    help="启用话题管理器",
   )
   parser.add_argument(
     "--speech-url", default=None,
@@ -137,7 +134,6 @@ async def main():
     model_name=args.model_name,
     enable_memory=enable_memory,
     enable_global_memory=args.global_memory,
-    enable_topic_manager=args.topic_manager,
     video_player=player,
   )
   studio.enable_streaming = True
@@ -154,10 +150,12 @@ async def main():
     print("--- 回复弹幕 ---")
     for c in old_comments:
       label = "[优先]" if c.priority else "[旧]"
-      print(f"{label} {c.nickname}: {c.content}")
+      text = c.format_for_llm() if c.event_type != EventType.DANMAKU else c.content
+      print(f"{label} {c.nickname}: {text}")
     for c in new_comments:
       label = "[优先]" if c.priority else "[新]"
-      print(f"{label} {c.nickname}: {c.content}")
+      text = c.format_for_llm() if c.event_type != EventType.DANMAKU else c.content
+      print(f"{label} {c.nickname}: {text}")
     print("-" * 16)
 
   studio.on_pre_response(on_pre_response)

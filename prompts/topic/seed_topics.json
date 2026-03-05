@@ -1,0 +1,128 @@
+[
+  {
+    "id": "daily_mood",
+    "category": "日常闲聊",
+    "title": "今天的心情",
+    "starter": "今天大家过得怎么样呀？有没有什么开心的事想分享？",
+    "suggestion": "聊聊今天的心情和日常，问问观众今天做了什么"
+  },
+  {
+    "id": "food_talk",
+    "category": "美食",
+    "title": "好吃的推荐",
+    "starter": "说到吃的，大家最近有吃到什么好吃的吗？",
+    "suggestion": "和观众聊美食，分享自己喜欢的食物，问问他们的推荐"
+  },
+  {
+    "id": "weekend_plan",
+    "category": "日常闲聊",
+    "title": "周末计划",
+    "starter": "大家周末一般都怎么度过呀？有什么有趣的安排吗？",
+    "suggestion": "聊聊休息日的安排，分享自己的计划或宅家体验"
+  },
+  {
+    "id": "music_share",
+    "category": "兴趣爱好",
+    "title": "最近在听什么歌",
+    "starter": "最近有没有什么好听的歌推荐？我最近单曲循环了好几首",
+    "suggestion": "聊音乐品味，问观众最近在听什么，分享自己的歌单"
+  },
+  {
+    "id": "pet_talk",
+    "category": "日常闲聊",
+    "title": "宠物故事",
+    "starter": "有养宠物的朋友吗？来分享一下你家毛孩子的趣事吧",
+    "suggestion": "聊宠物话题，问观众有没有养宠物，分享有趣的宠物故事"
+  },
+  {
+    "id": "season_feeling",
+    "category": "日常闲聊",
+    "title": "季节感受",
+    "starter": "最近天气变化好大，大家那边天气怎么样？",
+    "suggestion": "聊聊当前季节的感受、天气变化，引导观众分享所在地的情况"
+  },
+  {
+    "id": "movie_anime",
+    "category": "兴趣爱好",
+    "title": "影视动漫推荐",
+    "starter": "最近有看什么好看的电影或者动漫吗？来互相安利一下",
+    "suggestion": "聊最近看过的影视作品，问观众有没有推荐"
+  },
+  {
+    "id": "childhood_memory",
+    "category": "趣味问答",
+    "title": "童年回忆",
+    "starter": "突然想到小时候的事，大家小时候最喜欢玩什么呀？",
+    "suggestion": "聊童年回忆，分享小时候的趣事，引起观众共鸣"
+  },
+  {
+    "id": "late_night_snack",
+    "category": "美食",
+    "title": "深夜放毒",
+    "starter": "现在说这个有点罪恶，但是大家喜欢吃什么夜宵？",
+    "suggestion": "聊夜宵话题，分享自己爱吃的深夜美食"
+  },
+  {
+    "id": "superpower_wish",
+    "category": "趣味问答",
+    "title": "如果有超能力",
+    "starter": "如果可以拥有一种超能力，你们会选什么？我先说我的",
+    "suggestion": "趣味假设问答，引导观众发挥想象力参与讨论"
+  },
+  {
+    "id": "travel_dream",
+    "category": "日常闲聊",
+    "title": "最想去的地方",
+    "starter": "大家有没有特别想去但还没去过的地方？",
+    "suggestion": "聊旅行愿望，分享想去的目的地，问观众去过哪些好地方"
+  },
+  {
+    "id": "skill_learning",
+    "category": "日常闲聊",
+    "title": "最近在学什么",
+    "starter": "你们最近有在学什么新东西吗？我最近在尝试学一些新技能",
+    "suggestion": "聊学习和成长，分享最近在学的东西，互相鼓励"
+  },
+  {
+    "id": "emoji_game",
+    "category": "互动游戏",
+    "title": "表情猜谜",
+    "starter": "来玩个小游戏吧！我用文字描述一个东西，你们来猜",
+    "suggestion": "发起简单的文字猜谜或描述游戏，活跃气氛"
+  },
+  {
+    "id": "random_trivia",
+    "category": "趣味问答",
+    "title": "冷知识分享",
+    "starter": "我最近知道了一个很有意思的冷知识，你们知道吗？",
+    "suggestion": "分享有趣的冷知识，引导观众也分享他们知道的"
+  },
+  {
+    "id": "sleep_habit",
+    "category": "日常闲聊",
+    "title": "作息习惯",
+    "starter": "大家一般都几点睡觉呀？有没有夜猫子同伴？",
+    "suggestion": "聊作息习惯，分享自己的睡眠故事，找共同话题"
+  },
+  {
+    "id": "this_or_that",
+    "category": "互动游戏",
+    "title": "二选一",
+    "starter": "来玩个二选一吧！甜食还是咸食？你们选哪个？",
+    "suggestion": "发起二选一话题，用简单选择调动观众参与感"
+  },
+  {
+    "id": "hobby_share",
+    "category": "兴趣爱好",
+    "title": "兴趣爱好",
+    "starter": "除了看直播以外，大家平时都有什么兴趣爱好呀？",
+    "suggestion": "聊兴趣爱好，分享自己的爱好，发现和观众的共同点"
+  },
+  {
+    "id": "embarrassing_moment",
+    "category": "趣味问答",
+    "title": "尴尬时刻",
+    "starter": "大家有没有什么社死名场面可以分享？我先来一个",
+    "suggestion": "聊尴尬趣事，先分享自己的经历让观众放下戒备再参与"
+  }
+]

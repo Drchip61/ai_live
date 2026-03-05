@@ -48,6 +48,18 @@ class StudioConfig:
   interaction_stale_weight: float = 0.1
   """过期话题弹幕的权重"""
 
+  tts_skip_timer_threshold: int = 3
+  """TTS 播放期间积累弹幕数 >= 此值时，完播后跳过定时器直接进入回复流程"""
+
+  proactive_fallback_silence_multiplier: float = 1.5
+  """非对话模式下话题耗尽时的兜底主动发言沉默倍数（基于 proactive_silence_threshold）"""
+
+  comment_priority_mode: bool = True
+  """弹幕优先模式：有新弹幕时跳过画面传递，专注弹幕互动；无弹幕时走 VLM 画面理解"""
+
+  engaging_question_probability: float = 0.3
+  """引导式反问概率：每轮回复有此概率追加引导反问 prompt，增强观众互动"""
+
 
 @dataclass(frozen=True)
 class ReplyDeciderConfig:
@@ -71,6 +83,12 @@ class ReplyDeciderConfig:
 
   llm_judge_urgency_threshold: float = 4.0
   """LLM 精判返回 urgency 低于此值时跳过回复"""
+
+  sparse_chat_threshold: float = 5.0
+  """弹幕速率（条/分钟）低于此值时进入稀疏模式，放宽过滤标准"""
+
+  very_sparse_threshold: float = 1.0
+  """弹幕速率（条/分钟）低于此值时极稀疏模式，规则层直接放行不走 LLM"""
 
 
 @dataclass(frozen=True)

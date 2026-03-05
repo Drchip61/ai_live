@@ -4,12 +4,17 @@
 """
 
 import asyncio
+import json
 import logging
+import random
+import re
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
 from langchain_core.language_models import BaseChatModel
 
+from prompts import PromptLoader
 from .config import TopicManagerConfig
 from .models import Topic, ContentAnalysisDelta, RhythmAnalysisDelta
 from .table import TopicTable
@@ -68,8 +73,20 @@ class TopicManager:
     self._last_analysis_time: Optional[datetime] = None
     self._suggested_timing: Optional[tuple[float, float]] = None
 
+    # 话题种子库
+    self._seed_topics: list[dict] = []
+    self._used_seed_ids: set[str] = set()
+    self._seed_recycle_count: int = 0
+    if self._config.enable_seed_topics:
+      self._seed_topics = self._load_seed_topics()
+
     # 后台任务引用（防止 GC 回收）
     self._background_tasks: set[asyncio.Task] = set()
+
+    # 无弹幕独白状态（独立于话题表）
+    self._monologue_topic: Optional[Topic] = None
+    self._monologue_round: int = 0
+    self._monologue_history: list[str] = []
 
     # 运行状态
     self._running = False
@@ -124,9 +141,12 @@ class TopicManager:
         pass
       self._batch_task = None
 
-    # 等待所有后台任务完成
+    # 取消并等待后台任务（超时 3 秒避免挂起）
+    for task in self._background_tasks:
+      task.cancel()
     if self._background_tasks:
-      await asyncio.gather(*self._background_tasks, return_exceptions=True)
+      await asyncio.wait(self._background_tasks, timeout=3.0)
+    self._background_tasks.clear()
 
     logger.info("话题管理器已停止")
 
@@ -244,9 +264,14 @@ class TopicManager:
       格式化的话题上下文文本
     """
     new_ids = [c.id for c in new_comments]
-    return format_topic_context(
+    base = format_topic_context(
       self._table, new_ids, self._database, self._config,
     )
+
+    monologue_ctx = self.format_monologue_context()
+    if monologue_ctx:
+      return f"{base}\n\n{monologue_ctx}" if base else monologue_ctx
+    return base
 
   def get_comment_annotations(self) -> dict[str, str]:
     """
@@ -367,10 +392,10 @@ class TopicManager:
     推荐一个适合主动推进的话题
 
     选择条件：非 stale、有 suggestion、significance 达标、空闲足够久。
-    纯内存查询，无 LLM 调用。
+    纯内存查询，无 LLM 调用。找不到合适话题时 fallback 到种子库。
 
     Args:
-      silence_seconds: 距上次回复的沉默时长（秒），仅供调用方参考，方法内不做门控
+      silence_seconds: 距上次回复的沉默时长（秒）
 
     Returns:
       最佳候选话题，无合适话题返回 None
@@ -389,9 +414,153 @@ class TopicManager:
         continue
       candidates.append(topic)
 
-    if not candidates:
-      return None
-    return max(candidates, key=lambda t: t.significance)
+    if candidates:
+      return max(candidates, key=lambda t: t.significance)
+
+    # 无候选话题 → 直接从种子库抽取（种子可回收，不设沉默门槛）
+    return self._draw_seed_topic()
+
+  def _load_seed_topics(self) -> list[dict]:
+    """加载话题种子（角色专属优先，然后加载共享版）"""
+    project_root = Path(__file__).resolve().parent.parent
+    seeds: list[dict] = []
+    seen_ids: set[str] = set()
+
+    paths = [
+      project_root / "personas" / self._persona / "topic_seeds.json",
+      project_root / "prompts" / "topic" / "seed_topics.json",
+    ]
+    for path in paths:
+      if not path.exists():
+        continue
+      try:
+        with open(path, "r", encoding="utf-8") as f:
+          data = json.load(f)
+        for item in data:
+          sid = item.get("id", "")
+          if sid and sid not in seen_ids:
+            seeds.append(item)
+            seen_ids.add(sid)
+      except Exception:
+        logger.exception("加载话题种子失败: %s", path)
+
+    logger.info("话题种子库已加载: %d 个种子", len(seeds))
+    return seeds
+
+  def _draw_seed_topic(self) -> Optional["Topic"]:
+    """
+    从种子库中随机抽取一个未使用的话题，注入话题表
+
+    种子全部耗尽时自动回收复用（清空已用 ID 集合）。
+
+    Returns:
+      新创建的 Topic，种子库为空时返回 None
+    """
+    available = [s for s in self._seed_topics if s["id"] not in self._used_seed_ids]
+    if not available:
+      if not self._seed_topics:
+        return None
+      self._used_seed_ids.clear()
+      self._seed_recycle_count += 1
+      logger.info("种子话题已回收 (第%d轮)", self._seed_recycle_count)
+      available = list(self._seed_topics)
+
+    seed = random.choice(available)
+    self._used_seed_ids.add(seed["id"])
+
+    topic = Topic(
+      topic_id=f"seed_{seed['id']}",
+      title=seed["title"],
+      significance=self._config.initial_significance,
+      topic_progress=seed.get("starter", ""),
+      suggestion=seed.get("suggestion", ""),
+    )
+    self._table.add(topic)
+    logger.info("抽取种子话题: %s - %s", topic.topic_id, topic.title)
+    return topic
+
+  # ------------------------------------------------------------------
+  # 无弹幕独白层（独立于话题表的 significance 生命周期）
+  # ------------------------------------------------------------------
+
+  _EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\]\s*")
+  _MONOLOGUE_TEMPLATE: Optional[str] = None
+
+  @classmethod
+  def _get_monologue_template(cls) -> str:
+    if cls._MONOLOGUE_TEMPLATE is None:
+      cls._MONOLOGUE_TEMPLATE = PromptLoader().load(
+        "topic/monologue_continuation.txt",
+      )
+    return cls._MONOLOGUE_TEMPLATE
+
+  def enter_monologue(self, topic: Topic) -> None:
+    """开始独白：保存话题快照，清空历史"""
+    self._monologue_topic = topic
+    self._monologue_round = 0
+    self._monologue_history = []
+    logger.info("独白开始: %s - %s", topic.topic_id, topic.title)
+
+  def is_in_monologue(self) -> bool:
+    return self._monologue_topic is not None
+
+  @property
+  def monologue_round(self) -> int:
+    return self._monologue_round
+
+  def record_monologue_turn(self, response: str) -> bool:
+    """
+    记录一轮独白发言
+
+    Args:
+      response: AI 本轮回复原文
+
+    Returns:
+      True 表示应继续独白，False 表示已达上限
+    """
+    cleaned = self._EXPRESSION_TAG_RE.sub("", response).strip()
+    self._monologue_history.append(cleaned)
+
+    max_lines = self._config.monologue_history_lines
+    if len(self._monologue_history) > max_lines:
+      self._monologue_history = self._monologue_history[-max_lines:]
+
+    self._monologue_round += 1
+    should_continue = self._monologue_round < self._config.monologue_max_rounds
+    logger.debug(
+      "独白第 %d/%d 轮",
+      self._monologue_round, self._config.monologue_max_rounds,
+    )
+    return should_continue
+
+  def exit_monologue(self) -> None:
+    """结束独白，清空状态"""
+    if self._monologue_topic:
+      logger.info(
+        "独白结束: %s (共 %d 轮)",
+        self._monologue_topic.title, self._monologue_round,
+      )
+    self._monologue_topic = None
+    self._monologue_round = 0
+    self._monologue_history = []
+
+  def format_monologue_context(self) -> str:
+    """格式化独白上下文供 prompt 使用，非独白状态返回空字符串"""
+    if not self._monologue_topic or not self._monologue_history:
+      return ""
+
+    template = self._get_monologue_template()
+    history_text = "\n".join(
+      f"- 第{i+1}轮: {line}"
+      for i, line in enumerate(self._monologue_history)
+    )
+    return template.format(
+      title=self._monologue_topic.title,
+      round=self._monologue_round + 1,
+      max_rounds=self._config.monologue_max_rounds,
+      history=history_text,
+      suggestion=self._monologue_topic.suggestion,
+    )
 
   def debug_state(self) -> dict:
     """
@@ -430,4 +599,13 @@ class TopicManager:
         if self._last_analysis_time else None
       ),
       "background_tasks": len(self._background_tasks),
+      "seed_topics_total": len(self._seed_topics),
+      "seed_topics_used": len(self._used_seed_ids),
+      "seed_recycle_count": self._seed_recycle_count,
+      "monologue": {
+        "active": self._monologue_topic is not None,
+        "topic": self._monologue_topic.title if self._monologue_topic else None,
+        "round": self._monologue_round,
+        "max_rounds": self._config.monologue_max_rounds,
+      },
     }

@@ -7,6 +7,7 @@ from .active import ActiveLayer
 from .temporary import TemporaryLayer
 from .summary import SummaryLayer
 from .static import StaticLayer
+from .stance import StanceLayer
 
 __all__ = [
   "MemoryEntry",
@@ -14,4 +15,5 @@ __all__ = [
   "TemporaryLayer",
   "SummaryLayer",
   "StaticLayer",
+  "StanceLayer",
 ]

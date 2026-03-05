@@ -45,33 +45,27 @@ python download_bilibili.py "https://b23.tv/xxxxx"
 
 ## 核心架构
 
-### 两趟 VLM 调用管线
+### 单次 VLM 调用管线
 
 这是系统最关键的数据流，跨越 `streaming_studio/studio.py` → `langchain_wrapper/wrapper.py` → `langchain_wrapper/pipeline.py`：
 
 ```
 弹幕缓冲区 + 视频帧
        │
-       ▼
-  第一趟：场景理解 (小模型 Haiku/Mini)
-  wrapper.ascene_understand() → 客观描述画面+弹幕
-  不使用人设/记忆/历史，纯视觉+文本理解
+       ├── 弹幕文本 → 记忆检索 (RAG)
+       │   用弹幕内容作为 query 搜索五层记忆 → extra_context
        │
        ▼
-  记忆检索 (RAG)
-  用场景描述作为 query 搜索四层记忆 → extra_context
-       │
-       ▼
-  第二趟：完整回复 (大模型 Sonnet/GPT)
+  单次 VLM 调用：完整回复 (大模型 Sonnet/GPT)
   wrapper.achat() → system_prompt + extra_context + 画面 + 弹幕
-  extra_context 被 wrap_untrusted_context() 包装为只读参考数据
+  图片直传模型，extra_context 被 wrap_untrusted_context() 包装为只读参考数据
        │
        ▼
   记忆写入 (小模型，异步后台 task)
   MemoryManager.record_interaction() → 总结为第一人称记忆
 ```
 
-纯文本模式（无视频）跳过第一趟，直接用弹幕内容做 RAG 查询。
+纯对话模式（无视频/黑屏）不传图片，聚焦弹幕互动。
 
 ### 双轨制触发机制
 
@@ -119,7 +113,7 @@ python download_bilibili.py "https://b23.tv/xxxxx"
 `langchain_wrapper/model_provider.py` 中 `REMOTE_MODELS` 定义了大/小模型预设：
 
 - **大模型**（主对话）：Sonnet / GPT-5.2 / Gemini 2.5 Flash
-- **小模型**（场景理解、记忆总结、弹幕分类、回复决策）：Haiku / GPT-5 Mini / Gemini 2.0 Flash
+- **小模型**（记忆总结、弹幕分类、回复决策）：Haiku / GPT-5 Mini / Gemini 2.0 Flash
 
 通过 `ModelProvider.remote_large()` / `remote_small()` 工厂方法获取。Gemini 走 OpenAI 兼容接口。
 
@@ -143,7 +137,7 @@ python download_bilibili.py "https://b23.tv/xxxxx"
 
 - `base_instruction.txt` — 主播基础指令
 - `security/anti_injection.txt` — 安全规则
-- `studio/` — 直播间专用（场景理解、弹幕头部、回复决策等）
+- `studio/` — 直播间专用（弹幕头部、回复决策等）
 - `topic/` — 话题管理器专用（分类、分析模板）
 - `memory/` — 记忆系统专用（交互总结、定时汇总）
 

@@ -139,6 +139,9 @@ class TemporaryLayer:
     Args:
       retrieved_ids: 本次被取用的记忆 ID 集合
     """
+    if self._store.count() < self._config.min_count_before_decay:
+      return
+
     all_data = self._store.get_all()
     ids_to_delete = []
     memories_to_archive = []

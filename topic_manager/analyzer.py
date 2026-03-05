@@ -4,10 +4,11 @@
 """
 
 import asyncio
-import json
 import logging
 from datetime import datetime
 from typing import Optional
+
+import json_repair
 
 from langchain_core.language_models import BaseChatModel
 
@@ -72,8 +73,12 @@ def _parse_json_response(text: str) -> Optional[dict]:
   text = text.strip()
 
   try:
-    return json.loads(text)
-  except json.JSONDecodeError:
+    result = json_repair.loads(text)
+    if isinstance(result, dict):
+      return result
+    logger.error("JSON 解析结果非 dict: %s", text[:200])
+    return None
+  except Exception:
     logger.error("JSON 解析失败: %s", text[:200])
     return None
 

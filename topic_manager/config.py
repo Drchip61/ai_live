@@ -81,6 +81,20 @@ class TopicManagerConfig:
   proactive_topic_min_idle_seconds: float = 30.0
   """话题至少空闲此秒数才值得主动推进（避免推荐刚聊过的话题）"""
 
+  # 话题种子库
+  enable_seed_topics: bool = True
+  """是否启用话题种子库（冷场时抽取预设话题）"""
+
+  seed_topic_min_silence_seconds: float = 45.0
+  """抽取种子话题的最低沉默时长（秒），避免过早消耗种子"""
+
+  # 无弹幕独白模式
+  monologue_max_rounds: int = 10
+  """无弹幕独白最大轮数，到达后自动切换话题"""
+
+  monologue_history_lines: int = 10
+  """独白上下文中展示的最近发言条数"""
+
   # 网络搜索（可选，默认关）
   enable_web_search: bool = False
   """是否启用网络搜索（Tavily）"""

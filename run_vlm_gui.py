@@ -17,6 +17,8 @@ import argparse
 import asyncio
 import base64
 import collections
+import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -26,15 +28,15 @@ if str(project_root) not in sys.path:
   sys.path.insert(0, str(project_root))
 
 from nicegui import ui, context, app
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
 from langchain_wrapper import ModelType
 from streaming_studio import StreamingStudio, Comment
-from streaming_studio.models import ResponseChunk
+from streaming_studio.models import ResponseChunk, EventType
 from video_source import VideoPlayer
 from connection import SpeechBroadcaster
 from debug_console.state_collector import StateCollector
-from debug_console.comment_broadcaster import CommentBroadcaster
+from debug_console.comment_broadcaster import CommentBroadcaster, ResponseBroadcaster
 from debug_console.pages.monitor import create_monitor_page
 
 
@@ -52,7 +54,7 @@ def parse_args():
   )
   parser.add_argument(
     "--persona", default="karin",
-    choices=["karin", "sage", "kuro", "naixiong"],
+    choices=["karin", "sage", "kuro", "naixiong", "dacongming"],
     help="主播人设（默认 karin）",
   )
   parser.add_argument(
@@ -85,10 +87,6 @@ def parse_args():
     help="开启全局记忆",
   )
   parser.add_argument(
-    "--topic-manager", action="store_true", default=False,
-    help="启用话题管理器",
-  )
-  parser.add_argument(
     "--port", type=int, default=8081,
     help="Web 服务端口（默认 8081）",
   )
@@ -103,8 +101,35 @@ def parse_args():
   return parser.parse_args()
 
 
+def _install_win_exception_filter():
+  """抑制 Windows ProactorEventLoop 在 MJPEG 客户端断开时的 ConnectionResetError 噪声"""
+  if sys.platform != "win32":
+    return
+  loop = None
+  try:
+    loop = asyncio.get_running_loop()
+  except RuntimeError:
+    pass
+  if loop is None:
+    return
+
+  _original = loop.call_exception_handler
+
+  def _filtered(ctx):
+    exc = ctx.get("exception")
+    if isinstance(exc, ConnectionResetError):
+      return
+    if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10054:
+      return
+    _original(ctx)
+
+  loop.call_exception_handler = _filtered
+
+
 def main():
   args = parse_args()
+
+  logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
 
   model_map = {
     "openai": ModelType.OPENAI,
@@ -114,10 +139,19 @@ def main():
   model_type = model_map[args.model]
 
   # MJPEG 视频流：显示帧通过 HTTP 流式推送，避免 WebSocket base64 闪烁
-  _mjpeg_state = {"jpeg_bytes": b"", "running": False}
+  # frame_seq 递增序号，确保多客户端只在新帧到达时推送，画面同步
+  _mjpeg_state = {"jpeg_bytes": b"", "running": False, "frame_seq": 0}
+
+  def _make_placeholder_jpeg() -> bytes:
+    import numpy as np
+    import cv2
+    return cv2.imencode('.jpg', np.zeros((1, 1, 3), np.uint8))[1].tobytes()
+
+  _placeholder_jpeg = _make_placeholder_jpeg()
 
   def _store_display_frame(frame):
     _mjpeg_state["jpeg_bytes"] = base64.b64decode(frame.base64_jpeg)
+    _mjpeg_state["frame_seq"] += 1
 
   def _normalize_path(raw_path: str) -> str:
     p = Path(raw_path).expanduser()
@@ -142,21 +176,22 @@ def main():
       model_name=args.model_name,
       enable_memory=not args.no_memory,
       enable_global_memory=args.global_memory,
-      enable_topic_manager=args.topic_manager,
       video_player=player,
     )
     studio.enable_streaming = True
     player.on_display_frame(_store_display_frame)
 
+    speech_bc = None
     if args.speech_url:
-      speech = SpeechBroadcaster(api_url=args.speech_url, model_type=model_type)
-      speech.attach(studio)
+      speech_bc = SpeechBroadcaster(api_url=args.speech_url, model_type=model_type, enabled=False)
+      speech_bc.attach(studio)
 
     return {
       "video_path": normalized_video,
       "danmaku_path": normalized_danmaku,
       "player": player,
       "studio": studio,
+      "speech": speech_bc,
     }
 
   if args.video:
@@ -167,34 +202,122 @@ def main():
       "danmaku_path": None,
       "player": None,
       "studio": None,
+      "speech": None,
     }
 
+  def _mjpeg_frame(data: bytes) -> bytes:
+    length = str(len(data)).encode()
+    return (
+      b"--frame\r\n"
+      b"Content-Type: image/jpeg\r\n"
+      b"Content-Length: " + length + b"\r\n"
+      b"\r\n" + data + b"\r\n"
+    )
+
   async def _mjpeg_generator():
+    yield _mjpeg_frame(_placeholder_jpeg)
+    last_seq = -1
     while True:
-      player = runtime.get("player")
-      if _mjpeg_state["running"] and player:
-        interval = 1.0 / max(player.display_fps, 1)
-        data = _mjpeg_state["jpeg_bytes"]
-        if data:
-          yield (
-            b"--frame\r\n"
-            b"Content-Type: image/jpeg\r\n\r\n"
-            + data
-            + b"\r\n"
-          )
-          await asyncio.sleep(interval)
-          continue
-      await asyncio.sleep(0.2)
+      if _mjpeg_state["running"]:
+        current_seq = _mjpeg_state["frame_seq"]
+        if current_seq != last_seq:
+          data = _mjpeg_state["jpeg_bytes"]
+          if data:
+            last_seq = current_seq
+            yield _mjpeg_frame(data)
+            continue
+        await asyncio.sleep(0.03)
+      else:
+        await asyncio.sleep(0.2)
 
   @app.get("/video-stream")
   async def video_stream_route():
     return StreamingResponse(
       _mjpeg_generator(),
       media_type="multipart/x-mixed-replace; boundary=frame",
+      headers={
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "X-Accel-Buffering": "no",
+      },
+    )
+
+  @app.get("/video-frame")
+  async def video_frame_route():
+    """单帧快照端点，供不支持 MJPEG 的设备轮询回退"""
+    data = _mjpeg_state["jpeg_bytes"] or _placeholder_jpeg
+    return Response(
+      content=data,
+      media_type="image/jpeg",
+      headers={"Cache-Control": "no-cache, no-store"},
     )
 
   host = "0.0.0.0" if args.lan else "127.0.0.1"
   broadcaster = CommentBroadcaster()
+  resp_broadcaster = ResponseBroadcaster()
+
+  # 全局 studio → broadcaster 转发（只注册一次，所有客户端共享）
+  _global_callbacks_registered = {"value": False}
+  _terminal_state_global = {"active_response_id": None}
+  # 全局共享状态：跨客户端同步运行状态和换源版本号
+  _shared_state = {"running": False, "version": 0}
+
+  def _ensure_global_callbacks():
+    """确保 studio/player 全局回调只注册一次，转发到 broadcaster 供所有客户端消费"""
+    if _global_callbacks_registered["value"]:
+      return
+    studio = runtime.get("studio")
+    if not studio:
+      return
+
+    def _forward_chunk(chunk: ResponseChunk):
+      active_id = _terminal_state_global["active_response_id"]
+      if chunk.response_id != active_id:
+        if active_id is not None:
+          print()
+        _terminal_state_global["active_response_id"] = chunk.response_id
+        print("[主播] ", end="", flush=True)
+      if chunk.chunk:
+        print(chunk.chunk, end="", flush=True)
+      if chunk.done:
+        print()
+        _terminal_state_global["active_response_id"] = None
+      resp_broadcaster.broadcast_chunk(chunk)
+
+    def _forward_response(response):
+      resp_broadcaster.broadcast_response(response)
+
+    def _forward_pre_response(old_comments, new_comments):
+      resp_broadcaster.broadcast_pre_response(old_comments, new_comments)
+
+    studio.on_response_chunk(_forward_chunk)
+    studio.on_response(_forward_response)
+    studio.on_pre_response(_forward_pre_response)
+
+    # 视频弹幕 → 弹幕广播器（全局注册，任意客户端断开不影响其它客户端）
+    player = runtime.get("player")
+    if player:
+      def _forward_danmaku(danmaku):
+        nick = (
+          f"观众{danmaku.user_hash[:4]}"
+          if danmaku.user_hash
+          else "观众"
+        )
+        comment = Comment(
+          user_id=danmaku.user_hash or "anonymous",
+          nickname=nick,
+          content=danmaku.content,
+        )
+        broadcaster.broadcast(comment)
+      player.on_danmaku(_forward_danmaku)
+
+    # 自动停止回调（视频播完时更新全局状态，所有客户端通过定时器感知）
+    def _on_global_auto_stop():
+      _mjpeg_state["running"] = False
+      _shared_state["running"] = False
+    studio.on_stop(_on_global_auto_stop)
+
+    _global_callbacks_registered["value"] = True
 
   print(f"VLM 直播间 GUI")
   if runtime.get("player"):
@@ -204,6 +327,8 @@ def main():
     print(f"  视频: 未指定（请在 GUI 中选择）")
   print(f"  人设: {args.persona}  模型: {args.model}")
   print(f"  地址: {host}:{args.port}")
+
+  app.on_startup(_install_win_exception_filter)
 
   @ui.page("/monitor")
   def monitor_page():
@@ -224,13 +349,9 @@ def main():
     terminal_state = {"active_response_id": None}
     danmaku_entries: list[ui.element] = []
     callback_refs = {
-      "response_fn": None,
-      "chunk_fn": None,
-      "pre_fn": None,
-      "danmaku_fn": None,
-      "stop_fn": None,
-      "bound_player": None,
-      "bound_studio": None,
+      "bc_response_fn": None,
+      "bc_chunk_fn": None,
+      "bc_pre_fn": None,
     }
 
     DANMAKU_HEIGHT = "height: calc(55vh - 120px)"
@@ -305,21 +426,27 @@ def main():
           return
         start_btn.disable()
         _mjpeg_state["running"] = True
+        _shared_state["running"] = True
+        _ensure_global_callbacks()
         _register_callbacks()
-        await _current_studio().start()
+        if studio.is_paused:
+          await studio.resume()
+        else:
+          await studio.start()
         stop_btn.enable()
 
       async def on_stop():
-        if not _current_studio().is_running:
+        studio = runtime.get("studio")
+        if not studio or not studio.is_running:
           stop_btn.disable()
           start_btn.enable()
           return
         stop_btn.disable()
         _mjpeg_state["running"] = False
+        _shared_state["running"] = False
         _cleanup_callbacks()
-        await _current_studio().stop()
+        await studio.pause()
         start_btn.enable()
-        progress.set_value(0)
 
       start_btn = ui.button("开始", on_click=on_start).props(
         "dense icon=play_arrow color=green"
@@ -334,6 +461,49 @@ def main():
       ui.link("监控面板", "/monitor", new_tab=True).classes(
         "text-sm text-blue-600 no-underline hover:underline"
       )
+
+      _speech = runtime.get("speech")
+      if _speech:
+        def _toggle_speech(e):
+          _s = runtime.get("speech")
+          if _s:
+            _s.enabled = not _s.enabled
+            state = "开启" if _s.enabled else "关闭"
+            ui.notify(f"语音广播已{state}", type="info")
+            print(f"[语音广播] 手动切换: {state}")
+
+        ui.switch("语音广播", value=_speech.enabled, on_change=_toggle_speech).props(
+          "dense color=orange"
+        ).classes("text-sm")
+
+      ui.space()
+
+      async def _on_shutdown():
+        studio = runtime.get("studio")
+        if studio and (studio.is_running or studio.is_paused):
+          _mjpeg_state["running"] = False
+          try:
+            await asyncio.wait_for(studio.stop(), timeout=8.0)
+          except (asyncio.TimeoutError, Exception):
+            pass
+        print("[系统] 用户请求退出，正在关闭...")
+        await asyncio.sleep(0.3)
+        app.shutdown()
+        await asyncio.sleep(0.5)
+        os._exit(0)
+
+      def _confirm_shutdown():
+        with ui.dialog() as dlg, ui.card().classes("p-4"):
+          ui.label("确认退出？").classes("text-base font-bold")
+          ui.label("将停止直播并关闭服务器进程").classes("text-sm text-gray-500")
+          with ui.row().classes("w-full justify-end gap-2 mt-2"):
+            ui.button("取消", on_click=dlg.close).props("flat")
+            ui.button("退出", on_click=_on_shutdown).props("color=red")
+        dlg.open()
+
+      ui.button("退出", on_click=_confirm_shutdown).props(
+        "dense icon=power_settings_new color=grey-8"
+      ).classes("ml-2")
 
       progress = ui.linear_progress(value=0, show_value=False).classes("flex-1")
       _init_player = runtime.get("player")
@@ -401,12 +571,14 @@ def main():
         stop_btn.disable()
         _mjpeg_state["running"] = False
         _mjpeg_state["jpeg_bytes"] = b""
+        _shared_state["running"] = False
+        _shared_state["version"] += 1
 
         old_studio = runtime.get("studio")
         try:
           _cleanup_callbacks()
           if old_studio:
-            if old_studio.is_running:
+            if old_studio.is_running or old_studio.is_paused:
               await old_studio.stop()
 
             # 切换源视为"重启新会话"：清理运行期状态，避免记忆串场
@@ -416,7 +588,6 @@ def main():
             old_studio._last_collect_time = None
             old_studio._last_reply_time = None
             old_studio._last_prompt = None
-            old_studio._prev_scene_description = None
             old_studio._pending_comment_count = 0
             old_studio._current_frame_b64 = None
             old_studio._last_used_timing = None
@@ -427,6 +598,7 @@ def main():
 
           _clear_ui_state()
 
+          _global_callbacks_registered["value"] = False
           new_runtime = _build_runtime(normalized_video, normalized_danmaku)
           runtime.update(new_runtime)
 
@@ -463,10 +635,13 @@ def main():
     # ── 中间区域：视频画面 + 弹幕侧栏 ──
     with ui.row().classes("w-full gap-0 px-2").style("height: 55vh"):
 
-      # 左侧：视频画面（MJPEG 流，浏览器原生支持无闪烁连续帧）
+      # 左侧：视频画面（MJPEG 流，浏览器原生支持；onerror 自动重连；
+      # 不支持 MJPEG 的设备自动回退到 /video-frame 单帧轮询）
       with ui.column().classes("h-full p-1 overflow-hidden").style("flex: 3"):
         ui.html(
-          '<img src="/video-stream" '
+          '<img id="mjpeg-video" src="/video-stream" '
+          'onerror="var s=this;if(!s._poll){setTimeout(function(){'
+          "s.src='/video-stream?_='+Date.now();},2000);}\" "
           'style="width:100%;height:100%;object-fit:contain;background:#111;">',
           sanitize=False,
         ).classes("w-full h-full")
@@ -516,7 +691,7 @@ def main():
     # ── 辅助函数 ──
 
     def _add_danmaku(nickname: str, content: str, priority: bool = False):
-      """添加弹幕条目到侧栏"""
+      """添加弹幕条目到侧栏（不触发滚动，由调用方批量滚动）"""
       while len(danmaku_entries) >= 200:
         old = danmaku_entries.pop(0)
         old.delete()
@@ -531,7 +706,6 @@ def main():
             "text-sm text-gray-700"
           )
         danmaku_entries.append(lbl)
-      danmaku_scroll.scroll_to(percent=1.0)
 
     def _add_console_block(
       text: str,
@@ -560,163 +734,141 @@ def main():
 
       streamed_ids.clear()
       terminal_state["active_response_id"] = None
+      _pending_chunk["data"] = None
+      _pending_danmaku_list.clear()
 
     # ── 回调函数 ──
 
-    def on_danmaku(danmaku):
-      """视频弹幕到达 → 广播给所有客户端"""
-      nick = (
-        f"观众{danmaku.user_hash[:4]}"
-        if danmaku.user_hash
-        else "观众"
-      )
-      comment = Comment(
-        user_id=danmaku.user_hash or "anonymous",
-        nickname=nick,
-        content=danmaku.content,
-      )
-      broadcaster.broadcast(comment)
+    # ── broadcaster 回调（通过 safe_invoke 跨客户端安全更新 UI）──
 
-    def on_pre_response(old_comments, new_comments):
-      """生成回复前 → 控制台显示弹幕列表"""
-      lines = ["--- 回复弹幕 ---"]
-      for c in old_comments:
-        tag = "[优先]" if c.priority else "[旧]"
-        lines.append(f"{tag} {c.nickname}: {c.content}")
-      for c in new_comments:
-        tag = "[优先]" if c.priority else "[新]"
-        lines.append(f"{tag} {c.nickname}: {c.content}")
-      lines.append("-" * 16)
-      _add_console_block(
-        "\n".join(lines),
-        "text-sm text-yellow-400 font-mono whitespace-pre-wrap",
-      )
+    def _on_bc_pre_response(old_comments, new_comments):
+      def _update():
+        lines = ["--- 回复弹幕 ---"]
+        for c in old_comments:
+          tag = "[优先]" if c.priority else "[旧]"
+          text = c.format_for_llm() if c.event_type != EventType.DANMAKU else c.content
+          lines.append(f"{tag} {c.nickname}: {text}")
+        for c in new_comments:
+          tag = "[优先]" if c.priority else "[新]"
+          text = c.format_for_llm() if c.event_type != EventType.DANMAKU else c.content
+          lines.append(f"{tag} {c.nickname}: {text}")
+        lines.append("-" * 16)
+        _add_console_block(
+          "\n".join(lines),
+          "text-sm text-yellow-400 font-mono whitespace-pre-wrap",
+        )
+      if page_client.has_socket_connection:
+        page_client.safe_invoke(_update)
 
-    def on_chunk(chunk: ResponseChunk):
-      """流式回复 → 控制台逐字显示"""
-      # 同步输出到终端，便于无界面排障与远程观察
-      active_id = terminal_state["active_response_id"]
-      if chunk.response_id != active_id:
-        if active_id is not None:
-          print()
-        terminal_state["active_response_id"] = chunk.response_id
-        print("[主播] ", end="", flush=True)
-      if chunk.chunk:
-        print(chunk.chunk, end="", flush=True)
-      if chunk.done:
-        print()
-        terminal_state["active_response_id"] = None
+    _pending_chunk = {"data": None}
 
-      if chunk.response_id not in streaming_labels:
-        with console_column:
-          lbl = ui.label(chunk.accumulated).classes(
-            "text-sm text-green-400 font-mono whitespace-pre-wrap"
-          )
-        streaming_labels[chunk.response_id] = lbl
-        console_scroll.scroll_to(percent=1.0)
-      else:
-        lbl = streaming_labels[chunk.response_id]
-        lbl.set_text(chunk.accumulated)
-        console_scroll.scroll_to(percent=1.0)
-
-      if chunk.done:
-        lbl = streaming_labels.pop(chunk.response_id, None)
-        if lbl is not None:
-          lbl.classes(
-            replace="text-sm text-gray-200 font-mono whitespace-pre-wrap"
-          )
-        streamed_ids.append(chunk.response_id)
-
-    def on_response(response):
-      """完整回复回调（非流式兜底）"""
-      if response.id in streamed_ids:
+    def _flush_pending_chunk():
+      """将缓冲的流式片段刷新到 UI（节流，减少 WebSocket 消息量）"""
+      chunk = _pending_chunk.get("data")
+      if chunk is None:
         return
-      print(f"[主播] {response.content}")
-      _add_console_block(
-        response.content,
-        "text-sm text-gray-200 font-mono whitespace-pre-wrap",
-      )
+      _pending_chunk["data"] = None
+      def _update():
+        if chunk.response_id not in streaming_labels:
+          with console_column:
+            lbl = ui.label(chunk.accumulated).classes(
+              "text-sm text-green-400 font-mono whitespace-pre-wrap"
+            )
+          streaming_labels[chunk.response_id] = lbl
+        else:
+          lbl = streaming_labels[chunk.response_id]
+          lbl.set_text(chunk.accumulated)
+        console_scroll.scroll_to(percent=1.0)
+
+        if chunk.done:
+          lbl = streaming_labels.pop(chunk.response_id, None)
+          if lbl is not None:
+            lbl.classes(
+              replace="text-sm text-gray-200 font-mono whitespace-pre-wrap"
+            )
+          streamed_ids.append(chunk.response_id)
+
+      if page_client.has_socket_connection:
+        page_client.safe_invoke(_update)
+
+    def _on_bc_chunk(chunk: ResponseChunk):
+      _pending_chunk["data"] = chunk
+      if chunk.done or chunk.response_id not in streaming_labels:
+        _flush_pending_chunk()
+
+    def _on_bc_response(response):
+      def _update():
+        if response.id in streamed_ids:
+          return
+        _add_console_block(
+          response.content,
+          "text-sm text-gray-200 font-mono whitespace-pre-wrap",
+        )
+      if page_client.has_socket_connection:
+        page_client.safe_invoke(_update)
 
     # ── 回调注册 / 清理 ──
 
     def _register_callbacks():
+      """注册当前客户端的 broadcaster 回调"""
       _cleanup_callbacks()
-      current_player = _current_player()
-      current_studio = _current_studio()
+      callback_refs["bc_pre_fn"] = _on_bc_pre_response
+      callback_refs["bc_chunk_fn"] = _on_bc_chunk
+      callback_refs["bc_response_fn"] = _on_bc_response
 
-      callback_refs["danmaku_fn"] = on_danmaku
-      callback_refs["pre_fn"] = on_pre_response
-      callback_refs["chunk_fn"] = on_chunk
-      callback_refs["response_fn"] = on_response
-      callback_refs["bound_player"] = current_player
-      callback_refs["bound_studio"] = current_studio
-
-      def on_auto_stop():
-        """视频播完由 studio 回调触发（从 asyncio 后台 task 调用，无 UI slot）"""
-        _mjpeg_state["running"] = False
-        _cleanup_callbacks()
-
-        def _update_ui():
-          stop_btn.disable()
-          start_btn.enable()
-          progress.set_value(1.0)
-          total = current_player.duration
-          time_label.set_text(f"{total:.1f} / {total:.1f}s (完毕)")
-
-        if page_client.has_socket_connection:
-          page_client.safe_invoke(_update_ui)
-
-      callback_refs["stop_fn"] = on_auto_stop
-
-      current_player.on_danmaku(on_danmaku)
-      current_studio.on_pre_response(on_pre_response)
-      current_studio.on_response_chunk(on_chunk)
-      current_studio.on_response(on_response)
-      current_studio.on_stop(on_auto_stop)
+      resp_broadcaster.register_pre_response(_on_bc_pre_response)
+      resp_broadcaster.register_chunk(_on_bc_chunk)
+      resp_broadcaster.register_response(_on_bc_response)
 
     def _cleanup_callbacks():
-      bound_player = callback_refs.get("bound_player")
-      bound_studio = callback_refs.get("bound_studio")
+      """清理当前客户端的 broadcaster 回调"""
+      fn = callback_refs.get("bc_pre_fn")
+      if fn:
+        resp_broadcaster.unregister_pre_response(fn)
+      callback_refs["bc_pre_fn"] = None
 
-      fn = callback_refs.get("danmaku_fn")
-      if fn and bound_player and fn in bound_player._on_danmaku_callbacks:
-        bound_player._on_danmaku_callbacks.remove(fn)
-      callback_refs["danmaku_fn"] = None
+      fn = callback_refs.get("bc_chunk_fn")
+      if fn:
+        resp_broadcaster.unregister_chunk(fn)
+      callback_refs["bc_chunk_fn"] = None
 
-      fn = callback_refs.get("pre_fn")
-      if fn and bound_studio and fn in bound_studio._pre_response_callbacks:
-        bound_studio._pre_response_callbacks.remove(fn)
-      callback_refs["pre_fn"] = None
+      fn = callback_refs.get("bc_response_fn")
+      if fn:
+        resp_broadcaster.unregister_response(fn)
+      callback_refs["bc_response_fn"] = None
 
-      fn = callback_refs.get("chunk_fn")
-      if fn and bound_studio:
-        bound_studio.remove_chunk_callback(fn)
-      callback_refs["chunk_fn"] = None
-
-      fn = callback_refs.get("response_fn")
-      if fn and bound_studio:
-        bound_studio.remove_callback(fn)
-      callback_refs["response_fn"] = None
-
-      fn = callback_refs.get("stop_fn")
-      if fn and bound_studio:
-        bound_studio.remove_stop_callback(fn)
-      callback_refs["stop_fn"] = None
-
-      callback_refs["bound_player"] = None
-      callback_refs["bound_studio"] = None
       streaming_labels.clear()
 
     page_client = context.client
 
-    def _on_broadcast(comment: Comment):
-      """broadcaster 回调 → 本客户端弹幕侧栏显示"""
+    _pending_danmaku_list: list[Comment] = []
+
+    def _flush_pending_danmakus():
+      """将缓冲的弹幕批量刷新到 UI（减少 WebSocket 消息和 DOM 操作）"""
+      if not _pending_danmaku_list:
+        return
+      batch = list(_pending_danmaku_list)
+      _pending_danmaku_list.clear()
       def _update():
-        _add_danmaku(comment.nickname, comment.content, priority=comment.priority)
+        for c in batch:
+          _add_danmaku(c.nickname, c.content, priority=c.priority)
+        danmaku_scroll.scroll_to(percent=1.0)
       if page_client.has_socket_connection:
         page_client.safe_invoke(_update)
 
+    def _on_broadcast(comment: Comment):
+      """broadcaster 回调 → 缓冲弹幕，由定时器批量刷新到 UI"""
+      _pending_danmaku_list.append(comment)
+
     broadcaster.register(_on_broadcast)
+
+    # 如果 studio 已在运行（后续连接的客户端），自动注册 broadcaster 回调并同步按钮
+    _auto_studio = runtime.get("studio")
+    if _auto_studio and _auto_studio.is_running:
+      _ensure_global_callbacks()
+      _register_callbacks()
+      start_btn.disable()
+      stop_btn.enable()
 
     def _on_disconnect():
       _cleanup_callbacks()
@@ -726,10 +878,39 @@ def main():
 
     # ── 进度条定时器 ──
 
+    _local_sync = {"version": _shared_state["version"], "was_running": None}
+
     def update_progress():
       player = runtime.get("player")
       studio = runtime.get("studio")
-      if not player or not studio or not studio.is_running:
+      is_running = bool(studio and studio.is_running)
+
+      # 检测换源（全局 version 变化）→ 刷新本客户端 UI
+      if _local_sync["version"] != _shared_state["version"]:
+        _local_sync["version"] = _shared_state["version"]
+        video_input.value = runtime.get("video_path") or ""
+        danmaku_input.value = runtime.get("danmaku_path") or ""
+        progress.set_value(0)
+        _clear_ui_state()
+        if player:
+          time_label.set_text(f"0.0 / {player.duration:.1f}s")
+        else:
+          time_label.set_text("未加载视频")
+
+      # 检测运行状态变化 → 同步按钮 + 确保回调已注册
+      if _local_sync["was_running"] != is_running:
+        _local_sync["was_running"] = is_running
+        if is_running:
+          if not callback_refs.get("bc_chunk_fn"):
+            _ensure_global_callbacks()
+            _register_callbacks()
+          start_btn.disable()
+          stop_btn.enable()
+        else:
+          start_btn.enable() if studio else start_btn.disable()
+          stop_btn.disable()
+
+      if not player or not is_running:
         return
       current = player.current_sec
       total = player.duration
@@ -740,6 +921,24 @@ def main():
         time_label.set_text(f"{total:.1f} / {total:.1f}s (完毕)")
 
     ui.timer(0.5, update_progress)
+    ui.timer(0.1, _flush_pending_chunk)
+    ui.timer(0.2, _flush_pending_danmakus)
+
+    # MJPEG 回退检测：8 秒后若仍是占位帧，自动切换到单帧轮询
+    async def _mjpeg_fallback_check():
+      ui.run_javascript(
+        '(function(){'
+        'var img=document.getElementById("mjpeg-video");'
+        'if(!img||img._poll)return;'
+        'if(img.naturalWidth>1)return;'
+        'img._poll=true;'
+        'setInterval(function(){'
+        'img.src="/video-frame?_="+Date.now();'
+        '},100);'
+        'console.log("[video] MJPEG fallback: polling /video-frame");'
+        '})();'
+      )
+    ui.timer(8.0, _mjpeg_fallback_check, once=True)
 
   ui.run(port=args.port, host=host, reload=False, title="VLM 直播间")
 

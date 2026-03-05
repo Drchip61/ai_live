@@ -30,7 +30,7 @@ def run(
   persona: str = "karin",
   port: int = 8080,
   enable_global_memory: bool = False,
-  enable_topic_manager: bool = False,
+  enable_topic_manager: bool = True,
   speech_url: Optional[str] = None,
 ) -> None:
   """
@@ -58,21 +58,22 @@ def run(
   collector = StateCollector(studio)
   broadcaster = CommentBroadcaster()
 
+  speech_bc = None
   if speech_url:
-    speech = SpeechBroadcaster(api_url=speech_url, model_type=model_type)
-    speech.attach(studio)
+    speech_bc = SpeechBroadcaster(api_url=speech_url, model_type=model_type)
+    speech_bc.attach(studio)
 
   @ui.page("/")
   def index():
-    _build_page(studio, collector, broadcaster, default_tab="monitor")
+    _build_page(studio, collector, broadcaster, speech_bc, default_tab="monitor")
 
   @ui.page("/monitor")
   def monitor():
-    _build_page(studio, collector, broadcaster, default_tab="monitor")
+    _build_page(studio, collector, broadcaster, speech_bc, default_tab="monitor")
 
   @ui.page("/chat")
   def chat():
-    _build_page(studio, collector, broadcaster, default_tab="chat")
+    _build_page(studio, collector, broadcaster, speech_bc, default_tab="chat")
 
   ui.run(
     title="调试控制台 — mio-streaming-demo",
@@ -85,6 +86,7 @@ def _build_page(
   studio: StreamingStudio,
   collector: StateCollector,
   broadcaster: CommentBroadcaster,
+  speech_bc: Optional[SpeechBroadcaster] = None,
   default_tab: str = "monitor",
 ) -> None:
   """
@@ -94,11 +96,24 @@ def _build_page(
     studio: 直播间实例
     collector: 状态收集器
     broadcaster: 弹幕广播器
+    speech_bc: 语音广播器（None 则不显示开关）
     default_tab: 默认激活的标签页
   """
   # 顶部菜单栏
   with ui.header().classes("bg-blue-800 text-white items-center"):
     ui.label("mio-streaming-demo 调试控制台").classes("text-lg font-bold")
+
+    if speech_bc:
+      def _toggle_speech(e):
+        speech_bc.enabled = not speech_bc.enabled
+        state = "开启" if speech_bc.enabled else "关闭"
+        ui.notify(f"语音广播已{state}", type="info")
+        print(f"[语音广播] 手动切换: {state}")
+
+      ui.switch("语音广播", value=speech_bc.enabled, on_change=_toggle_speech).props(
+        "dense color=orange"
+      ).classes("text-white text-sm")
+
     ui.space()
     with ui.tabs().classes("text-white") as tabs:
       monitor_tab = ui.tab("monitor", label="监控面板")
