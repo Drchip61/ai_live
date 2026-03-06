@@ -155,6 +155,7 @@ class LLMWrapper:
     rag_queries: Optional[list[str]] = None,
     topic_context: Optional[str] = None,
     situation: Optional[str] = None,
+    viewer_ids: Optional[list[str]] = None,
   ) -> str:
     """
     构建额外上下文
@@ -190,17 +191,19 @@ class LLMWrapper:
     # ④ 检索记忆区（Chroma 向量查询是同步的，放到线程池避免阻塞事件循环）
     if self._memory is not None:
       if rag_queries:
-        active_text, rag_text = await asyncio.to_thread(
-          self._memory.retrieve, rag_queries,
+        active_text, rag_text, viewer_text = await asyncio.to_thread(
+          self._memory.retrieve, rag_queries, viewer_ids,
         )
       else:
-        active_text, rag_text = await asyncio.to_thread(
+        active_text, rag_text, viewer_text = await asyncio.to_thread(
           self._memory.retrieve_active_only,
         )
       if active_text:
         parts.append(active_text)
       if rag_text:
         parts.append(rag_text)
+      if viewer_text:
+        parts.append(viewer_text)
 
     # 活跃梗注入
     if self._meme_manager is not None:
@@ -229,6 +232,7 @@ class LLMWrapper:
     rag_queries: Optional[list[str]] = None,
     topic_context: Optional[str] = None,
     situation: Optional[str] = None,
+    viewer_ids: Optional[list[str]] = None,
   ) -> str:
     """同步版 _build_extra_context，供 chat() 等同步入口使用"""
     parts: list[str] = []
@@ -248,13 +252,15 @@ class LLMWrapper:
         parts.append(up_text)
     if self._memory is not None:
       if rag_queries:
-        active_text, rag_text = self._memory.retrieve(rag_queries)
+        active_text, rag_text, viewer_text = self._memory.retrieve(rag_queries, viewer_ids)
       else:
-        active_text, rag_text = self._memory.retrieve_active_only()
+        active_text, rag_text, viewer_text = self._memory.retrieve_active_only()
       if active_text:
         parts.append(active_text)
       if rag_text:
         parts.append(rag_text)
+      if viewer_text:
+        parts.append(viewer_text)
     if self._meme_manager is not None:
       meme_text = self._meme_manager.to_prompt()
       if meme_text:
@@ -360,6 +366,7 @@ class LLMWrapper:
     images: Optional[list[str]] = None,
     memory_input: Optional[str] = None,
     situation: Optional[str] = None,
+    comments: Optional[list] = None,
   ) -> str:
     """
     异步聊天
@@ -373,14 +380,23 @@ class LLMWrapper:
       memory_input: 用于记忆记录的清洗输入（VLM 模式下传入场景理解+弹幕摘要，
         替代原始 prompt；不传时使用 user_input）
       situation: 情境标签（react_comment/react_scene/proactive），用于风格参考库检索
+      comments: 原始 Comment 列表（用于观众记忆记录和检索）
 
     Returns:
       模型回复
     """
+    viewer_ids = None
+    if comments:
+      viewer_ids = list({
+        c.user_id for c in comments
+        if getattr(c, "user_id", None)
+      })
+
     normalized_input = self._normalize_untrusted_text(user_input)
     guarded_input = self._guard_user_input(user_input)
     extra_context = await self._build_extra_context(
       normalized_input, rag_queries, topic_context, situation,
+      viewer_ids=viewer_ids,
     )
     self._last_extra_context = extra_context
     response = await self.pipeline.ainvoke(
@@ -402,6 +418,13 @@ class LLMWrapper:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+        if comments:
+          viewer_task = asyncio.create_task(
+            self._memory.record_viewer_memories(comments, ai_response_summary=response[:100])
+          )
+          self._background_tasks.add(viewer_task)
+          viewer_task.add_done_callback(self._background_tasks.discard)
+
       stance_task = asyncio.create_task(
         self._memory.extract_stances(response, context=mem_text if has_danmaku else "")
       )
@@ -419,6 +442,7 @@ class LLMWrapper:
     images: Optional[list[str]] = None,
     memory_input: Optional[str] = None,
     situation: Optional[str] = None,
+    comments: Optional[list] = None,
   ) -> AsyncIterator[str]:
     """
     异步流式聊天，逐 token yield
@@ -434,14 +458,23 @@ class LLMWrapper:
       memory_input: 用于记忆记录的清洗输入（VLM 模式下传入场景理解+弹幕摘要，
         替代原始 prompt；不传时使用 user_input）
       situation: 情境标签（react_comment/react_scene/proactive），用于风格参考库检索
+      comments: 原始 Comment 列表（用于观众记忆记录和检索）
 
     Yields:
       模型输出的文本片段
     """
+    viewer_ids = None
+    if comments:
+      viewer_ids = list({
+        c.user_id for c in comments
+        if getattr(c, "user_id", None)
+      })
+
     normalized_input = self._normalize_untrusted_text(user_input)
     guarded_input = self._guard_user_input(user_input)
     extra_context = await self._build_extra_context(
       normalized_input, rag_queries, topic_context, situation,
+      viewer_ids=viewer_ids,
     )
     self._last_extra_context = extra_context
     full_response = ""
@@ -485,6 +518,13 @@ class LLMWrapper:
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
+
+            if comments:
+              viewer_task = asyncio.create_task(
+                self._memory.record_viewer_memories(comments, ai_response_summary=full_response[:100])
+              )
+              self._background_tasks.add(viewer_task)
+              viewer_task.add_done_callback(self._background_tasks.discard)
 
           stance_task = asyncio.create_task(
             self._memory.extract_stances(

@@ -2,6 +2,7 @@
 跨层记忆检索器
 支持两种检索模式：per-layer quota / weighted merge
 支持多查询（逐条弹幕 RAG + 去重）
+支持按 viewer_ids 召回观众历史记忆
 """
 
 from typing import Optional, Union
@@ -9,13 +10,18 @@ from typing import Optional, Union
 from langchain_core.runnables import RunnableLambda
 
 from .config import RetrievalConfig
-from .formatter import format_active_memories, format_retrieved_memories
+from .formatter import (
+  format_active_memories,
+  format_retrieved_memories,
+  format_viewer_memories,
+)
 from .layers.base import MemoryEntry
 from .layers.active import ActiveLayer
 from .layers.temporary import TemporaryLayer
 from .layers.summary import SummaryLayer
 from .layers.static import StaticLayer
 from .layers.stance import StanceLayer
+from .layers.viewer import ViewerMemoryLayer
 
 
 def _dedup_entries(entries: list[MemoryEntry], top_k: int) -> list[MemoryEntry]:
@@ -60,6 +66,7 @@ class MemoryRetriever:
     summary: SummaryLayer,
     static: StaticLayer,
     stance: Optional[StanceLayer] = None,
+    viewer: Optional[ViewerMemoryLayer] = None,
     config: Optional[RetrievalConfig] = None,
   ):
     """
@@ -71,6 +78,7 @@ class MemoryRetriever:
       summary: summary 层实例
       static: static 层实例
       stance: stance 层实例（立场记忆，可选）
+      viewer: viewer 层实例（观众记忆，可选）
       config: 检索配置
     """
     self._active = active
@@ -78,21 +86,28 @@ class MemoryRetriever:
     self._summary = summary
     self._static = static
     self._stance = stance
+    self._viewer = viewer
     self._config = config or RetrievalConfig()
     self.session_id: Optional[str] = None
 
-  def retrieve(self, query: Union[str, list[str]]) -> tuple[str, str]:
+  def retrieve(
+    self,
+    query: Union[str, list[str]],
+    viewer_ids: Optional[list[str]] = None,
+  ) -> tuple[str, str, str]:
     """
     执行跨层检索
 
     Args:
       query: 查询文本，支持单条字符串或多条列表。
         多条时逐条检索 + 按 ID 去重，语义匹配更精准。
+      viewer_ids: 当前弹幕中出现的观众 user_id 列表（用于召回观众历史记忆）
 
     Returns:
-      (active_text, rag_text) 元组：
+      (active_text, rag_text, viewer_text) 三元组：
         active_text: active 层格式化文本（时序直接注入）
-        rag_text: RAG 层格式化文本（temporary + summary + static）
+        rag_text: RAG 层格式化文本（temporary + summary + static + stance）
+        viewer_text: 观众记忆格式化文本（按 user_id 召回的历史发言）
     """
     # 标准化为列表
     queries = [query] if isinstance(query, str) else query
@@ -131,14 +146,23 @@ class MemoryRetriever:
       response_max_length=self._config.response_display_max_length,
     )
 
-    return active_text, rag_text
+    # 观众记忆检索
+    viewer_text = ""
+    if self._viewer is not None and viewer_ids:
+      viewer_entries = self._retrieve_viewer(queries, viewer_ids)
+      viewer_text = format_viewer_memories(
+        viewer_entries,
+        current_session_id=self.session_id,
+      )
 
-  def retrieve_active_only(self) -> tuple[str, str]:
+    return active_text, rag_text, viewer_text
+
+  def retrieve_active_only(self) -> tuple[str, str, str]:
     """
     仅返回 Active 层记忆，不触发任何 RAG 检索和 significance 衰减
 
     Returns:
-      (active_text, "") 元组
+      (active_text, "", "") 三元组
     """
     active_memories = self._active.get_all()
     active_entries = [
@@ -156,7 +180,7 @@ class MemoryRetriever:
       include_response=self._config.include_response_in_active,
       response_max_length=self._config.response_display_max_length,
     )
-    return active_text, ""
+    return active_text, "", ""
 
   def _retrieve_quota(self, queries: list[str]) -> list[MemoryEntry]:
     """
@@ -255,6 +279,45 @@ class MemoryRetriever:
     weighted.sort(key=lambda x: x[1], reverse=True)
     return [entry for entry, _ in weighted[:total_quota]]
 
+  def _retrieve_viewer(
+    self,
+    queries: list[str],
+    viewer_ids: list[str],
+  ) -> list[MemoryEntry]:
+    """
+    按 viewer_ids 召回观众历史记忆
+
+    对每个 user_id，用弹幕内容做语义检索（带 user_id 过滤），
+    多个用户的结果合并后按 ID 去重。
+    所有用户检索完成后统一执行一次全局衰减。
+
+    Args:
+      queries: 查询文本列表（弹幕内容）
+      viewer_ids: 观众 user_id 列表
+    """
+    if self._viewer is None:
+      return []
+
+    all_entries: list[MemoryEntry] = []
+    seen_ids: set[str] = set()
+    query_text = " ".join(queries) if queries else ""
+
+    for uid in viewer_ids:
+      entries = self._viewer.retrieve_by_user(
+        user_id=uid,
+        query=query_text,
+        top_k=3,
+      )
+      for entry in entries:
+        if entry.id not in seen_ids:
+          seen_ids.add(entry.id)
+          all_entries.append(entry)
+
+    if seen_ids:
+      self._viewer.decay_unretrieved(seen_ids)
+
+    return all_entries
+
   def as_runnable(self) -> RunnableLambda:
     """
     获取 LCEL 兼容的 Runnable
@@ -270,7 +333,7 @@ class MemoryRetriever:
       if not query:
         return {**data, "active_memories": "", "retrieved_memories": ""}
 
-      active_text, rag_text = self.retrieve(query)
+      active_text, rag_text, _viewer_text = self.retrieve(query)
       return {
         **data,
         "active_memories": active_text,

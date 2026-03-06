@@ -50,12 +50,17 @@ class SummaryLayer:
     """
     添加一条总结记忆
 
+    容量满时自动淘汰 significance 最低的记忆。
+
     Args:
       content: 总结内容
 
     Returns:
       记忆 ID
     """
+    if self._store.count() >= self._config.max_capacity:
+      self._evict_least_significant()
+
     memory_id = str(uuid.uuid4())
 
     metadata = {
@@ -122,11 +127,27 @@ class SummaryLayer:
 
     return entries
 
+  def _evict_least_significant(self) -> None:
+    """淘汰 significance 最低的一条记忆"""
+    all_data = self._store.get_all()
+    if not all_data["ids"]:
+      return
+    min_idx = min(
+      range(len(all_data["ids"])),
+      key=lambda i: all_data["metadatas"][i].get("significance", 1.0),
+    )
+    evicted_id = all_data["ids"][min_idx]
+    content = all_data["documents"][min_idx] if all_data["documents"] else ""
+    self._archive.archive_batch([{
+      "id": evicted_id,
+      "content": content,
+      "layer": "summary",
+      "metadata": all_data["metadatas"][min_idx],
+    }])
+    self._store.delete([evicted_id])
+
   def _decay_unretrieved(self, retrieved_ids: set[str]) -> None:
     """衰减未取用记忆的 significance"""
-    if self._store.count() < self._config.min_count_before_decay:
-      return
-
     all_data = self._store.get_all()
 
     for i, doc_id in enumerate(all_data["ids"]):

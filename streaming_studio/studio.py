@@ -6,6 +6,8 @@
 
 import asyncio
 import base64
+import logging
+import logging.handlers
 import random
 import re
 import sys
@@ -66,6 +68,42 @@ _ENGAGING_QUESTION_HINT = (
 _BEIJING_TZ = timezone(timedelta(hours=8))
 
 
+def _setup_chat_logger() -> logging.Logger:
+  """创建独立的对话记录 logger，写入 logs/chat.log"""
+  log_dir = Path(__file__).resolve().parent.parent / "logs"
+  log_dir.mkdir(exist_ok=True)
+
+  logger = logging.getLogger("chat_log")
+  logger.setLevel(logging.INFO)
+  logger.propagate = False
+
+  if not logger.handlers:
+    handler = logging.handlers.RotatingFileHandler(
+      log_dir / "chat.log",
+      maxBytes=10 * 1024 * 1024,
+      backupCount=5,
+      encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+
+  return logger
+
+
+def _format_comment_for_log(c) -> str:
+  """将弹幕/事件格式化为日志行"""
+  if c.event_type == EventType.GUARD_BUY:
+    level = GUARD_LEVEL_NAMES.get(c.guard_level, "舰长")
+    return f"[上舰] {c.nickname} 开通了{level}"
+  if c.event_type == EventType.SUPER_CHAT:
+    return f"[SC ¥{c.price}] {c.nickname}: {c.content}"
+  if c.event_type == EventType.GIFT:
+    return f"[礼物] {c.nickname} 赠送 {c.gift_name} x{c.gift_num}"
+  if c.event_type == EventType.ENTRY:
+    return f"[入场] {c.nickname}"
+  return f"[弹幕] {c.nickname}: {c.content}"
+
+
 def _beijing_time_tag() -> str:
   now = datetime.now(_BEIJING_TZ)
   return f"[当前北京时间] {now.strftime('%Y-%m-%d %A %H:%M')}\n"
@@ -104,7 +142,7 @@ class StreamingStudio:
     model_type: ModelType = ModelType.OPENAI,
     model_name: Optional[str] = None,
     enable_memory: bool = False,
-    enable_global_memory: bool = False,
+    enable_global_memory: bool = True,
     enable_topic_manager: bool = True,
     enable_reply_decider: bool = True,
     enable_comment_clusterer: bool = False,
@@ -125,7 +163,7 @@ class StreamingStudio:
       model_type: 模型类型 (OPENAI/ANTHROPIC/LOCAL_QWEN)
       model_name: 模型名称（可选，使用默认值）
       enable_memory: 是否启用分层记忆系统
-      enable_global_memory: 是否开启全局记忆（持久化到文件），需同时开启 enable_memory
+      enable_global_memory: 是否持久化记忆到文件（默认开启），需同时开启 enable_memory
       enable_topic_manager: 是否启用话题管理器（追踪、分类和管理直播话题）
       enable_comment_clusterer: 是否启用弹幕聚类器（合并语义相似弹幕，节省 token）
       video_player: 视频播放器（传入后启用 VLM 模式，自动从视频提取帧和弹幕）
@@ -338,6 +376,9 @@ class StreamingStudio:
 
     # 会员名册（舰长/提督/总督）
     self._guard_roster = GuardRoster()
+
+    # 对话记录日志（弹幕+回复 → logs/chat.log）
+    self._chat_log = _setup_chat_logger()
 
     # 上次已使用的动态等待时间（避免同一个建议重复使用）
     self._last_used_timing: Optional[tuple[float, float]] = None
@@ -761,6 +802,7 @@ class StreamingStudio:
             self._last_round_skipped = True
             self._was_silent = True
             self._timer.finish(skipped=True)
+            self._chat_log.info("[跳过] 无弹幕，未触发主动发言")
             continue
 
         # 弹幕聚类
@@ -784,6 +826,7 @@ class StreamingStudio:
           preview = " | ".join(all_texts)
           if not decision.should_reply:
             print(f"[决策器] 跳过({decision.phase}): {decision.reason} ← {preview[:40]}")
+            self._chat_log.info("[跳过] 决策器(%s): %s", decision.phase, decision.reason)
             self._last_round_skipped = True
             timings = self._timer.finish(skipped=True)
             print(timings.format_summary())
@@ -791,6 +834,10 @@ class StreamingStudio:
           response_style = decision.response_style
           sentences = decision.sentences
           print(f"[决策器] 回复({decision.phase},u={decision.urgency:.0f},s={response_style},n={sentences}): {decision.reason} ← {preview[:40]}")
+
+        # 记录本轮弹幕到日志
+        for c in (old_comments + new_comments):
+          self._chat_log.info("%s", _format_comment_for_log(c))
 
         # 触发生成回复前回调
         for cb in self._pre_response_callbacks:
@@ -823,6 +870,7 @@ class StreamingStudio:
           )
 
         if response:
+          self._chat_log.info("[主播] %s", response.content)
           await asyncio.to_thread(self.database.save_response, response)
           await self._response_queue.put(response)
 
@@ -832,7 +880,10 @@ class StreamingStudio:
             except Exception as e:
               print(f"回调执行错误: {e}")
 
-          self._last_collect_time = reply_started_at
+          # 只在实际回复弹幕时才推进弹幕分界线；
+          # 主动发言（无弹幕）不推进，避免后续到达的弹幕被误判为"旧弹幕"
+          if old_comments or new_comments:
+            self._last_collect_time = reply_started_at
           self._last_reply_time = datetime.now()
           self._last_round_skipped = False
           self._was_silent = not (old_comments or new_comments)
@@ -873,6 +924,7 @@ class StreamingStudio:
         break
       except Exception as e:
         print(f"主循环错误: {e}")
+        self._chat_log.info("[错误] 主循环异常: %s", e)
         await asyncio.sleep(1)
 
   async def _check_proactive_speak(self) -> bool:
@@ -1478,9 +1530,11 @@ class StreamingStudio:
         rag_queries=rag_queries, topic_context=topic_context,
         images=reply_images, memory_input=memory_input,
         situation=situation,
+        comments=all_comments,
       )
     except Exception as e:
       print(f"LLM 调用错误: {e}")
+      self._chat_log.info("[错误] LLM 调用失败: %s", e)
       return None
 
     self._timer.mark("后处理")
@@ -1605,6 +1659,7 @@ class StreamingStudio:
         rag_queries=rag_queries, topic_context=topic_context,
         images=reply_images, memory_input=memory_input,
         situation=situation,
+        comments=all_comments,
       ):
         if not first_token_received:
           self._timer.mark("LLM流式输出")
@@ -1640,6 +1695,7 @@ class StreamingStudio:
 
     except Exception as e:
       print(f"LLM 流式调用错误: {e}")
+      self._chat_log.info("[错误] LLM 流式调用失败: %s", e)
       # 通知回调流式传输已中断
       error_chunk = ResponseChunk(
         response_id=response_id,

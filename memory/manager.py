@@ -1,6 +1,6 @@
 """
 记忆系统编排器
-统一管理五层初始化、记忆读写、定时汇总和清理
+统一管理六层初始化、记忆读写、定时汇总和清理
 """
 
 import asyncio
@@ -22,6 +22,7 @@ from .layers.temporary import TemporaryLayer
 from .layers.summary import SummaryLayer
 from .layers.static import StaticLayer
 from .layers.stance import StanceLayer
+from .layers.viewer import ViewerMemoryLayer
 from .layers.user_profile import UserProfileLayer
 from .layers.character_profile import CharacterProfileLayer
 from .retriever import MemoryRetriever
@@ -29,6 +30,7 @@ from .prompts import (
   INTERACTION_SUMMARY_PROMPT,
   PERIODIC_SUMMARY_PROMPT,
   STANCE_EXTRACTION_PROMPT,
+  VIEWER_SUMMARY_PROMPT,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,8 +41,9 @@ class MemoryManager:
   记忆系统顶层编排器
 
   职责：
-  - 初始化五层记忆（active / temporary / summary / static / stance）+ 共享 embeddings
-  - 编排记忆读取（检索）和写入（交互记录 + 立场提取）
+  - 初始化六层记忆（active / temporary / summary / static / stance / viewer）
+    + 可选层（user_profile / character_profile）+ 共享 embeddings
+  - 编排记忆读取（检索）和写入（交互记录 + 立场提取 + 观众记忆）
   - 管理定时汇总和清理任务的生命周期
   """
 
@@ -50,12 +53,20 @@ class MemoryManager:
     r"我更.{1,6}一些|我不太.{1,6}|我挺.{1,6}的|我是.{1,6}派|我站"
   )
 
+  _NOISE_DANMAKU = re.compile(
+    r"^(哈+|6+|[?？!！.。~～、，]+|草+|好家伙|啊+|呜+|嗯+|ww+|hhh+|lol+|emm+|"
+    r"nb|tql|xswl|yyds|awsl|dd|ddd+|[Oo0]+|233+|7777*|牛|强|绝|顶|冲|来了|"
+    r"你好|hello|hi|嗨|晚上好|早上好|下午好|主播好|"
+    r"[👍👏🔥❤️💯😂🤣😭😍]+)$",
+    re.IGNORECASE,
+  )
+
   def __init__(
     self,
     persona: str,
     config: MemoryConfig = MemoryConfig(),
     summary_model: Optional[BaseChatModel] = None,
-    enable_global_memory: bool = False,
+    enable_global_memory: bool = True,
   ):
     """
     初始化记忆管理器
@@ -64,7 +75,7 @@ class MemoryManager:
       persona: 角色名称
       config: 记忆系统总配置
       summary_model: 用于总结的小 LLM（默认使用 ModelProvider.remote_small()）
-      enable_global_memory: 是否开启全局记忆（持久化到文件）
+      enable_global_memory: 是否持久化记忆到文件（默认开启）
     """
     self._enable_global_memory = enable_global_memory
 
@@ -139,6 +150,15 @@ class MemoryManager:
         config.stance,
       )
 
+    # 观众记忆层（默认启用）
+    self._viewer: Optional[ViewerMemoryLayer] = None
+    if config.viewer.enabled:
+      self._viewer = ViewerMemoryLayer(
+        VectorStore("viewer", embedding_config, embeddings=embeddings),
+        self._archive,
+        config.viewer,
+      )
+
     # 当前会话 ID（由 studio 在 start() 时设置）
     self._session_id: Optional[str] = None
 
@@ -149,6 +169,7 @@ class MemoryManager:
       self._summary_layer,
       self._static,
       stance=self._stance,
+      viewer=self._viewer,
       config=config.retrieval,
     )
 
@@ -189,6 +210,8 @@ class MemoryManager:
     self._summary_layer.session_id = value
     if self._stance is not None:
       self._stance.session_id = value
+    if self._viewer is not None:
+      self._viewer.session_id = value
     self._retriever.session_id = value
 
   def _get_summary_model(self) -> BaseChatModel:
@@ -203,20 +226,25 @@ class MemoryManager:
       self._summary_model = ModelProvider.remote_small()
     return self._summary_model
 
-  def retrieve(self, query: Union[str, list[str]]) -> tuple[str, str]:
+  def retrieve(
+    self,
+    query: Union[str, list[str]],
+    viewer_ids: Optional[list[str]] = None,
+  ) -> tuple[str, str, str]:
     """
     执行跨层记忆检索
 
     Args:
       query: 查询文本，支持单条字符串或多条列表。
         多条时逐条检索 + 按 ID 去重，语义匹配更精准。
+      viewer_ids: 当前弹幕中出现的观众 user_id 列表
 
     Returns:
-      (active_text, rag_text) 元组
+      (active_text, rag_text, viewer_text) 三元组
     """
-    return self._retriever.retrieve(query)
+    return self._retriever.retrieve(query, viewer_ids=viewer_ids)
 
-  def retrieve_active_only(self) -> tuple[str, str]:
+  def retrieve_active_only(self) -> tuple[str, str, str]:
     """
     仅返回 Active 层记忆（不触发任何 RAG 检索和 significance 衰减）
 
@@ -224,7 +252,7 @@ class MemoryManager:
     但不应触发 Temporary/Summary/Static/Stance 的 RAG 检索和衰减。
 
     Returns:
-      (active_text, "") 元组，rag_text 始终为空
+      (active_text, "", "") 三元组
     """
     return self._retriever.retrieve_active_only()
 
@@ -261,6 +289,80 @@ class MemoryManager:
         logger.debug("记录交互记忆: %s", summary_text)
     except Exception as e:
       logger.error("记录交互记忆失败: %s", e)
+
+  async def record_viewer_memories(
+    self,
+    comments: list,
+    ai_response_summary: str = "",
+  ) -> None:
+    """
+    用小 LLM 筛选+改写观众弹幕，写入 Viewer 层
+
+    流程：正则预过滤（省 token）→ 小 LLM 批量判断哪些值得记 + 改写为陈述性记忆 → 写入。
+
+    Args:
+      comments: Comment 对象列表（须含 user_id, nickname, content）
+      ai_response_summary: AI 回复摘要（可选，为 LLM 提供上下文）
+    """
+    if self._viewer is None:
+      return
+
+    candidates = []
+    for comment in comments:
+      content = getattr(comment, "content", "").strip()
+      if len(content) <= 2:
+        continue
+      if self._NOISE_DANMAKU.match(content):
+        continue
+      user_id = getattr(comment, "user_id", "")
+      nickname = getattr(comment, "nickname", "未知")
+      if not user_id:
+        continue
+      candidates.append({
+        "user_id": user_id,
+        "nickname": nickname,
+        "content": content,
+      })
+
+    if not candidates:
+      return
+
+    comments_text = "\n".join(
+      f"{i}. {c['nickname']}：{c['content']}"
+      for i, c in enumerate(candidates)
+    )
+    prompt = VIEWER_SUMMARY_PROMPT.format(
+      comments=comments_text,
+      ai_response=ai_response_summary[:200] if ai_response_summary else "（无）",
+    )
+
+    try:
+      model = self._get_summary_model()
+      result = await model.ainvoke(prompt)
+      text = result.content if hasattr(result, "content") else str(result)
+      text = text.strip()
+
+      json_match = re.search(r"\[.*\]", text, re.DOTALL)
+      if not json_match:
+        logger.debug("观众记忆 LLM 返回无有效 JSON: %s", text[:100])
+        return
+      memories = json.loads(json_match.group())
+
+      for item in memories:
+        idx = item.get("index")
+        memory_text = item.get("memory", "").strip()
+        if not isinstance(idx, int) or not memory_text or idx < 0 or idx >= len(candidates):
+          continue
+        src = candidates[idx]
+        self._viewer.add(
+          user_id=src["user_id"],
+          nickname=src["nickname"],
+          content=memory_text,
+          ai_response_summary=ai_response_summary[:100],
+        )
+        logger.debug("观众记忆 +新增: [%s] %s", src["nickname"], memory_text[:60])
+    except Exception as e:
+      logger.error("观众记忆 LLM 筛选失败: %s", e)
 
   async def extract_stances(
     self,
@@ -401,7 +503,7 @@ class MemoryManager:
     if clear_summary:
       self._summary_layer.clear()
     self._recent_interactions.clear()
-    # 注意：stance / user_profile / character_profile 不随运行期清空（它们是跨会话的长期记忆）
+    # 注意：stance / viewer / user_profile / character_profile 不随运行期清空（它们是跨会话的长期记忆）
     logger.info("已清空运行期记忆状态 (clear_summary=%s)", clear_summary)
 
   def debug_state(self) -> dict:
@@ -502,6 +604,9 @@ class MemoryManager:
       result["stance_count"] = self._stance.count()
       result["stance_active_count"] = self._stance.count_active()
       result["stance_memories"] = stance_memories
+
+    if self._viewer is not None:
+      result["viewer"] = self._viewer.debug_state()
 
     if self._user_profile is not None:
       result["user_profile"] = self._user_profile.debug_state()

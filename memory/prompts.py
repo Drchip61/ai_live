@@ -18,3 +18,7 @@ PERIODIC_SUMMARY_PROMPT = _loader.load("memory/periodic_summary.txt")
 # 立场提取 prompt
 # 变量：{input}, {response}
 STANCE_EXTRACTION_PROMPT = _loader.load("memory/stance_extraction.txt")
+
+# 观众记忆筛选+改写 prompt
+# 变量：{comments}, {ai_response}
+VIEWER_SUMMARY_PROMPT = _loader.load("memory/viewer_summary.txt")

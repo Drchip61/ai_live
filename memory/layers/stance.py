@@ -63,6 +63,9 @@ class StanceLayer:
     Returns:
       新立场的 ID
     """
+    if self._store.count() >= self._config.max_capacity:
+      self._evict_least_significant()
+
     previous_id = self._detect_and_supersede(content, topic)
 
     memory_id = str(uuid.uuid4())
@@ -193,11 +196,30 @@ class StanceLayer:
 
     return entries
 
+  def _evict_least_significant(self) -> None:
+    """淘汰 significance 最低的一条立场（优先淘汰已被取代的旧立场）"""
+    all_data = self._store.get_all()
+    if not all_data["ids"]:
+      return
+    min_idx = min(
+      range(len(all_data["ids"])),
+      key=lambda i: (
+        0 if all_data["metadatas"][i].get("superseded_by") else 1,
+        all_data["metadatas"][i].get("significance", 1.0),
+      ),
+    )
+    evicted_id = all_data["ids"][min_idx]
+    content = all_data["documents"][min_idx] if all_data["documents"] else ""
+    self._archive.archive_batch([{
+      "id": evicted_id,
+      "content": content,
+      "layer": "stance",
+      "metadata": all_data["metadatas"][min_idx],
+    }])
+    self._store.delete([evicted_id])
+
   def _decay_and_cleanup(self, retrieved_boosts: dict[str, float]) -> None:
     """写回 boosted significance，衰减未取用立场，删除低于阈值的"""
-    if self._store.count() < self._config.min_count_before_decay:
-      return
-
     all_data = self._store.get_all()
     ids_to_delete = []
     memories_to_archive = []

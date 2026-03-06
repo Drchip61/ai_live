@@ -169,3 +169,49 @@ def format_retrieved_memories(
     parts.append("\n".join(lines))
 
   return "\n\n".join(parts)
+
+
+def format_viewer_memories(
+  entries: list[MemoryEntry],
+  now: Optional[datetime] = None,
+  current_session_id: Optional[str] = None,
+) -> str:
+  """
+  格式化观众记忆（按用户分组）
+
+  格式示例：
+    【观众记忆】
+    - 关于观众「花凛」：该观众家里有一只叫小橘的猫（来自之前的直播）
+    - 关于观众「小明」：该观众玩了主播推荐的游戏，反馈很喜欢（3分25秒之前）
+
+  Args:
+    entries: viewer 层检索结果（内容为 LLM 改写后的陈述性记忆）
+    now: 当前时间（默认 datetime.now()）
+    current_session_id: 当前会话 ID（用于跨会话标注）
+
+  Returns:
+    格式化文本，无结果时返回空字符串
+  """
+  if not entries:
+    return ""
+
+  if now is None:
+    now = datetime.now()
+
+  lines = ["【观众记忆】"]
+  for entry in entries:
+    nickname = entry.metadata.get("nickname", "未知") if entry.metadata else "未知"
+    rel_time = _relative_time(entry.timestamp, now)
+
+    cross_session_prefix = ""
+    if current_session_id is not None and entry.metadata:
+      mem_session = entry.metadata.get("session_id")
+      if mem_session is not None and mem_session != current_session_id:
+        cross_session_prefix = "【来自之前的直播】"
+
+    lines.append(
+      f"- {cross_session_prefix}关于观众「{nickname}」："
+      f"{entry.content}（{rel_time}）"
+    )
+
+  return "\n".join(lines)

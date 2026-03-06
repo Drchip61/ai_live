@@ -50,6 +50,8 @@ class TemporaryLayer:
     """
     添加一条记忆（通常来自 active 层溢出）
 
+    容量满时自动淘汰 significance 最低的记忆。
+
     Args:
       content: 记忆内容
       timestamp: 原始时间戳（来自 active 层），默认为当前时间
@@ -58,6 +60,9 @@ class TemporaryLayer:
     Returns:
       记忆 ID
     """
+    if self._store.count() >= self._config.max_capacity:
+      self._evict_least_significant()
+
     memory_id = str(uuid.uuid4())
     ts = timestamp or datetime.now()
 
@@ -132,6 +137,25 @@ class TemporaryLayer:
 
     return entries
 
+  def _evict_least_significant(self) -> None:
+    """淘汰 significance 最低的一条记忆"""
+    all_data = self._store.get_all()
+    if not all_data["ids"]:
+      return
+    min_idx = min(
+      range(len(all_data["ids"])),
+      key=lambda i: all_data["metadatas"][i].get("significance", 1.0),
+    )
+    evicted_id = all_data["ids"][min_idx]
+    content = all_data["documents"][min_idx] if all_data["documents"] else ""
+    self._archive.archive_batch([{
+      "id": evicted_id,
+      "content": content,
+      "layer": "temporary",
+      "metadata": all_data["metadatas"][min_idx],
+    }])
+    self._store.delete([evicted_id])
+
   def _decay_and_cleanup(self, retrieved_boosts: dict[str, float]) -> None:
     """
     写回被取用记忆的 boosted significance，衰减未取用记忆，删除低于阈值的记忆
@@ -139,9 +163,6 @@ class TemporaryLayer:
     Args:
       retrieved_boosts: 被取用的记忆 ID → boost 后的 significance 值
     """
-    if self._store.count() < self._config.min_count_before_decay:
-      return
-
     all_data = self._store.get_all()
     ids_to_delete = []
     memories_to_archive = []

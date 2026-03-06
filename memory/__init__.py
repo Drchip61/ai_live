@@ -1,6 +1,6 @@
 """
 memory 模块
-分层记忆系统：active / temporary / summary / static / stance
+分层记忆系统：active / temporary / summary / static / stance / viewer
 
 提供基于 RAG 的长期记忆能力，独立于 langchain_wrapper 和 streaming_studio，
 桥接两层之间的记忆读写需求。
@@ -12,6 +12,7 @@ from .config import (
   TemporaryConfig,
   SummaryConfig,
   StanceConfig,
+  ViewerConfig,
   RetrievalConfig,
   EmbeddingConfig,
   STATIC_CATEGORY_PREFIXES,
@@ -30,10 +31,15 @@ from .layers import (
   SummaryLayer,
   StaticLayer,
   StanceLayer,
+  ViewerMemoryLayer,
 )
 from .retriever import MemoryRetriever
 from .manager import MemoryManager
-from .formatter import format_active_memories, format_retrieved_memories
+from .formatter import (
+  format_active_memories,
+  format_retrieved_memories,
+  format_viewer_memories,
+)
 
 __all__ = [
   # 配置
@@ -42,6 +48,7 @@ __all__ = [
   "TemporaryConfig",
   "SummaryConfig",
   "StanceConfig",
+  "ViewerConfig",
   "RetrievalConfig",
   "EmbeddingConfig",
   "STATIC_CATEGORY_PREFIXES",
@@ -59,6 +66,7 @@ __all__ = [
   "SummaryLayer",
   "StaticLayer",
   "StanceLayer",
+  "ViewerMemoryLayer",
   # 检索
   "MemoryRetriever",
   # 管理器
@@ -66,4 +74,5 @@ __all__ = [
   # 格式化
   "format_active_memories",
   "format_retrieved_memories",
+  "format_viewer_memories",
 ]

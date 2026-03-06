@@ -18,7 +18,7 @@ class TemporaryConfig:
   """temporary 层配置"""
   significance_threshold: float = 0.100  # 低于此值的记忆将被删除
   decay_coefficient: float = 0.9       # 未被取用时 significance 乘以此系数衰减
-  min_count_before_decay: int = 500    # 记忆数不足此值时跳过衰减（向量检索在千条量级无性能影响）
+  max_capacity: int = 500             # 容量上限，满时淘汰 significance 最低的记忆
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ class SummaryConfig:
   decay_coefficient: float = 0.980       # 未被取用时 significance 乘以此系数衰减
   cleanup_interval_seconds: float = 600.0  # 清理触发间隔（秒），默认 10 分钟
   cleanup_ratio: float = 0.01           # 每次清理删除的比例（向下取整），默认 1%
-  min_count_before_decay: int = 200    # 记忆数不足此值时跳过衰减
+  max_capacity: int = 300              # 容量上限，满时淘汰 significance 最低的记忆
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,16 @@ class StanceConfig:
   significance_threshold: float = 0.050  # 低于此值的立场将被删除
   decay_coefficient: float = 0.995       # 极慢衰减，立场近乎永久保持
   conflict_search_threshold: float = 1.2  # Chroma distance 阈值，低于此视为同话题
-  min_count_before_decay: int = 100    # 立场数不足此值时跳过衰减
+  max_capacity: int = 200              # 容量上限，满时淘汰 significance 最低的立场
+
+
+@dataclass(frozen=True)
+class ViewerConfig:
+  """观众记忆层配置"""
+  enabled: bool = True
+  max_capacity: int = 500             # 全局容量上限，满时淘汰 significance 最低的记忆
+  decay_coefficient: float = 0.99995  # 极慢衰减，仅用于区分淘汰优先级
+  max_per_user: int = 10              # 单个用户最多保留的记忆条数
 
 
 @dataclass(frozen=True)
@@ -113,5 +122,6 @@ class MemoryConfig:
   retrieval: RetrievalConfig = RetrievalConfig()
   embedding: EmbeddingConfig = EmbeddingConfig()
   stance: StanceConfig = StanceConfig()
+  viewer: ViewerConfig = ViewerConfig()
   user_profile: UserProfileConfig = UserProfileConfig()
   character_profile: CharacterProfileConfig = CharacterProfileConfig()

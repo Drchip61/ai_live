@@ -8,6 +8,7 @@ from .temporary import TemporaryLayer
 from .summary import SummaryLayer
 from .static import StaticLayer
 from .stance import StanceLayer
+from .viewer import ViewerMemoryLayer
 
 __all__ = [
   "MemoryEntry",
@@ -16,4 +17,5 @@ __all__ = [
   "SummaryLayer",
   "StaticLayer",
   "StanceLayer",
+  "ViewerMemoryLayer",
 ]

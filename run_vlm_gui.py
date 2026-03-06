@@ -83,8 +83,8 @@ def parse_args():
     help="禁用分层记忆系统",
   )
   parser.add_argument(
-    "--global-memory", action="store_true", default=False,
-    help="开启全局记忆",
+    "--ephemeral-memory", action="store_true", default=False,
+    help="使用临时记忆（进程退出后丢弃，默认持久化到文件）",
   )
   parser.add_argument(
     "--port", type=int, default=8081,
@@ -175,7 +175,7 @@ def main():
       model_type=model_type,
       model_name=args.model_name,
       enable_memory=not args.no_memory,
-      enable_global_memory=args.global_memory,
+      enable_global_memory=not args.ephemeral_memory,
       video_player=player,
     )
     studio.enable_streaming = True

@@ -81,8 +81,8 @@ def parse_args():
     help="禁用分层记忆系统（默认启用）",
   )
   parser.add_argument(
-    "--global-memory", action="store_true", default=False,
-    help="开启全局记忆（持久化到文件，默认关闭）",
+    "--ephemeral-memory", action="store_true", default=False,
+    help="使用临时记忆（进程退出后丢弃，默认持久化到文件）",
   )
   parser.add_argument(
     "--speech-url", default=None,
@@ -111,7 +111,7 @@ async def main():
   print(f"  速度: {args.speed}x")
   print(f"  帧间隔: {args.frame_interval}s")
   print(f"  记忆: {'启用' if not args.no_memory else '禁用'}")
-  print(f"  全局记忆: {'启用' if args.global_memory else '禁用'}")
+  print(f"  记忆持久化: {'关闭（临时模式）' if args.ephemeral_memory else '启用'}")
   print(f"  语音服务: {args.speech_url or '未启用'}")
   print("=" * 60)
   print()
@@ -133,7 +133,7 @@ async def main():
     model_type=model_type,
     model_name=args.model_name,
     enable_memory=enable_memory,
-    enable_global_memory=args.global_memory,
+    enable_global_memory=not args.ephemeral_memory,
     video_player=player,
   )
   studio.enable_streaming = True

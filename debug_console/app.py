@@ -29,7 +29,7 @@ def run(
   model_name: Optional[str] = None,
   persona: str = "karin",
   port: int = 8080,
-  enable_global_memory: bool = False,
+  enable_global_memory: bool = True,
   enable_topic_manager: bool = True,
   speech_url: Optional[str] = None,
 ) -> None:
@@ -41,7 +41,7 @@ def run(
     model_name: 模型名称
     persona: 角色名称
     port: 监听端口
-    enable_global_memory: 是否开启全局记忆（持久化到文件）
+    enable_global_memory: 是否持久化记忆到文件（默认开启）
     enable_topic_manager: 是否启用话题管理器
     speech_url: 语音/动作服务 URL（None 则不启用）
   """
