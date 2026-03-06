@@ -143,6 +143,9 @@ class StreamingStudio:
     self.config = config or StudioConfig()
 
     # 初始化 LLMWrapper
+    # 情绪检测器（奶凶专用，避免每轮重复实例化）
+    self._emotion_detector = None
+
     if llm_wrapper is not None:
       # 高级用户：直接使用传入的 wrapper
       self.llm_wrapper = llm_wrapper
@@ -172,10 +175,12 @@ class StreamingStudio:
       response_checker = None
       if persona.lower() == "naixiong":
         from emotion import EmotionMachine, AffectionBank
+        from emotion.detector import EmotionTriggerDetector
         from validation import ResponseChecker
         emotion_machine = EmotionMachine()
         affection_bank = AffectionBank()
         response_checker = ResponseChecker()
+        self._emotion_detector = EmotionTriggerDetector()
 
       # 梗管理器：任何角色只要有 seed_memes.json 即启用
       persona_dir = Path(__file__).resolve().parent.parent / "personas" / persona
@@ -321,7 +326,8 @@ class StreamingStudio:
     self._last_cluster_result: Optional[ClusterResult] = None
 
     # 已回复特殊事件 ID（防止礼物/SC/上舰等事件被反复提升导致循环感谢）
-    self._responded_event_ids: set[str] = set()
+    # 使用 deque 保持插入顺序，满时自动丢弃最旧的
+    self._responded_event_ids: deque[str] = deque(maxlen=500)
 
     # Prompt 模板
     _loader = PromptLoader()
@@ -407,7 +413,14 @@ class StreamingStudio:
     Args:
       comment: 弹幕对象
     """
-    self.database.save_comment(comment)
+    # 异步写库（fire-and-forget），避免阻塞事件循环
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+      task = loop.create_task(asyncio.to_thread(self.database.save_comment, comment))
+      self._background_tasks.add(task)
+      task.add_done_callback(self._background_tasks.discard)
+    else:
+      self.database.save_comment(comment)
     self._comment_buffer.append(comment)
     self._pending_comment_count += 1
     self._comment_timestamps.append(datetime.now())
@@ -554,7 +567,7 @@ class StreamingStudio:
 
     # 生成会话 ID
     self._session_id = str(uuid.uuid4())
-    self.database.create_session(self._session_id, self._persona)
+    await asyncio.to_thread(self.database.create_session, self._session_id, self._persona)
 
     # 将 session_id 传递给记忆管理器
     memory_mgr = self.llm_wrapper.memory_manager
@@ -637,7 +650,7 @@ class StreamingStudio:
 
     # 结束会话记录
     if self._session_id:
-      self.database.end_session(self._session_id)
+      await asyncio.to_thread(self.database.end_session, self._session_id)
       self._session_id = None
 
     # 并行停止话题管理器和记忆系统（各自内部已有超时保护）
@@ -810,7 +823,7 @@ class StreamingStudio:
           )
 
         if response:
-          self.database.save_response(response)
+          await asyncio.to_thread(self.database.save_response, response)
           await self._response_queue.put(response)
 
           for callback in self._response_callbacks:
@@ -827,9 +840,7 @@ class StreamingStudio:
           # 标记本轮回复中包含的特殊事件，防止下一轮被重复提升
           for c in (old_comments + new_comments):
             if c.event_type != EventType.DANMAKU or c.priority:
-              self._responded_event_ids.add(c.id)
-          if len(self._responded_event_ids) > 500:
-            self._responded_event_ids = set(list(self._responded_event_ids)[-200:])
+              self._responded_event_ids.append(c.id)
 
           # 奶凶系统：好感度更新
           self._update_affection_from_comments(new_comments, response.content)
@@ -943,12 +954,10 @@ class StreamingStudio:
   def _detect_emotion_from_comments(self, comments: list[Comment]) -> None:
     """分析弹幕，触发情绪状态转换（奶凶专用）"""
     emotion = self.llm_wrapper._emotion
-    if emotion is None:
+    if emotion is None or self._emotion_detector is None:
       return
-    from emotion.detector import EmotionTriggerDetector
-    detector = EmotionTriggerDetector()
     for c in comments:
-      result = detector.detect(c.content, emotion.mood)
+      result = self._emotion_detector.detect(c.content, emotion.mood)
       if result:
         target_mood, trigger = result
         emotion.transition(target_mood, trigger)

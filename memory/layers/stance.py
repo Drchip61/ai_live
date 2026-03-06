@@ -84,6 +84,19 @@ class StanceLayer:
       content=content,
       metadata=metadata,
     )
+
+    # 回填旧立场的 superseded_by 为实际新 ID（_detect_and_supersede 中暂存为 "pending"）
+    if previous_id:
+      try:
+        all_data = self._store.get_all()
+        for i, doc_id in enumerate(all_data["ids"]):
+          if doc_id == previous_id:
+            old_meta = all_data["metadatas"][i]
+            self._store.update_metadata(previous_id, {**old_meta, "superseded_by": memory_id})
+            break
+      except Exception as e:
+        logger.warning("回填 superseded_by 失败: %s", e)
+
     logger.info("立场记忆 +新增: [%s] %s", topic, content[:60])
     return memory_id
 
@@ -144,7 +157,8 @@ class StanceLayer:
       return []
 
     results = self._store.search(query=query, top_k=top_k * 2)
-    retrieved_ids = set()
+    # retrieved_boosts: 被取用立场的 ID → boost 后的 significance
+    retrieved_boosts: dict[str, float] = {}
     entries = []
 
     for doc, score in results:
@@ -152,10 +166,9 @@ class StanceLayer:
         continue
 
       mem_id = doc.metadata.get("id", "")
-      retrieved_ids.add(mem_id)
-
       old_sig = doc.metadata.get("significance", STANCE_INITIAL_SIGNIFICANCE)
       new_sig = boost_significance(old_sig)
+      retrieved_boosts[mem_id] = new_sig
 
       ts_str = doc.metadata.get("timestamp", "")
       try:
@@ -176,12 +189,12 @@ class StanceLayer:
       if len(entries) >= top_k:
         break
 
-    self._decay_and_cleanup(retrieved_ids)
+    self._decay_and_cleanup(retrieved_boosts)
 
     return entries
 
-  def _decay_and_cleanup(self, retrieved_ids: set[str]) -> None:
-    """衰减未取用立场的 significance，删除低于阈值的"""
+  def _decay_and_cleanup(self, retrieved_boosts: dict[str, float]) -> None:
+    """写回 boosted significance，衰减未取用立场，删除低于阈值的"""
     if self._store.count() < self._config.min_count_before_decay:
       return
 
@@ -192,10 +205,9 @@ class StanceLayer:
     for i, doc_id in enumerate(all_data["ids"]):
       meta = all_data["metadatas"][i]
 
-      if doc_id in retrieved_ids:
-        old_sig = meta.get("significance", STANCE_INITIAL_SIGNIFICANCE)
-        new_sig = boost_significance(old_sig)
-        self._store.update_metadata(doc_id, {**meta, "significance": new_sig})
+      if doc_id in retrieved_boosts:
+        # 被取用的：写回 retrieve() 中已计算好的 boosted significance
+        self._store.update_metadata(doc_id, {**meta, "significance": retrieved_boosts[doc_id]})
       else:
         old_sig = meta.get("significance", STANCE_INITIAL_SIGNIFICANCE)
         new_sig = decay_significance(old_sig, self._config.decay_coefficient)

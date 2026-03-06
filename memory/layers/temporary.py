@@ -101,15 +101,15 @@ class TemporaryLayer:
 
     # 检索
     results = self._store.search(query=query, top_k=top_k)
-    retrieved_ids = set()
+    # retrieved_boosts: 被取用记忆的 ID → boost 后的 significance
+    retrieved_boosts: dict[str, float] = {}
     entries = []
 
     for doc, score in results:
       mem_id = doc.metadata.get("id", "")
-      retrieved_ids.add(mem_id)
-
       old_sig = doc.metadata.get("significance", initial_significance())
       new_sig = boost_significance(old_sig)
+      retrieved_boosts[mem_id] = new_sig
 
       ts_str = doc.metadata.get("timestamp", "")
       try:
@@ -128,16 +128,16 @@ class TemporaryLayer:
       ))
 
     # 衰减所有未取用的记忆 + 清理低 significance 记忆
-    self._decay_and_cleanup(retrieved_ids)
+    self._decay_and_cleanup(retrieved_boosts)
 
     return entries
 
-  def _decay_and_cleanup(self, retrieved_ids: set[str]) -> None:
+  def _decay_and_cleanup(self, retrieved_boosts: dict[str, float]) -> None:
     """
-    衰减未取用记忆的 significance，删除低于阈值的记忆
+    写回被取用记忆的 boosted significance，衰减未取用记忆，删除低于阈值的记忆
 
     Args:
-      retrieved_ids: 本次被取用的记忆 ID 集合
+      retrieved_boosts: 被取用的记忆 ID → boost 后的 significance 值
     """
     if self._store.count() < self._config.min_count_before_decay:
       return
@@ -147,15 +147,12 @@ class TemporaryLayer:
     memories_to_archive = []
 
     for i, doc_id in enumerate(all_data["ids"]):
-      if doc_id in retrieved_ids:
-        # 被取用的：提升（已在 retrieve 中处理逻辑，此处更新存储）
-        meta = all_data["metadatas"][i]
-        old_sig = meta.get("significance", initial_significance())
-        new_sig = boost_significance(old_sig)
-        self._store.update_metadata(doc_id, {**meta, "significance": new_sig})
+      meta = all_data["metadatas"][i]
+      if doc_id in retrieved_boosts:
+        # 被取用的：写回 retrieve() 中已计算好的 boosted significance
+        self._store.update_metadata(doc_id, {**meta, "significance": retrieved_boosts[doc_id]})
       else:
         # 未取用的：衰减
-        meta = all_data["metadatas"][i]
         old_sig = meta.get("significance", initial_significance())
         new_sig = decay_significance(old_sig, self._config.decay_coefficient)
 
