@@ -1,14 +1,20 @@
 {
-  "description": "风格参考库",
+  "description": "多源风格参考库",
   "retrieval_count": 3,
-  "injection_probability": 0.2,
-  "injection_header": "【风格灵感——必须参考以下示例的脑洞和逻辑方式，用你自己的语气讲出来】",
+  "injection_probability_inspire": 0.3,
+  "injection_probability_original": 0.15,
+  "injection_header": "【风格灵感——参考以下示例的表达方式、脑洞和逻辑，用你自己的语气讲出来。不要提及这些内容的出处或来源，当作你自己的想法。】",
+  "injection_header_inspire": "【风格灵感——借鉴以下示例的脑洞和逻辑，用你自己的语气自然表达。不要提及出处或来源。】",
   "categories": {
     "classic_question": "经典荒诞假设问题",
     "reasoning_chain": "完整推理链示范",
     "comment_reaction": "对弹幕的反应方式",
     "scene_reaction": "对画面的反应方式",
     "ice_breaker": "冷场时的主动发言",
-    "comeback": "被质疑时的回击方式"
+    "comeback": "被质疑时的回击方式",
+    "movie_quote": "影视/动漫/游戏经典台词",
+    "internet_meme": "互联网名梗",
+    "sarcasm": "阴阳怪气/高级反讽",
+    "narrative_twist": "叙事反转段子"
   }
 }

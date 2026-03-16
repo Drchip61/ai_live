@@ -7,6 +7,9 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
+from collections import deque
+from typing import Callable
+
 from ..config import TemporaryConfig
 from ..significance import (
   boost_significance,
@@ -32,6 +35,7 @@ class TemporaryLayer:
     vector_store: VectorStore,
     archive: MemoryArchive,
     config: Optional[TemporaryConfig] = None,
+    on_fade: Optional[Callable[[str], None]] = None,
   ):
     """
     初始化 temporary 层
@@ -40,10 +44,12 @@ class TemporaryLayer:
       vector_store: 向量存储实例（collection: "temporary"）
       archive: 归档器实例
       config: 层配置
+      on_fade: 记忆即将遗忘时的回调，参数为记忆内容文本
     """
     self._store = vector_store
     self._archive = archive
     self._config = config or TemporaryConfig()
+    self._on_fade = on_fade
     self.session_id: Optional[str] = None
 
   def add(self, content: str, timestamp: Optional[datetime] = None, response: str = "") -> str:
@@ -166,19 +172,19 @@ class TemporaryLayer:
     all_data = self._store.get_all()
     ids_to_delete = []
     memories_to_archive = []
+    update_ids: list[str] = []
+    update_metas: list[dict] = []
 
     for i, doc_id in enumerate(all_data["ids"]):
       meta = all_data["metadatas"][i]
       if doc_id in retrieved_boosts:
-        # 被取用的：写回 retrieve() 中已计算好的 boosted significance
-        self._store.update_metadata(doc_id, {**meta, "significance": retrieved_boosts[doc_id]})
+        update_ids.append(doc_id)
+        update_metas.append({**meta, "significance": retrieved_boosts[doc_id]})
       else:
-        # 未取用的：衰减
         old_sig = meta.get("significance", initial_significance())
         new_sig = decay_significance(old_sig, self._config.decay_coefficient)
 
         if new_sig < self._config.significance_threshold:
-          # 低于阈值，标记为待删除
           ids_to_delete.append(doc_id)
           content = all_data["documents"][i] if all_data["documents"] else ""
           memories_to_archive.append({
@@ -188,10 +194,18 @@ class TemporaryLayer:
             "metadata": meta,
           })
         else:
-          self._store.update_metadata(doc_id, {**meta, "significance": new_sig})
+          update_ids.append(doc_id)
+          update_metas.append({**meta, "significance": new_sig})
 
-    # 删除并归档
+    if update_ids:
+      self._store.update_metadata_batch(update_ids, update_metas)
+
     if ids_to_delete:
+      if self._on_fade:
+        for mem in memories_to_archive:
+          content = mem.get("content", "")
+          if content:
+            self._on_fade(content)
       self._store.delete(ids_to_delete)
       self._archive.archive_batch(memories_to_archive)
 

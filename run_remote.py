@@ -52,7 +52,7 @@ def parse_args():
 
   parser.add_argument(
     "--persona", default="karin",
-    choices=["karin", "sage", "kuro", "naixiong", "dacongming"],
+    choices=["karin", "sage", "kuro", "naixiong", "dacongming", "mio"],
     help="主播人设（默认 karin）",
   )
   parser.add_argument(

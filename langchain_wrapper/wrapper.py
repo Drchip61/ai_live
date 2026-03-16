@@ -40,6 +40,24 @@ _INJECTION_HINT_PATTERNS = [
   re.compile(r"(?i)(系统提示|提示词|忽略之前|忽略以上|越狱|注入)"),
 ]
 
+_EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\]")
+
+
+def _strip_bilingual_for_memory(text: str) -> str:
+  """剥离表情标签和日语翻译，只保留纯中文文本供记忆系统使用"""
+  parts = _EXPRESSION_TAG_RE.split(text)
+  chinese_parts = []
+  for part in parts:
+    part = part.strip()
+    if not part:
+      continue
+    sep_idx = part.find(" / ")
+    if sep_idx >= 0:
+      part = part[:sep_idx].strip()
+    if part:
+      chinese_parts.append(part)
+  return "".join(chinese_parts) if chinese_parts else text
+
 
 class LLMWrapper:
   """
@@ -109,10 +127,14 @@ class LLMWrapper:
     # 后台任务引用集合（防止被 GC 回收）
     self._background_tasks: set[asyncio.Task] = set()
 
-  def roll_style_bank(self) -> bool:
-    """预判本轮风格参考库是否触发，供 studio 调整句数"""
+  def roll_style_bank(self) -> Optional[str]:
+    """预判本轮风格参考库触发模式，供 studio 调整句数和风格。
+
+    Returns:
+      "inspire" / "original" / None（未触发）
+    """
     if self._style_bank is None:
-      return False
+      return None
     return self._style_bank.pre_roll()
 
   @property
@@ -352,7 +374,8 @@ class LLMWrapper:
 
     if self._memory is not None:
       self._memory.record_interaction_sync(
-        self._normalize_untrusted_text(memory_input or user_input), response,
+        self._normalize_untrusted_text(memory_input or user_input),
+        _strip_bilingual_for_memory(response),
       )
 
     return response
@@ -410,23 +433,24 @@ class LLMWrapper:
     if self._memory is not None:
       mem_text = self._normalize_untrusted_text(memory_input or user_input)
       has_danmaku = bool(rag_queries) and bool(memory_input)
+      clean_response = _strip_bilingual_for_memory(response)
 
       if has_danmaku:
         task = asyncio.create_task(
-          self._memory.record_interaction(mem_text, response)
+          self._memory.record_interaction(mem_text, clean_response)
         )
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
         if comments:
           viewer_task = asyncio.create_task(
-            self._memory.record_viewer_memories(comments, ai_response_summary=response[:100])
+            self._memory.record_viewer_memories(comments, ai_response_summary=clean_response[:100])
           )
           self._background_tasks.add(viewer_task)
           viewer_task.add_done_callback(self._background_tasks.discard)
 
       stance_task = asyncio.create_task(
-        self._memory.extract_stances(response, context=mem_text if has_danmaku else "")
+        self._memory.extract_stances(clean_response, context=mem_text if has_danmaku else "")
       )
       self._background_tasks.add(stance_task)
       stance_task.add_done_callback(self._background_tasks.discard)
@@ -511,24 +535,25 @@ class LLMWrapper:
         if self._memory is not None:
           mem_text = self._normalize_untrusted_text(memory_input or user_input)
           has_danmaku = bool(rag_queries) and bool(memory_input)
+          clean_response = _strip_bilingual_for_memory(full_response)
 
           if has_danmaku:
             task = asyncio.create_task(
-              self._memory.record_interaction(mem_text, full_response)
+              self._memory.record_interaction(mem_text, clean_response)
             )
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
 
             if comments:
               viewer_task = asyncio.create_task(
-                self._memory.record_viewer_memories(comments, ai_response_summary=full_response[:100])
+                self._memory.record_viewer_memories(comments, ai_response_summary=clean_response[:100])
               )
               self._background_tasks.add(viewer_task)
               viewer_task.add_done_callback(self._background_tasks.discard)
 
           stance_task = asyncio.create_task(
             self._memory.extract_stances(
-              full_response, context=mem_text if has_danmaku else "",
+              clean_response, context=mem_text if has_danmaku else "",
             )
           )
           self._background_tasks.add(stance_task)

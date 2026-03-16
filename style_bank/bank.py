@@ -55,10 +55,34 @@ class StyleBank:
       corpus_path = bank_dir / "corpus.jsonl"
 
     self._retrieval_count: int = self._meta.get("retrieval_count", 3)
-    self._injection_probability: float = self._meta.get("injection_probability", 1.0)
-    self._header: str = self._meta.get("injection_header", "【风格参考】")
     self._categories: dict[str, str] = self._meta.get("categories", {})
-    self._next_trigger: Optional[bool] = None
+
+    # 双轨概率：inspire（日语表达灵感）+ original（中文原味）
+    has_dual = (
+      "injection_probability_inspire" in self._meta
+      or "injection_probability_original" in self._meta
+    )
+    if has_dual:
+      self._prob_inspire: float = self._meta.get(
+        "injection_probability_inspire", 0.0,
+      )
+      self._prob_original: float = self._meta.get(
+        "injection_probability_original", 0.0,
+      )
+    else:
+      legacy_prob = self._meta.get("injection_probability", 0.0)
+      self._prob_inspire = 0.0
+      self._prob_original = legacy_prob
+
+    self._header_original: str = self._meta.get(
+      "injection_header", "【风格参考】",
+    )
+    self._header_inspire: str = self._meta.get(
+      "injection_header_inspire", self._header_original,
+    )
+
+    # pre_roll 缓存：None=未决定, "inspire"/"original"=触发模式
+    self._next_mode: Optional[str] = None
 
     collection_name = f"style_bank_{persona_dir.name}"
     self._store = VectorStore(
@@ -82,11 +106,14 @@ class StyleBank:
         item = json.loads(line)
         ids.append(item["id"])
         texts.append(item["text"])
-        metas.append({
+        meta = {
           "category": item.get("category", ""),
           "situation": item.get("situation", "any"),
           "score": item.get("score", 3),
-        })
+        }
+        if "source" in item:
+          meta["source"] = item["source"]
+        metas.append(meta)
 
     if not ids:
       logger.warning("StyleBank 语料为空: %s", corpus_path)
@@ -102,10 +129,20 @@ class StyleBank:
 
     logger.info("StyleBank 已加载 %d 条语料", len(ids))
 
-  def pre_roll(self) -> bool:
-    """预判本轮是否触发风格注入，缓存结果供 retrieve() 使用"""
-    self._next_trigger = random.random() <= self._injection_probability
-    return self._next_trigger
+  def pre_roll(self) -> Optional[str]:
+    """预判本轮触发模式，缓存结果供 retrieve() 使用。
+
+    Returns:
+      "inspire" / "original" / None（未触发）
+    """
+    r = random.random()
+    if r <= self._prob_inspire:
+      self._next_mode = "inspire"
+    elif r <= self._prob_inspire + self._prob_original:
+      self._next_mode = "original"
+    else:
+      self._next_mode = None
+    return self._next_mode
 
   def retrieve(
     self,
@@ -124,11 +161,9 @@ class StyleBank:
     Returns:
       格式化后的风格参考文本，无结果时返回空字符串
     """
-    triggered = self._next_trigger if self._next_trigger is not None else (
-      random.random() <= self._injection_probability
-    )
-    self._next_trigger = None
-    if not triggered:
+    mode = self._next_mode
+    self._next_mode = None
+    if mode is None:
       return ""
 
     k = top_k or self._retrieval_count
@@ -147,7 +182,8 @@ class StyleBank:
     if not results:
       return ""
 
-    lines = [self._header]
+    header = self._header_inspire if mode == "inspire" else self._header_original
+    lines = [header]
     for i, (doc, _score) in enumerate(results, 1):
       cat = doc.metadata.get("category", "")
       cat_label = self._categories.get(cat, cat)

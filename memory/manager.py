@@ -7,6 +7,8 @@ import asyncio
 import json
 import logging
 import re
+
+import json_repair
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
@@ -104,11 +106,16 @@ class MemoryManager:
       enabled=enable_global_memory,
     )
 
+    # 遗忘感知队列：记忆从 temporary 层衰减消失时推入此队列
+    from collections import deque
+    self._fading_memories: deque[str] = deque(maxlen=5)
+
     # 初始化四层
     self._temporary = TemporaryLayer(
       VectorStore("temporary", embedding_config, embeddings=embeddings),
       self._archive,
       config.temporary,
+      on_fade=lambda content: self._fading_memories.append(content),
     )
     self._active = ActiveLayer(
       config=config.active,
@@ -173,6 +180,16 @@ class MemoryManager:
       config=config.retrieval,
     )
 
+    # 所有向量层启动健康检查（HNSW 索引损坏时自动重建，数据零丢失）
+    for _layer_name, _store in [
+      ("temporary", self._temporary._store),
+      ("summary", self._summary_layer._store),
+      ("viewer", self._viewer._store if self._viewer else None),
+      ("stance", self._stance._store if self._stance else None),
+    ]:
+      if _store is not None:
+        _store.ensure_healthy()
+
     # 汇总用小 LLM
     self._summary_model = summary_model
     self._config = config
@@ -196,6 +213,12 @@ class MemoryManager:
   def embeddings(self) -> HuggingFaceEmbeddings:
     """共享的嵌入模型实例（供外部模块复用，避免重复加载）"""
     return self._embeddings
+
+  def pop_fading_memory(self) -> Optional[str]:
+    """弹出一条即将遗忘的记忆内容（用于遗忘感知触发），无则返回 None"""
+    if self._fading_memories:
+      return self._fading_memories.popleft()
+    return None
 
   @property
   def session_id(self) -> Optional[str]:
@@ -346,7 +369,10 @@ class MemoryManager:
       if not json_match:
         logger.debug("观众记忆 LLM 返回无有效 JSON: %s", text[:100])
         return
-      memories = json.loads(json_match.group())
+      memories = json_repair.loads(json_match.group())
+      if not isinstance(memories, list):
+        logger.debug("观众记忆 JSON 解析结果非 list: %s", type(memories).__name__)
+        return
 
       for item in memories:
         idx = item.get("index")

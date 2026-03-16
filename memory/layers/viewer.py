@@ -121,11 +121,15 @@ class ViewerMemoryLayer:
     )
 
     entries = []
+    boost_ids: list[str] = []
+    boost_metas: list[dict] = []
+
     for doc, score in results:
       mem_id = doc.metadata.get("id", "")
       old_sig = doc.metadata.get("significance", initial_significance())
       new_sig = boost_significance(old_sig)
-      self._store.update_metadata(mem_id, {**doc.metadata, "significance": new_sig})
+      boost_ids.append(mem_id)
+      boost_metas.append({**doc.metadata, "significance": new_sig})
 
       ts_str = doc.metadata.get("timestamp", "")
       try:
@@ -142,6 +146,9 @@ class ViewerMemoryLayer:
         score=score,
         metadata=doc.metadata,
       ))
+
+    if boost_ids:
+      self._store.update_metadata_batch(boost_ids, boost_metas)
 
     return entries
 
@@ -195,13 +202,20 @@ class ViewerMemoryLayer:
       retrieved_ids: 本轮所有被命中的记忆 ID 集合
     """
     all_data = self._store.get_all()
+    update_ids: list[str] = []
+    update_metas: list[dict] = []
+
     for i, doc_id in enumerate(all_data["ids"]):
       if doc_id in retrieved_ids:
         continue
       meta = all_data["metadatas"][i]
       old_sig = meta.get("significance", initial_significance())
       new_sig = decay_significance(old_sig, self._config.decay_coefficient)
-      self._store.update_metadata(doc_id, {**meta, "significance": new_sig})
+      update_ids.append(doc_id)
+      update_metas.append({**meta, "significance": new_sig})
+
+    if update_ids:
+      self._store.update_metadata_batch(update_ids, update_metas)
 
   def _enforce_per_user_limit(self, user_id: str) -> None:
     """确保单个用户的记忆数不超过 max_per_user，超出时淘汰最旧的"""

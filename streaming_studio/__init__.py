@@ -6,7 +6,10 @@ streaming_studio 模块
 from .models import Comment, StreamerResponse, ResponseChunk, EventType, GUARD_LEVEL_NAMES
 from .database import CommentDatabase
 from .studio import StreamingStudio
-from .config import StudioConfig, ReplyDeciderConfig, CommentClustererConfig
+from .config import StudioConfig, ReplyDeciderConfig, CommentClustererConfig, EventResponderConfig, SceneMemoryConfig, SessionConfig, SpeechQueueConfig
+from .event_responder import EventTemplateResponder
+from .scene_memory import SceneMemoryCache
+from .session import SessionManager, SessionType, FocusSession
 from .reply_decider import (
   ReplyDecider, ReplyDecision,
   CommentClusterer, CommentCluster, ClusterResult,
@@ -24,6 +27,15 @@ __all__ = [
   "StudioConfig",
   "ReplyDeciderConfig",
   "CommentClustererConfig",
+  "EventResponderConfig",
+  "SceneMemoryConfig",
+  "SessionConfig",
+  "SpeechQueueConfig",
+  "EventTemplateResponder",
+  "SceneMemoryCache",
+  "SessionManager",
+  "SessionType",
+  "FocusSession",
   "ReplyDecider",
   "ReplyDecision",
   "CommentClusterer",

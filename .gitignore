@@ -21,14 +21,24 @@ env/
 # Secrets (API keys)
 secrets/
 
-# Data files (large video/audio)
+# Data files (large video/audio, recursive)
+data/**/*.mp4
+data/**/*.mkv
+data/**/*.flv
+data/**/*.m4a
+data/**/*.webm
+data/**/*.wav
+data/**/*.xml
 data/*.mp4
 data/*.mkv
 data/*.flv
 data/*.m4a
 data/*.webm
-# 弹幕文件也不要上传，没有对应的视频文件本来就没意义
-data/*.xml
+
+# Large data files
+data/comments.db
+data/memory_store/
+data/example_videos/
 
 # Chroma DB (local vector store)
 chroma_data/

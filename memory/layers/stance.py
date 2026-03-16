@@ -223,13 +223,15 @@ class StanceLayer:
     all_data = self._store.get_all()
     ids_to_delete = []
     memories_to_archive = []
+    update_ids: list[str] = []
+    update_metas: list[dict] = []
 
     for i, doc_id in enumerate(all_data["ids"]):
       meta = all_data["metadatas"][i]
 
       if doc_id in retrieved_boosts:
-        # 被取用的：写回 retrieve() 中已计算好的 boosted significance
-        self._store.update_metadata(doc_id, {**meta, "significance": retrieved_boosts[doc_id]})
+        update_ids.append(doc_id)
+        update_metas.append({**meta, "significance": retrieved_boosts[doc_id]})
       else:
         old_sig = meta.get("significance", STANCE_INITIAL_SIGNIFICANCE)
         new_sig = decay_significance(old_sig, self._config.decay_coefficient)
@@ -244,7 +246,11 @@ class StanceLayer:
             "metadata": meta,
           })
         else:
-          self._store.update_metadata(doc_id, {**meta, "significance": new_sig})
+          update_ids.append(doc_id)
+          update_metas.append({**meta, "significance": new_sig})
+
+    if update_ids:
+      self._store.update_metadata_batch(update_ids, update_metas)
 
     if ids_to_delete:
       self._store.delete(ids_to_delete)

@@ -195,17 +195,29 @@ async def batch_classify(
     text = text.strip()
 
     mapping = json_repair.loads(text)
+    if isinstance(mapping, list):
+      if all(isinstance(item, dict) for item in mapping):
+        merged: dict = {}
+        for item in mapping:
+          merged.update(item)
+        mapping = merged
+      else:
+        logger.debug("批量分类: LLM 返回 list 而非 dict，跳过 (raw=%s)", text[:120])
+        return results
     if not isinstance(mapping, dict):
-      raise ValueError(f"LLM 返回了非 dict 类型: {type(mapping).__name__}")
+      logger.debug("批量分类: json_repair 解析为 %s 而非 dict，跳过 (raw=%s)", type(mapping).__name__, text[:120])
+      return results
 
     # 将编号映射回 comment_id
     idx_to_cid = {str(idx): cid for idx, cid, _ in unmatched}
     for idx_str, topic_id in mapping.items():
-      cid = idx_to_cid.get(idx_str)
+      if not isinstance(topic_id, str):
+        continue
+      cid = idx_to_cid.get(str(idx_str))
       if cid and topic_id != "none" and table.get(topic_id):
         results[cid] = topic_id
 
-  except (json.JSONDecodeError, Exception) as e:
-    logger.error("批量分类失败: %s", e)
+  except Exception as e:
+    logger.error("批量分类失败: %s (raw=%s)", e, text[:120] if text else "empty")
 
   return results

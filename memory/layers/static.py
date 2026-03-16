@@ -58,18 +58,46 @@ class StaticLayer:
     self._static_dir = personas_dir / persona / "static_memories"
     self._loaded = False
 
+  def _count_json_entries(self) -> int:
+    """统计 JSON 文件中的总条目数（不加载到向量存储）"""
+    if not self._static_dir.exists():
+      return 0
+    total = 0
+    for json_file in sorted(self._static_dir.glob("*.json")):
+      try:
+        data = json.loads(json_file.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+          total += sum(1 for item in data if item.get("content", "").strip())
+      except (json.JSONDecodeError, IOError):
+        pass
+    return total
+
   def load(self) -> int:
     """
     从 JSON 文件加载静态记忆到向量存储
 
-    如果已加载（向量存储非空），跳过加载。
+    如果已加载（向量存储非空且索引健康且条目数一致），跳过加载。
+    索引损坏或条目数不匹配时自动清空并重新加载。
 
     Returns:
       加载的记忆数量
     """
     if self._store.count() > 0:
-      self._loaded = True
-      return 0
+      if self._index_healthy():
+        expected = self._count_json_entries()
+        stored = self._store.count()
+        if expected > 0 and stored != expected:
+          logger.warning(
+            "static 层条目数不匹配（存储 %d 条，JSON %d 条），重新加载",
+            stored, expected,
+          )
+          self._store.clear()
+        else:
+          self._loaded = True
+          return 0
+      else:
+        logger.warning("static 层索引损坏，清空后重新加载")
+        self._store.clear()
 
     if not self._static_dir.exists():
       logger.info("静态记忆目录不存在: %s，跳过加载", self._static_dir)
@@ -84,6 +112,14 @@ class StaticLayer:
     self._loaded = True
     logger.info("加载了 %d 条静态记忆 (角色: %s)", total, self._persona)
     return total
+
+  def _index_healthy(self) -> bool:
+    """探测向量索引是否可用（试一次原始检索，失败即判定损坏）"""
+    try:
+      self._store.search_raw(query="test", top_k=1)
+      return True
+    except Exception:
+      return False
 
   def _load_file(self, path: Path) -> int:
     """加载单个 JSON 文件"""

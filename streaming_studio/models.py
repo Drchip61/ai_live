@@ -142,6 +142,7 @@ class StreamerResponse:
   timestamp: datetime = field(default_factory=datetime.now)
   mapped_content: Optional[str] = None
   expression_motion_tags: tuple[Any, ...] = field(default_factory=tuple)
+  response_style: str = "normal"
 
   def to_dict(self) -> dict:
     """转换为字典"""

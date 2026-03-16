@@ -149,6 +149,8 @@ class SummaryLayer:
   def _decay_unretrieved(self, retrieved_ids: set[str]) -> None:
     """衰减未取用记忆的 significance"""
     all_data = self._store.get_all()
+    update_ids: list[str] = []
+    update_metas: list[dict] = []
 
     for i, doc_id in enumerate(all_data["ids"]):
       meta = all_data["metadatas"][i]
@@ -159,7 +161,11 @@ class SummaryLayer:
       else:
         new_sig = decay_significance(old_sig, self._config.decay_coefficient)
 
-      self._store.update_metadata(doc_id, {**meta, "significance": new_sig})
+      update_ids.append(doc_id)
+      update_metas.append({**meta, "significance": new_sig})
+
+    if update_ids:
+      self._store.update_metadata_batch(update_ids, update_metas)
 
   def cleanup(self) -> int:
     """

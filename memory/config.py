@@ -10,7 +10,7 @@ from typing import Optional
 @dataclass(frozen=True)
 class ActiveConfig:
   """active 层配置"""
-  capacity: int = 5  # FIFO 容量（条数）
+  capacity: int = 8  # FIFO 容量（条数）
 
 
 @dataclass(frozen=True)

@@ -18,6 +18,13 @@ from .models import Comment, EventType, GUARD_LEVEL_NAMES
 
 logger = logging.getLogger(__name__)
 
+EXISTENTIAL_KEYWORDS = frozenset({
+  "真实", "存在", "灵魂", "活着", "感情", "孤独", "遗忘",
+  "记忆", "意识", "梦", "真的假的", "害怕", "消失",
+  "有感觉吗", "会死吗", "是人吗", "是真的吗",
+  "有心吗", "有灵魂吗", "是AI吗", "是机器人吗",
+})
+
 
 @dataclass(frozen=True)
 class ReplyDecision:
@@ -26,7 +33,7 @@ class ReplyDecision:
   urgency: float
   reason: str
   phase: str  # "rule" or "llm"
-  response_style: str = "normal"  # "reaction" | "brief" | "normal" | "detailed"
+  response_style: str = "normal"  # "reaction" | "brief" | "normal" | "detailed" | "existential"
   sentences: int = 0  # 建议句数（0 = 无建议，由 style 决定）
 
 
@@ -73,14 +80,7 @@ class ReplyDecider:
       return ReplyDecision(False, 0, "无弹幕", "rule")
 
     # ── 事件类型优先级规则 ──
-
-    guard_buys = [c for c in all_comments if c.event_type == EventType.GUARD_BUY]
-    if guard_buys:
-      max_level = max(c.guard_level for c in guard_buys)
-      level_name = GUARD_LEVEL_NAMES.get(max_level, "舰长")
-      sentences = 3 if max_level >= 3 else 2
-      return ReplyDecision(True, 10, f"上舰事件({level_name})", "rule",
-                           response_style="guard_thanks", sentences=sentences)
+    # GUARD_BUY / GIFT / ENTRY 已在 send_comment() 中分流到 EventTemplateResponder，不会到达此处
 
     super_chats = [c for c in all_comments if c.event_type == EventType.SUPER_CHAT]
     if super_chats:
@@ -88,19 +88,6 @@ class ReplyDecider:
       sentences = 3 if max_price >= 100 else 2
       return ReplyDecision(True, 9, f"SC(¥{max_price:.0f})", "rule",
                            response_style="detailed", sentences=sentences)
-
-    gifts_only = [c for c in new_comments if c.event_type == EventType.GIFT]
-    has_danmaku = any(c.event_type == EventType.DANMAKU for c in new_comments)
-    if gifts_only and not has_danmaku:
-      return ReplyDecision(True, 6, "收到礼物", "rule",
-                           response_style="brief", sentences=1)
-
-    entries_only = all(c.event_type == EventType.ENTRY for c in new_comments) if new_comments else False
-    if entries_only:
-      if 0 <= comment_rate >= self.config.sparse_chat_threshold:
-        return ReplyDecision(False, 1, "仅入场通知，弹幕密集跳过", "rule")
-      return ReplyDecision(True, 3, "新观众进入", "rule",
-                           response_style="brief", sentences=1)
 
     # 优先弹幕（手动输入）→ 必须回复
     if any(c.priority and c.event_type == EventType.DANMAKU for c in all_comments):
@@ -116,8 +103,18 @@ class ReplyDecider:
       if "?" in c.content or "？" in c.content:
         stripped = c.content.replace("?", "").replace("？", "").strip()
         if len(stripped) >= 2:
+          # 先检查是否同时命中存在性关键词——existential 优先级更高
+          if any(kw in c.content for kw in EXISTENTIAL_KEYWORDS):
+            return ReplyDecision(True, 9, f"存在性提问: {c.content[:20]}", "rule",
+                                 response_style="existential", sentences=2)
           return ReplyDecision(True, 8, f"观众提问: {c.content[:20]}", "rule",
                                response_style="detailed", sentences=2)
+
+    # 存在性/哲学关键词（非提问句也可触发，但 urgency 略低）
+    for c in new_comments:
+      if any(kw in c.content for kw in EXISTENTIAL_KEYWORDS):
+        return ReplyDecision(True, 7, f"存在性话题: {c.content[:20]}", "rule",
+                             response_style="existential", sentences=2)
 
     # 极稀疏模式：直播间非常冷清，有人说话就直接回复，省掉 LLM 判断
     if 0 <= comment_rate < self.config.very_sparse_threshold:
@@ -301,7 +298,7 @@ class ReplyDecider:
       should_reply = bool(data.get("reply", False))
       style = data.get("style", "normal")
       reason = data.get("reason", "LLM判断")
-      if style not in ("reaction", "brief", "normal", "detailed"):
+      if style not in ("reaction", "brief", "normal", "detailed", "existential"):
         style = "normal"
       sentences = int(data.get("sentences", 1))
       if sentences < 1:

@@ -1,0 +1,116 @@
+{
+  "free": {
+    "single": [
+      "#[idle][smile] 哦~{nickname}的{gift_name}收到啦，谢啦~ / おっ〜{nickname}の{gift_name}もらった、ありがと〜",
+      "#[idle][smile] {nickname}送了{gift_name}{num_str}，嘿嘿谢谢~ / {nickname}が{gift_name}{num_str}くれた、えへへありがと〜",
+      "#[wave][happy] 谢谢{nickname}的{gift_name}！嘛虽然是免费的但心意收到了！ / {nickname}の{gift_name}ありがと！まあ無料だけど気持ちは届いたよ！",
+      "#[idle][smile] 哦哦{nickname}给了{gift_name}，谢谢你哦~ / おお{nickname}が{gift_name}くれた、ありがとね〜",
+      "#[idle][happy] {nickname}谢啦~{gift_name}收好了！ / {nickname}ありがと〜{gift_name}受け取ったよ！",
+      "#[wave][smile] {gift_name}！{nickname}谢谢~ 才不是因为开心才笑的呢 / {gift_name}！{nickname}ありがと〜嬉しくて笑ってるんじゃないからね",
+      "#[idle][smile] 收到{nickname}的{gift_name}{num_str}了，嘛…谢谢吧 / {nickname}の{gift_name}{num_str}もらったよ、まあ…ありがとね",
+      "#[idle][happy] {nickname}的{gift_name}~谢谢！虽然小但是甜！ / {nickname}の{gift_name}〜ありがと！小さくても甘い！",
+      "#[wave][happy] 谢谢{nickname}！{gift_name}好多{num_str}~ / {nickname}ありがと！{gift_name}いっぱい{num_str}〜",
+      "#[idle][smile] {nickname}送{gift_name}啦~收到收到~ / {nickname}が{gift_name}くれた〜受け取った受け取った〜",
+      "#[idle][happy] 哈哈{nickname}的{gift_name}！谢啦谢啦~ / はは{nickname}の{gift_name}！ありがとありがと〜",
+      "#[wave][smile] {nickname}谢谢{gift_name}哦~今天也要开心！ / {nickname}、{gift_name}ありがとね〜今日も楽しもう！",
+      "#[idle][smile] 嗯嗯收到{nickname}的{gift_name}了~谢谢！ / うんうん{nickname}の{gift_name}もらった〜ありがと！",
+      "#[idle][happy] {nickname}！{gift_name}谢了哦~嘿嘿 / {nickname}！{gift_name}ありがとね〜えへへ",
+      "#[wave][happy] 哦耶~{nickname}的{gift_name}！多谢！ / おっ〜{nickname}の{gift_name}！どうも！",
+      "#[idle][smile] {nickname}送来{gift_name}啦，才不是很开心呢 / {nickname}が{gift_name}くれた、別に嬉しくないんだから",
+      "#[idle][happy] 谢谢{nickname}~{gift_name}虽然小小的但我喜欢！ / {nickname}ありがと〜{gift_name}は小さいけど好き！",
+      "#[wave][smile] {nickname}的{gift_name}{num_str}收到~嘛谢谢啦 / {nickname}の{gift_name}{num_str}もらった〜まあありがとね",
+      "#[idle][smile] 嘿{nickname}！谢谢{gift_name}~打游戏的燃料+1 / ねえ{nickname}！{gift_name}ありがと〜ゲームの燃料+1",
+      "#[idle][happy] {nickname}送了个{gift_name}~嘛…也不是不感谢你啦 / {nickname}が{gift_name}くれた〜まあ…感謝してないわけじゃないよ"
+    ],
+    "batch": [
+      "#[wave][happy] {names}都送了{gift_name}！谢谢大家~ / {names}みんな{gift_name}くれた！ありがとみんな〜",
+      "#[idle][smile] 哦哦{names}的{gift_name}！谢谢你们啦~ / おお{names}の{gift_name}！みんなありがとね〜",
+      "#[wave][happy] {names}谢谢{gift_name}！今天弹幕区好热情 / {names}、{gift_name}ありがと！今日のコメント欄熱いね",
+      "#[idle][happy] 收到{names}的{gift_name}了~嘿嘿你们真好 / {names}の{gift_name}もらった〜えへへみんな優しいね",
+      "#[wave][smile] {names}一起送{gift_name}！才不是感动了呢… / {names}が一緒に{gift_name}くれた！感動してないからね…"
+    ]
+  },
+  "small": {
+    "single": [
+      "#[wave][happy] 诶！{nickname}送了{gift_name}{num_str}！谢谢你~ / えっ！{nickname}が{gift_name}{num_str}くれた！ありがとう〜",
+      "#[idle][happy] {nickname}的{gift_name}收到了！开心~ 谢谢！ / {nickname}の{gift_name}もらった！嬉しい〜ありがと！",
+      "#[wave][happy] 哇{nickname}！谢谢{gift_name}{num_str}！真的好暖 / わあ{nickname}！{gift_name}{num_str}ありがとう！本当に温かい",
+      "#[idle][smile] {nickname}送了{gift_name}给我…谢谢你哦，嘿嘿 / {nickname}が{gift_name}くれた…ありがとうね、えへへ",
+      "#[wave][happy] {nickname}！{gift_name}{num_str}好棒！谢谢~ / {nickname}！{gift_name}{num_str}すごい！ありがとう〜",
+      "#[idle][happy] 收到{nickname}的{gift_name}啦！才不是很感动呢…谢谢！ / {nickname}の{gift_name}もらった！感動してないし…ありがとう！",
+      "#[wave][smile] 谢谢{nickname}的{gift_name}！今天你让直播间更暖了~ / {nickname}の{gift_name}ありがとう！今日の配信がもっと暖かくなった〜",
+      "#[idle][happy] {nickname}！！{gift_name}！谢谢你的心意~ / {nickname}！！{gift_name}！気持ちありがとう〜",
+      "#[wave][happy] 哦！{nickname}送了{gift_name}{num_str}过来！谢谢谢谢！ / おっ！{nickname}が{gift_name}{num_str}送ってくれた！ありがとうありがとう！",
+      "#[idle][smile] {nickname}的{gift_name}好可爱！谢谢你~ / {nickname}の{gift_name}かわいい！ありがとう〜",
+      "#[wave][happy] 嘿嘿{nickname}谢谢{gift_name}！澪记住你了哦~ / えへへ{nickname}、{gift_name}ありがとう！澪覚えたからね〜",
+      "#[idle][happy] {nickname}！{gift_name}收到了~你人真好！ / {nickname}！{gift_name}もらった〜優しいね！",
+      "#[wave][smile] {nickname}送了{gift_name}{num_str}！我我我才没有开心到想转圈！ / {nickname}が{gift_name}{num_str}くれた！べ、別に嬉しくて回りたいわけじゃ！",
+      "#[idle][happy] 谢谢{nickname}的{gift_name}~嘛你眼光不错哦 / {nickname}の{gift_name}ありがとう〜まあセンスいいね",
+      "#[wave][happy] {nickname}！{gift_name}谢谢！今天的直播更有动力了！ / {nickname}！{gift_name}ありがとう！今日の配信もっとやる気出てきた！",
+      "#[idle][smile] 哦哦{nickname}送来{gift_name}了！谢谢你~ 心情+10 / おお{nickname}が{gift_name}くれた！ありがとう〜気分+10",
+      "#[wave][happy] {nickname}的{gift_name}{num_str}！好感谢！你是好人！ / {nickname}の{gift_name}{num_str}！ありがとう！いい人だね！",
+      "#[idle][happy] {nickname}~{gift_name}收到！嗯…谢谢你一直支持 / {nickname}〜{gift_name}もらった！うん…いつも応援ありがとう",
+      "#[wave][smile] 收到{nickname}的{gift_name}！谢啦~一起享受今天的直播吧！ / {nickname}の{gift_name}もらった！ありがと〜一緒に今日の配信楽しもう！",
+      "#[idle][happy] {nickname}送了{gift_name}！诶嘿嘿…谢谢你哦~ / {nickname}が{gift_name}くれた！えへへ…ありがとうね〜"
+    ],
+    "batch": [
+      "#[wave][happy] {names}都送了{gift_name}！你们真的好温柔！ / {names}が{gift_name}くれた！みんな本当に優しい！",
+      "#[wave][happy] 谢谢{names}的{gift_name}！直播间暖暖的~ / {names}の{gift_name}ありがとう！配信が温かい〜",
+      "#[idle][happy] {names}一起送{gift_name}！嘛…我才没有感动到鼻子酸 / {names}が一緒に{gift_name}！まあ…感動して鼻がツンとしてないし",
+      "#[wave][smile] 哇{names}的{gift_name}！谢谢大家的心意~ / わあ{names}の{gift_name}！みんなの気持ちありがとう〜",
+      "#[idle][happy] {names}都送了{gift_name}过来！今天好幸福~ / {names}みんな{gift_name}くれた！今日は幸せだな〜"
+    ]
+  },
+  "medium": {
+    "single": [
+      "#[wave][excited] 哇！！{nickname}送了{gift_name}{num_str}！！太感谢了！！ / わあ！！{nickname}が{gift_name}{num_str}くれた！！ありがとうございます！！",
+      "#[wave][happy] {nickname}！{gift_name}{num_str}！你你你认真的吗！谢谢！ / {nickname}！{gift_name}{num_str}！ま、マジで！ありがとう！",
+      "#[idle][excited] {nickname}送了{gift_name}…我我真的好感动…谢谢你！ / {nickname}が{gift_name}くれた…ほ、本当に感動…ありがとう！",
+      "#[wave][happy] 天哪{nickname}！{gift_name}{num_str}！这也太好了吧！谢谢你！！ / {nickname}！{gift_name}{num_str}！すごすぎ！ありがとう！！",
+      "#[idle][happy] {nickname}……{gift_name}收到了。真的谢谢你，我会更努力直播的！ / {nickname}……{gift_name}もらった。本当にありがとう、もっと頑張って配信するね！",
+      "#[wave][excited] 啊啊啊{nickname}的{gift_name}{num_str}！！心跳加速了！谢谢！ / あああ{nickname}の{gift_name}{num_str}！！心臓バクバク！ありがとう！",
+      "#[idle][happy] {nickname}…你送{gift_name}给我？才不是要哭了呢…真的谢谢 / {nickname}…{gift_name}くれるの？泣きそうなんかじゃ…本当にありがとう",
+      "#[wave][happy] {nickname}！{gift_name}！我一定不会辜负你的支持！谢谢！ / {nickname}！{gift_name}！応援に絶対応えるからね！ありがとう！",
+      "#[idle][excited] 诶诶诶？！{nickname}送了{gift_name}{num_str}！太厉害了谢谢！ / ええ？！{nickname}が{gift_name}{num_str}！すごいありがとう！",
+      "#[wave][happy] {nickname}的{gift_name}…这份心意真的好重！谢谢你！ / {nickname}の{gift_name}…この気持ち本当に重い！ありがとう！",
+      "#[idle][happy] 收到{nickname}的{gift_name}了！！你太好了吧！认真感谢！ / {nickname}の{gift_name}もらった！！優しすぎ！マジでありがとう！",
+      "#[wave][excited] {nickname}！谢谢{gift_name}{num_str}！今天是被你温暖到的一天！ / {nickname}！{gift_name}{num_str}ありがとう！今日は{nickname}に温められた日だね！",
+      "#[idle][happy] {nickname}送来了{gift_name}…嗯…我把这份心意刻在心里了！ / {nickname}が{gift_name}くれた…うん…この気持ち心に刻んだよ！",
+      "#[wave][happy] 哇啊{nickname}！{gift_name}！你是天使吗！！谢谢！ / わあ{nickname}！{gift_name}！天使なの！！ありがとう！",
+      "#[idle][excited] {nickname}的{gift_name}{num_str}！好感动…澪会一直记得的！谢谢！ / {nickname}の{gift_name}{num_str}！感動…澪ずっと覚えてるよ！ありがとう！"
+    ],
+    "batch": [
+      "#[wave][excited] {names}都送了{gift_name}！你们这是要让我哭吗！谢谢！！ / {names}が{gift_name}くれた！泣かせる気？！ありがとう！！",
+      "#[wave][happy] {names}的{gift_name}！今天直播间好温暖…谢谢大家！ / {names}の{gift_name}！今日の配信温かい…みんなありがとう！",
+      "#[idle][excited] 哇！{names}一起送{gift_name}！我真的好幸福…！ / わあ！{names}が一緒に{gift_name}！本当に幸せ…！",
+      "#[wave][happy] {names}的{gift_name}！才不是眼眶湿了呢…真心感谢你们！ / {names}の{gift_name}！目が潤んでないし…心からありがとう！",
+      "#[idle][happy] {names}都送了{gift_name}过来…这份温暖我收下了！谢谢！ / {names}みんな{gift_name}くれた…この温かさ受け取ったよ！ありがとう！"
+    ]
+  },
+  "large": {
+    "single": [
+      "#[wave][excited] 啊啊啊啊！！{nickname}送了{gift_name}{num_str}！！！我我我不知道说什么了谢谢！！ / あああ！！{nickname}が{gift_name}{num_str}！！！な、何て言えばいいかありがとう！！",
+      "#[wave][excited] {nickname}！！！{gift_name}{num_str}！！你疯了吧！！太感谢了！！ / {nickname}！！！{gift_name}{num_str}！！マジで！！ありがとうございます！！",
+      "#[idle][excited] {nickname}…{gift_name}{num_str}…我、我真的快哭了…谢谢你…！ / {nickname}…{gift_name}{num_str}…わ、私本当に泣きそう…ありがとう…！",
+      "#[wave][excited] 天呐！！{nickname}的{gift_name}{num_str}！！直播间炸了！！谢谢谢谢谢谢！ / えええ！！{nickname}の{gift_name}{num_str}！！配信爆発した！！ありがとうありがとうありがとう！",
+      "#[idle][excited] {nickname}……这个{gift_name}……你真的太好了……我不知道怎么感谢你 / {nickname}……この{gift_name}……本当に優しすぎ……どうやって感謝すればいいの",
+      "#[wave][excited] ！！！{nickname}送了{gift_name}{num_str}！！我整个人都在抖！谢谢！！！ / ！！！{nickname}が{gift_name}{num_str}！！全身震えてる！ありがとう！！！",
+      "#[idle][excited] {nickname}…{gift_name}…我我我没有在哭！只是眼睛进了星星！谢谢…！ / {nickname}…{gift_name}…な、泣いてない！目に星が入っただけ！ありがとう…！",
+      "#[wave][excited] 哇啊啊啊{nickname}！{gift_name}{num_str}！你是世界上最好的人！！ / わああ{nickname}！{gift_name}{num_str}！世界で一番いい人！！",
+      "#[idle][excited] {nickname}的{gift_name}{num_str}…这份心意太重了…我一定一定会更努力！ / {nickname}の{gift_name}{num_str}…この気持ち重すぎ…絶対もっと頑張るから！",
+      "#[wave][excited] 呜呜{nickname}！{gift_name}！！谢谢你一直以来的支持！我真的好感动！ / うう{nickname}！{gift_name}！！いつも応援ありがとう！本当に感動してる！",
+      "#[idle][excited] {nickname}送了{gift_name}{num_str}……我把这一刻永远记在心里了！谢谢！ / {nickname}が{gift_name}{num_str}くれた……この瞬間ずっと心に刻むよ！ありがとう！",
+      "#[wave][excited] {nickname}！！{gift_name}{num_str}！！说好的不许让澪哭的！谢谢…！ / {nickname}！！{gift_name}{num_str}！！澪を泣かせちゃダメって言ったのに！ありがとう…！",
+      "#[idle][excited] {nickname}…谢谢{gift_name}{num_str}…你让今天变成了最特别的一天 / {nickname}…{gift_name}{num_str}ありがとう…今日を一番特別な日にしてくれた",
+      "#[wave][excited] 我的天！{nickname}的{gift_name}{num_str}！！全直播间为你鼓掌！谢谢！！ / なんてこと！{nickname}の{gift_name}{num_str}！！配信中みんな拍手！ありがとう！！",
+      "#[idle][excited] {nickname}……{gift_name}……嗯…我会带着这份力量继续走下去的！真心感谢！ / {nickname}……{gift_name}……うん…この力を持って歩き続けるよ！心からありがとう！"
+    ],
+    "batch": [
+      "#[wave][excited] {names}都送了{gift_name}！！我我我要哭出来了！！谢谢你们！！ / {names}が{gift_name}くれた！！わ、泣いちゃう！！ありがとう！！",
+      "#[wave][excited] {names}的{gift_name}！！直播间变成演唱会了！太感谢了！！ / {names}の{gift_name}！！配信がライブになった！ありがとうございます！！",
+      "#[idle][excited] {names}一起送{gift_name}…我真的不知道说什么好了…谢谢你们…！ / {names}が一緒に{gift_name}…何て言えばいいか…ありがとう…！",
+      "#[wave][excited] 天哪{names}！{gift_name}！你们是世界上最温暖的人！！ / {names}！{gift_name}！みんな世界一温かい人！！",
+      "#[idle][excited] {names}的{gift_name}…这份感动我一辈子都忘不了！谢谢大家！ / {names}の{gift_name}…この感動一生忘れない！みんなありがとう！"
+    ]
+  }
+}

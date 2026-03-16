@@ -36,6 +36,11 @@ _TAG_RE = re.compile(r"#\[([^\]]*)\]\[([^\]]*)\]")
 _DEFAULT_EMOTION = "- -"
 _DEFAULT_MOTION = "Idle"
 
+_CHINESE_SPEECH_RE = re.compile(
+  r"谢谢|感谢|多谢|谢啦|太感[谢动]|欢迎|来[了啦]"
+  r"|舰长|提督|总督|上舰|SC|礼物|打赏"
+)
+
 _TRANSLATE_JA_SINGLE = (
   "你是中日翻译器。将以下中文翻译成自然的日语口语。"
   "保持说话者的语气和情感。只输出日语译文，不要任何解释。\n\n{text}"
@@ -113,6 +118,12 @@ class SpeechBroadcaster:
     self._estimated_playback_seconds: float = 0.0
     self._runner: Optional[web.AppRunner] = None
 
+    # 最新回复（供外部轮询）
+    self._latest_response: Optional[dict] = None
+
+    # SpeechQueue 模式：旧 _on_response 回调跳过 TTS 发送（由 Dispatcher 接管）
+    self._queue_mode = False
+
   @property
   def url(self) -> str:
     return self._url
@@ -132,6 +143,7 @@ class SpeechBroadcaster:
 
     app = web.Application()
     app.router.add_post("/speech_done", self._handle_speech_done)
+    app.router.add_get("/latest_response", self._handle_latest_response)
     self._runner = web.AppRunner(app)
     await self._runner.setup()
     site = web.TCPSite(self._runner, "0.0.0.0", self._callback_port)
@@ -157,9 +169,11 @@ class SpeechBroadcaster:
   # ── 挂载与同步 ──────────────────────────────────────
 
   def attach(self, studio) -> None:
-    """注册到 StreamingStudio 的回复回调，并注入语音完播门控"""
+    """注册到 StreamingStudio 的回复回调，并注入语音完播门控 + broadcaster 引用"""
     studio.on_response(self._on_response)
+    studio.on_response(self._update_latest_response)
     studio.set_speech_gate(self.wait_for_playback)
+    studio.set_speech_broadcaster(self)
     state = "开启" if self.enabled else "关闭（待手动开启）"
     print(f"[语音广播] 已挂载，目标: {self._url}，状态: {state}")
     if self._callback_port:
@@ -168,22 +182,21 @@ class SpeechBroadcaster:
       print(f"[语音广播] 完播同步: 未启用（fire-and-forget 模式）")
 
   async def wait_for_playback(self) -> None:
-    """等待当前语音播放完毕（由 StreamingStudio 主循环调用）"""
+    """等待当前语音播放完毕（由 StreamingStudio 主循环调用）
+    兜底超时 30 秒，防止回调丢失导致长时间卡死"""
     if self._playback_done.is_set():
       return
-    timeout = min(max(self._estimated_playback_seconds * 2, 15.0), 60.0)
     try:
-      await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
+      await asyncio.wait_for(self._playback_done.wait(), timeout=30.0)
     except asyncio.TimeoutError:
-      logger.warning("语音播放等待超时 (%ss)，强制继续", timeout)
-      print(f"[语音广播] 等待超时 ({timeout:.0f}s)，强制继续")
+      print("[语音广播] 30s 未收到完播回调，疑似回调丢失，强制继续")
       self._playback_done.set()
 
   # ── 回调处理 ──────────────────────────────────────────
 
   def _on_response(self, response: StreamerResponse) -> None:
-    """同步回调入口，关闭时跳过"""
-    if not self.enabled:
+    """同步回调入口，关闭时或 queue 模式跳过（Dispatcher 接管 TTS 发送）"""
+    if not self.enabled or self._queue_mode:
       return
     self._pending_batch_id = str(uuid.uuid4())
     self._playback_done.clear()
@@ -200,7 +213,10 @@ class SpeechBroadcaster:
     """处理 TTS 完播回调（任何合法请求都解除阻塞）"""
     try:
       data = await request.json()
-    except Exception:
+    except Exception as e:
+      raw_body = await request.text()
+      print(f"[语音广播] 收到无效回调 JSON，仍放行: {e}\n  原始body: {raw_body[:200]}")
+      self._playback_done.set()
       return web.Response(status=400, text="invalid json")
 
     batch_id = data.get("batch_id")
@@ -216,7 +232,61 @@ class SpeechBroadcaster:
     self._playback_done.set()
     return web.Response(text="ok")
 
-  # ── 处理管线 ──────────────────────────────────────────
+  def _update_latest_response(self, response: StreamerResponse) -> None:
+    """回复回调：更新最新回复供 HTTP 端点返回"""
+    self._latest_response = {
+      "id": response.id,
+      "text": self._extract_chinese(response.content),
+      "raw": response.content,
+      "timestamp": response.timestamp.isoformat(),
+      "response_style": response.response_style,
+    }
+
+  async def _handle_latest_response(self, request: web.Request) -> web.Response:
+    """GET /latest_response — 返回最新回复供弹幕机器人轮询"""
+    import json as _json
+    if self._latest_response is None:
+      body = _json.dumps({"id": None}, ensure_ascii=False)
+    else:
+      body = _json.dumps(self._latest_response, ensure_ascii=False)
+    return web.Response(text=body, content_type="application/json")
+
+  # ── SpeechQueue 模式：单段发送 ────────────────────────
+
+  async def send_segment(self, segment: dict) -> bool:
+    """
+    发送单个 TTS 段（由 TTS Dispatcher 调用）。
+
+    自动生成 batch_id 并清除 playback_done，调用方需在之后
+    await wait_for_playback() 等待完播回调。
+
+    Args:
+      segment: TTS 段字典（text, text_zh, emotion, motion, language 等）
+
+    Returns:
+      True 表示 POST 成功（2xx），False 表示失败
+    """
+    if not self.enabled:
+      return False
+
+    self._pending_batch_id = str(uuid.uuid4())
+    self._playback_done.clear()
+
+    seg = dict(segment)
+    seg["timestamp"] = time.time()
+    seg["batch_id"] = self._pending_batch_id
+    seg["seq"] = 0
+    seg["total"] = 1
+    seg["is_last"] = True
+    if self._callback_url:
+      seg["callback_url"] = self._callback_url
+
+    ok = await asyncio.to_thread(self._post_segment, seg)
+    if not ok or not self._callback_url:
+      self._playback_done.set()
+    return ok
+
+  # ── 处理管线（旧路径，_on_response 回调使用）──────────
 
   async def _process(self, response: StreamerResponse) -> None:
     """解析内嵌双语 → 逐条发送（无翻译步骤）"""
@@ -226,6 +296,8 @@ class SpeechBroadcaster:
       if not segments:
         self._playback_done.set()
         return
+
+      self._apply_chinese_speech(segments, response.response_style)
 
       total = len(segments)
       all_ok = True
@@ -254,6 +326,41 @@ class SpeechBroadcaster:
       logger.error("SpeechBroadcaster 处理失败: %s", e)
       print(f"[语音广播] 处理失败: {e}")
       self._playback_done.set()
+
+  # ── 中文语音替换 ─────────────────────────────────────
+
+  @staticmethod
+  def _apply_chinese_speech(
+    segments: list[dict], response_style: str,
+  ) -> None:
+    """style_bank_original 全中文；style_bank_inspire 不覆盖（走日语）；
+    其他风格逐段关键词检测，感谢/欢迎段用中文。
+    被替换的段 language 从 'Japanese' 改为 'Chinese'。"""
+    if response_style == "style_bank_original":
+      for seg in segments:
+        seg["text"] = seg["text_zh"]
+        seg["language"] = "Chinese"
+      return
+    for seg in segments:
+      if _CHINESE_SPEECH_RE.search(seg.get("text_zh", "")):
+        seg["text"] = seg["text_zh"]
+        seg["language"] = "Chinese"
+
+  @staticmethod
+  def _extract_chinese(content: str) -> str:
+    """剥离表情标签和日语翻译，只保留纯中文文本"""
+    parts = _TAG_RE.split(content)
+    chinese_parts = []
+    for part in parts:
+      part = part.strip()
+      if not part:
+        continue
+      sep_idx = part.find(" / ")
+      if sep_idx >= 0:
+        part = part[:sep_idx].strip()
+      if part:
+        chinese_parts.append(part)
+    return "".join(chinese_parts) if chinese_parts else content
 
   # ── 解析 / 翻译 / 发送 ──────────────────────────────
 
@@ -288,6 +395,8 @@ class SpeechBroadcaster:
       segments.append({
         "text": ja,
         "text_zh": zh,
+        "text_ja": ja,
+        "language": "Japanese",
         "emotion": _DEFAULT_EMOTION,
         "motion": _DEFAULT_MOTION,
       })
@@ -302,6 +411,8 @@ class SpeechBroadcaster:
         segments.append({
           "text": ja,
           "text_zh": zh,
+          "text_ja": ja,
+          "language": "Japanese",
           "emotion": emotion,
           "motion": motion,
         })
@@ -314,6 +425,8 @@ class SpeechBroadcaster:
         segments.append({
           "text": ja,
           "text_zh": zh,
+          "text_ja": ja,
+          "language": "Japanese",
           "emotion": _DEFAULT_EMOTION,
           "motion": _DEFAULT_MOTION,
         })

@@ -27,20 +27,21 @@ from langchain_wrapper.model_provider import ModelProvider, ModelType
 # ============================================================
 
 SCORE_SYSTEM = """\
-你是弱智吧/抽象梗内容质量评审。评估每条内容的质量。
+你是直播间风格语料质量评审。评估每条内容作为直播间风格参考的质量。
 
 评分标准（1-5）：
-5 - 经典：逻辑结构精妙 + 前提荒诞但推理有效 + 结论出人意料，先愣住再爆笑
-4 - 优秀：有创意有趣味，逻辑链条有意思，但不够惊艳
-3 - 尚可：有弱智吧风格，但比较普通或类似内容太多
-2 - 一般：创意不足、逻辑不通、或只是普通段子
-1 - 垃圾：无聊/低俗/纯灌水/跟弱智吧风格无关
+5 - 经典：表达精妙、让人印象深刻，适合直播间使用，有传播力
+4 - 优秀：有创意有趣味，表达方式值得借鉴
+3 - 尚可：有一定风格特色，但比较普通或类似内容太多
+2 - 一般：创意不足、表达平淡、或不适合直播间使用
+1 - 垃圾：无聊/纯低俗/无意义/无法口语化表达
 
-重点关注：
-- 「一本正经胡说八道」的反差感
-- 逻辑推理的完整性（即使前提荒诞）
-- 出人意料的角度和结论
-- 能否在直播间口语化表达"""
+各类风格的加分项：
+- 弱智吧/荒诞类：「一本正经胡说八道」的反差感、逻辑推理的完整性、出人意料的结论
+- 影视/动漫名言：经典度高、适用场景广、能引发观众共鸣或讨论
+- 抗压/反讽类：创意回击、阴阳怪气的精妙度、不带脏字但杀伤力强
+- 互联网梗/段子：梗的传播度、叙事的反转感、直播间适用性
+- 通用：能否在直播间口语化表达、是否有互动潜力"""
 
 SCORE_USER_TEMPLATE = """\
 请评估以下 {count} 条内容的质量。
@@ -60,6 +61,10 @@ category（内容类型）:
 - scene_reaction: 适合评论看到的画面（"等等，这个角色走路姿势有逻辑漏洞"）
 - ice_breaker: 适合冷场时主动抛出（"既然没人说话，我提一个问题..."）
 - comeback: 适合被质疑/攻击时回击（"你的反驳缺乏逻辑结构"）
+- movie_quote: 经典影视/动漫/游戏台词（"做人如果没有梦想，跟咸鱼有什么分别"）
+- internet_meme: 互联网名梗/流行语（出圈的网络流行表达）
+- sarcasm: 阴阳怪气/反讽/高级损（不带脏字但杀伤力强）
+- narrative_twist: 叙事反转段子（铺垫很长、结尾突然反转）
 
 situation（使用场景）:
 - proactive: 主动发言（冷场、开场、自言自语）
@@ -68,7 +73,7 @@ situation（使用场景）:
 - comeback: 被观众怼时的回击
 - any: 通用，多种场景都能用
 
-tags: 2-4 个语义标签（如 "动物"、"物理"、"哲学"、"生活" 等）"""
+tags: 2-4 个语义标签（如 "动物"、"物理"、"哲学"、"生活"、"影视"、"动漫"、"游戏" 等）"""
 
 CLASSIFY_USER_TEMPLATE = """\
 请为以下 {count} 条内容分类。
@@ -368,6 +373,10 @@ def ensure_meta(output_dir: Path):
       "scene_reaction": "对画面的反应方式",
       "ice_breaker": "冷场时的主动发言",
       "comeback": "被质疑时的回击方式",
+      "movie_quote": "影视/动漫/游戏经典台词",
+      "internet_meme": "互联网名梗",
+      "sarcasm": "阴阳怪气/高级反讽",
+      "narrative_twist": "叙事反转段子",
     },
   }
   meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -448,6 +457,10 @@ def main():
     "--id-prefix", default="rz",
     help="条目 ID 前缀（默认 rz）",
   )
+  parser.add_argument(
+    "--source", default="",
+    help="来源标记（如 ruozhiba / kangyaba / hitokoto），写入 corpus 条目",
+  )
   args = parser.parse_args()
 
   # ---- 读取输入 ----
@@ -527,14 +540,17 @@ def main():
   for i, (idx, text, score_info) in enumerate(passed):
     cls = classifications.get(idx, {})
     final_text = adapted.get(idx, text)
-    new_entries.append({
+    entry = {
       "id": f"{args.id_prefix}_{start_num + i:03d}",
       "text": final_text,
       "category": cls.get("category", "classic_question"),
       "situation": cls.get("situation", "any"),
       "tags": cls.get("tags", []),
       "score": score_info.get("score", 3),
-    })
+    }
+    if args.source:
+      entry["source"] = args.source
+    new_entries.append(entry)
 
   all_entries = existing_entries + new_entries if args.append else new_entries
   write_corpus(all_entries, output_path)

@@ -5,9 +5,12 @@
 支持按 viewer_ids 召回观众历史记忆
 """
 
+import logging
 from typing import Optional, Union
 
 from langchain_core.runnables import RunnableLambda
+
+logger = logging.getLogger(__name__)
 
 from .config import RetrievalConfig
 from .formatter import (
@@ -191,37 +194,24 @@ class MemoryRetriever:
     """
     entries = []
 
-    if self._config.quota_temporary > 0:
-      all_temp = []
-      for q in queries:
-        all_temp.extend(
-          self._temporary.retrieve(q, top_k=self._config.quota_temporary)
-        )
-      entries.extend(_dedup_entries(all_temp, self._config.quota_temporary))
+    layers = [
+      ("temporary", self._temporary, self._config.quota_temporary),
+      ("summary", self._summary, self._config.quota_summary),
+      ("static", self._static, self._config.quota_static),
+    ]
+    if self._stance is not None:
+      layers.append(("stance", self._stance, self._config.quota_stance))
 
-    if self._config.quota_summary > 0:
-      all_sum = []
-      for q in queries:
-        all_sum.extend(
-          self._summary.retrieve(q, top_k=self._config.quota_summary)
-        )
-      entries.extend(_dedup_entries(all_sum, self._config.quota_summary))
-
-    if self._config.quota_static > 0:
-      all_stat = []
-      for q in queries:
-        all_stat.extend(
-          self._static.retrieve(q, top_k=self._config.quota_static)
-        )
-      entries.extend(_dedup_entries(all_stat, self._config.quota_static))
-
-    if self._stance is not None and self._config.quota_stance > 0:
-      all_stance = []
-      for q in queries:
-        all_stance.extend(
-          self._stance.retrieve(q, top_k=self._config.quota_stance)
-        )
-      entries.extend(_dedup_entries(all_stance, self._config.quota_stance))
+    for layer_name, layer, quota in layers:
+      if quota <= 0:
+        continue
+      try:
+        all_results = []
+        for q in queries:
+          all_results.extend(layer.retrieve(q, top_k=quota))
+        entries.extend(_dedup_entries(all_results, quota))
+      except Exception as e:
+        logger.error("记忆层 %s 检索失败，跳过: %s", layer_name, e)
 
     return entries
 
@@ -246,12 +236,20 @@ class MemoryRetriever:
     per_layer = max(1, overfetch // layer_count)
     all_entries = []
 
+    layers = [
+      ("temporary", self._temporary),
+      ("summary", self._summary),
+      ("static", self._static),
+    ]
+    if self._stance is not None:
+      layers.append(("stance", self._stance))
+
     for q in queries:
-      all_entries.extend(self._temporary.retrieve(q, top_k=per_layer))
-      all_entries.extend(self._summary.retrieve(q, top_k=per_layer))
-      all_entries.extend(self._static.retrieve(q, top_k=per_layer))
-      if self._stance is not None:
-        all_entries.extend(self._stance.retrieve(q, top_k=per_layer))
+      for layer_name, layer in layers:
+        try:
+          all_entries.extend(layer.retrieve(q, top_k=per_layer))
+        except Exception as e:
+          logger.error("记忆层 %s 检索失败，跳过: %s", layer_name, e)
 
     # 按 ID 去重（保留最佳 score）
     best: dict[str, MemoryEntry] = {}
