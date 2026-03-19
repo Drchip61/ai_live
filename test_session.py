@@ -173,7 +173,7 @@ def test_comment_session_round_increment():
   sm.evaluate_new_session([_c("你觉得这个结局设计怎么样")], [])
 
   sm.update_after_response(
-    "#[wave][happy] 我觉得结局很棒 / 結末は素晴らしいと思う",
+    "#[wave][happy][joy] 我觉得结局很棒 / 結末は素晴らしいと思う",
     [_c("确实，结局设计很好")],
   )
   assert sm.session.round_count == 1
@@ -575,7 +575,7 @@ def test_expression_tag_stripped_from_history():
   sm = SessionManager()
   sm.evaluate_new_session([_c("你觉得这个游戏的boss设计怎么样")], [])
   sm.update_after_response(
-    "#[wave][happy] 这个boss超帅的 / このボスは超かっこいい",
+    "#[wave][happy][joy] 这个boss超帅的 / このボスは超かっこいい",
     [_c("boss设计确实棒")],
   )
   history = sm.session.history[0]

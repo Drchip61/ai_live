@@ -297,6 +297,8 @@ class StreamingStudio:
 
     # 上次回复完成时间（用于沉默时长等节奏判断）
     self._last_reply_time: Optional[datetime] = None
+    # 上次生成回复的时间（入队时更新，用于 producer 侧沉默判断，避免视频解说误触发）
+    self._last_generate_time: Optional[datetime] = None
     # 上次进入回复生成的起始时间（用于区分新旧弹幕）
     self._last_collect_time: Optional[datetime] = None
 
@@ -660,6 +662,7 @@ class StreamingStudio:
     self._running = True
     self._stream_start_time = datetime.now()
     self._last_reply_time = None
+    self._last_generate_time = None
     self._last_collect_time = None
 
     # 在当前事件循环中创建 Event（Python 3.9 兼容）
@@ -874,9 +877,16 @@ class StreamingStudio:
             except asyncio.TimeoutError:
               break
 
+        in_comment_session = (
+          self._session_manager.is_active
+          and self._session_manager.session_type == SessionType.COMMENT
+        )
+
         # ── 高优先模板事件（GUARD > GIFT > VIP入场）：抢占弹幕 ──
         self._timer.mark("高优先事件")
-        high_resp = self._event_responder.next_high_priority()
+        high_resp = self._event_responder.next_high_priority(
+          allow_vip_entry=not in_comment_session
+        )
         while high_resp:
           self._chat_log.info("[模板回复] %s", high_resp.content)
           await self._response_queue.put(high_resp)
@@ -887,7 +897,9 @@ class StreamingStudio:
               print(f"回调执行错误: {e}")
           if self._speech_gate:
             await self._speech_gate()
-          high_resp = self._event_responder.next_high_priority()
+          high_resp = self._event_responder.next_high_priority(
+            allow_vip_entry=not in_comment_session
+          )
 
         self._timer.mark("弹幕收集")
         old_comments, new_comments = self._collect_comments()
@@ -914,9 +926,10 @@ class StreamingStudio:
             pass  # 直接进入回复流程，session prompt 会引导 AI 继续话题
           else:
             # 无弹幕 → 尝试开启 VideoSession 或主动发言
+            candidates = [t for t in (self._last_reply_time, self._last_generate_time) if t]
             silence = 0.0
-            if self._last_reply_time:
-              silence = (datetime.now() - self._last_reply_time).total_seconds()
+            if candidates:
+              silence = (datetime.now() - max(candidates)).total_seconds()
             elif self._stream_start_time:
               silence = (datetime.now() - self._stream_start_time).total_seconds()
             has_scene = self._scene_memory is not None and len(self._scene_memory._recent) > 0
@@ -1025,7 +1038,13 @@ class StreamingStudio:
 
         if response:
           # 在 LLM 回复前注入低优先前缀（cheap gift + entry）
-          prefix_resp = self._event_responder.consume_prefix()
+          in_comment_session = (
+            self._session_manager.is_active
+            and self._session_manager.session_type == SessionType.COMMENT
+          )
+          prefix_resp = self._event_responder.consume_prefix(
+            include_entry=not in_comment_session
+          )
           if prefix_resp:
             self._chat_log.info("[前缀问候] %s", prefix_resp.content)
             await self._response_queue.put(prefix_resp)
@@ -1126,11 +1145,12 @@ class StreamingStudio:
 
           self._session_manager.evaluate_new_session(new, old)
           self._session_manager.on_comment_arrived(new)
-          # 清空低优先级内容，弹幕优先
+          # 清空低优先级内容 + 旧弹幕待播句，确保新弹幕快速响应
           await self._speech_queue.flush_source("video")
           await self._speech_queue.flush_source("monologue")
           await self._speech_queue.flush_source("session_cont")
           await self._speech_queue.flush_source("event_low")
+          await self._speech_queue.flush_source("danmaku")
 
           # 弹幕聚类
           self._last_cluster_result = None
@@ -1175,6 +1195,18 @@ class StreamingStudio:
 
         # ── Priority 3: VideoSession / 独白 / 主动发言（队列 <=1 时预生成）──
         if self._speech_queue.size <= 1:
+          # 队列中仍有弹幕待播 → 跳过视频生成，等弹幕播完
+          has_pending_danmaku = any(
+            i.source == "danmaku" for i in self._speech_queue._items
+          )
+          if has_pending_danmaku:
+            self._comment_arrived.clear()
+            try:
+              await asyncio.wait_for(self._comment_arrived.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+              pass
+            continue
+
           # 视频播完处理
           if self._video_player and self._video_player.is_finished:
             if not self._in_conversation_mode:
@@ -1186,9 +1218,11 @@ class StreamingStudio:
                   print(f"停止回调错误: {e}")
               break
 
+          # 用 max(reply_time, generate_time) 计算沉默，避免 TTS 排队期间误触发视频解说
+          candidates = [t for t in (self._last_reply_time, self._last_generate_time) if t]
           silence = 0.0
-          if self._last_reply_time:
-            silence = (datetime.now() - self._last_reply_time).total_seconds()
+          if candidates:
+            silence = (datetime.now() - max(candidates)).total_seconds()
           elif self._stream_start_time:
             silence = (datetime.now() - self._stream_start_time).total_seconds()
 
@@ -1269,8 +1303,15 @@ class StreamingStudio:
     """把 EventResponder 中的模板回复 drain 到 SpeechQueue"""
     from connection.speech_broadcaster import SpeechBroadcaster
 
+    in_comment_session = (
+      self._session_manager.is_active
+      and self._session_manager.session_type == SessionType.COMMENT
+    )
+
     # 高优先事件（GUARD / 大礼物 / VIP入场）
-    high_resp = self._event_responder.next_high_priority()
+    high_resp = self._event_responder.next_high_priority(
+      allow_vip_entry=not in_comment_session
+    )
     while high_resp:
       self._chat_log.info("[模板回复] %s", high_resp.content)
       segments = SpeechBroadcaster._parse_segments(high_resp.content)
@@ -1286,10 +1327,14 @@ class StreamingStudio:
           comments=[],
         )
         await self._speech_queue.push(item)
-      high_resp = self._event_responder.next_high_priority()
+      high_resp = self._event_responder.next_high_priority(
+        allow_vip_entry=not in_comment_session
+      )
 
     # 低优先前缀事件（小礼物 / 普通入场）
-    prefix_resp = self._event_responder.consume_prefix()
+    prefix_resp = self._event_responder.consume_prefix(
+      include_entry=not in_comment_session
+    )
     if prefix_resp:
       self._chat_log.info("[前缀问候] %s", prefix_resp.content)
       segments = SpeechBroadcaster._parse_segments(prefix_resp.content)
@@ -1333,6 +1378,12 @@ class StreamingStudio:
 
     self._detect_emotion_from_comments(new_comments)
 
+    # 视频解说/独白：强制 1 句且简短（10 字以内，缩短 TTS 占用时间）
+    max_chars = 0
+    if source in ("monologue", "video"):
+      sentences = 1
+      max_chars = 10
+
     images = None
     if self._current_frame_b64:
       images = [self._current_frame_b64]
@@ -1346,11 +1397,13 @@ class StreamingStudio:
       response = await self._generate_response_streaming(
         old_comments, new_comments, images=images,
         response_style=response_style, sentences=sentences,
+        max_chars=max_chars,
       )
     else:
       response = await self._generate_response(
         old_comments, new_comments, images=images,
         response_style=response_style, sentences=sentences,
+        max_chars=max_chars,
       )
 
     if response is None:
@@ -1358,6 +1411,8 @@ class StreamingStudio:
       return None
 
     self._timer.mark("入队")
+
+    self._last_generate_time = datetime.now()
 
     # 记录 VLM 调用时间（独白/视频用于冷却控制）
     if source in ("monologue", "video"):
@@ -1370,9 +1425,21 @@ class StreamingStudio:
     segments = SpeechBroadcaster._parse_segments(response.content)
     SpeechBroadcaster._apply_chinese_speech(segments, response.response_style)
 
-    # 独白/视频：硬限制单句，丢弃 LLM 多说的部分
-    if source in ("monologue", "video") and len(segments) > 1:
-      segments = segments[:1]
+    # 独白/视频：硬限制单句 + 字数截断，缩短 TTS 占用时间
+    if source in ("monologue", "video"):
+      if len(segments) > 1:
+        segments = segments[:1]
+      if max_chars > 0 and segments:
+        seg = segments[0]
+        text_zh = seg.get("text_zh", "")
+        if len(text_zh) > max_chars:
+          cut = text_zh[:max_chars]
+          last_punct = max(cut.rfind(p) for p in "。！？…，、")
+          if last_punct > max_chars // 2:
+            cut = cut[:last_punct + 1]
+          seg["text_zh"] = cut
+          if seg.get("language") == "Chinese":
+            seg["text"] = cut
 
     for seg in segments:
       item = SpeechItem(
@@ -1554,9 +1621,10 @@ class StreamingStudio:
       print(f"[独白模式] 继续 (第{r + 1}轮)")
       return True
 
+    candidates = [t for t in (self._last_reply_time, self._last_generate_time) if t]
     silence = 0.0
-    if self._last_reply_time:
-      silence = (datetime.now() - self._last_reply_time).total_seconds()
+    if candidates:
+      silence = (datetime.now() - max(candidates)).total_seconds()
     elif self._stream_start_time:
       silence = (datetime.now() - self._stream_start_time).total_seconds()
 
@@ -1988,11 +2056,14 @@ class StreamingStudio:
 
     return f"当前时间 {clock}"
 
-  def _build_style_hint(self, response_style: str, sentences: int) -> str:
+  def _build_style_hint(
+    self, response_style: str, sentences: int, max_chars: int = 0,
+  ) -> str:
     """组装风格指令 + 句数提示 + 上舰感谢参考（如适用）"""
     hint = _STYLE_INSTRUCTIONS.get(response_style, "")
     if sentences > 0:
-      count_hint = f"[本轮句数] 回复{sentences}句话。"
+      brevity = f"，{max_chars}个字以内" if max_chars > 0 else ""
+      count_hint = f"[本轮句数] 回复{sentences}句话{brevity}。"
       hint = f"{count_hint}\n{hint}" if hint else f"{count_hint}\n\n"
     if response_style == "guard_thanks" and self._guard_thanks_reference:
       hint = hint + f"[上舰感谢参考]\n{self._guard_thanks_reference}\n\n"
@@ -2049,6 +2120,7 @@ class StreamingStudio:
     images: Optional[list[str]],
     response_style: str,
     sentences: int,
+    max_chars: int = 0,
   ) -> tuple[str, Optional[str], Optional[list[str]], list[str], str, str, str, int]:
     """
     构建 LLM 调用所需的完整 prompt 及周边参数。
@@ -2155,9 +2227,10 @@ class StreamingStudio:
       response_style = f"style_bank_{style_bank_mode}"
       sentences = 2
 
-    style_hint = self._build_style_hint(response_style, sentences)
+    style_hint = self._build_style_hint(response_style, sentences, max_chars)
     if sentences > 0:
-      prompt = prompt + f"\n\n[本轮句数] 回复{sentences}句话。"
+      brevity = f"，{max_chars}个字以内" if max_chars > 0 else ""
+      prompt = prompt + f"\n\n[本轮句数] 回复{sentences}句话{brevity}。"
     if style_hint:
       prompt = style_hint + prompt
 
@@ -2177,6 +2250,7 @@ class StreamingStudio:
     images: Optional[list[str]] = None,
     response_style: str = "normal",
     sentences: int = 0,
+    max_chars: int = 0,
   ) -> Optional[StreamerResponse]:
     """
     根据弹幕（和视频帧）生成回复
@@ -2190,6 +2264,7 @@ class StreamingStudio:
       images: base64 JPEG 图片列表（VLM 模式下的视频帧）
       response_style: 回复风格 (reaction/brief/normal/detailed)
       sentences: 建议句数（0 = 无建议）
+      max_chars: 字数上限（0 = 不限制）
 
     Returns:
       回复对象
@@ -2197,6 +2272,7 @@ class StreamingStudio:
     prompt, topic_context, reply_images, rag_queries, memory_input, \
       situation, response_style, sentences = self._build_llm_prompt(
       old_comments, new_comments, images, response_style, sentences,
+      max_chars=max_chars,
     )
 
     self._timer.mark("LLM生成")
@@ -2225,6 +2301,7 @@ class StreamingStudio:
     images: Optional[list[str]] = None,
     response_style: str = "normal",
     sentences: int = 0,
+    max_chars: int = 0,
   ) -> Optional[StreamerResponse]:
     """
     流式生成回复，逐 token 分发 ResponseChunk
@@ -2238,6 +2315,7 @@ class StreamingStudio:
       images: base64 JPEG 图片列表（VLM 模式下的视频帧）
       response_style: 回复风格 (reaction/brief/normal/detailed)
       sentences: 建议句数（0 = 无建议）
+      max_chars: 字数上限（0 = 不限制）
 
     Returns:
       完整回复对象（流结束后组装）
@@ -2245,6 +2323,7 @@ class StreamingStudio:
     prompt, topic_context, reply_images, rag_queries, memory_input, \
       situation, response_style, sentences = self._build_llm_prompt(
       old_comments, new_comments, images, response_style, sentences,
+      max_chars=max_chars,
     )
 
     all_comments = old_comments + new_comments
@@ -2322,7 +2401,7 @@ class StreamingStudio:
     return StreamerResponse(**kwargs)
 
   def _apply_expression_mapping(self, text: str) -> tuple[str, tuple]:
-    """对文本做表情/动作语义映射，返回 (映射后文本, 标签元组)"""
+    """对文本做表情/动作/语音情绪语义映射，返回 (映射后文本, 标签元组)"""
     if self._expression_mapper is None:
       return text, ()
     try:
@@ -2330,7 +2409,9 @@ class StreamingStudio:
       tags = tuple(result.tags)
       if tags:
         preview = ", ".join(
-          f"{t.original_action}→{t.mapped_motion} / {t.original_emotion}→{t.mapped_expression}"
+          f"{t.original_action}→{t.mapped_motion} / "
+          f"{t.original_emotion}→{t.mapped_expression} / "
+          f"{t.original_voice_emotion}→{t.mapped_voice_emotion}"
           for t in tags[:3]
         )
         print(f"[表情映射] {preview}")
@@ -2412,6 +2493,9 @@ class StreamingStudio:
       "pending_comment_count": self._pending_comment_count,
       "last_reply_time": (
         self._last_reply_time.isoformat() if self._last_reply_time else None
+      ),
+      "last_generate_time": (
+        self._last_generate_time.isoformat() if self._last_generate_time else None
       ),
       "last_prompt": self._last_prompt,
       "enable_streaming": self.enable_streaming,

@@ -10,7 +10,7 @@
     --screenshot-url http://10.81.7.114:8000/screenshot \
     --danmaku-url http://10.81.7.114:8000/danmaku \
     --persona karin \
-    --model anthropic \
+    --model openai \
     --speech-url http://10.81.7.115:9200/say \
     --frame-interval 5.0
 """
@@ -56,9 +56,9 @@ def parse_args():
     help="主播人设（默认 karin）",
   )
   parser.add_argument(
-    "--model", default="anthropic",
+    "--model", default="openai",
     choices=["openai", "anthropic", "gemini"],
-    help="模型提供者（默认 anthropic）",
+    help="模型提供者（默认 openai）",
   )
   parser.add_argument(
     "--model-name", default=None,
@@ -100,6 +100,18 @@ def parse_args():
     "--callback-host", default=None,
     help="回调 URL 中的 host（TTS 用此地址访问本端），默认自动探测局域网 IP",
   )
+  parser.add_argument(
+    "--disable-local-translation", action="store_true", default=False,
+    help="禁用本地 Qwen 日语补译（默认启用）",
+  )
+  parser.add_argument(
+    "--translator-model-name", default="Qwen/Qwen3-8B",
+    help="本地翻译模型名称（默认 Qwen/Qwen3-8B）",
+  )
+  parser.add_argument(
+    "--translator-base-url", default=None,
+    help="本地翻译模型 OpenAI 兼容接口地址（默认读取 LOCAL_QWEN_BASE_URL 或 http://localhost:8000/v1）",
+  )
 
   return parser.parse_args()
 
@@ -127,6 +139,11 @@ async def main():
   print(f"  记忆持久化: {'关闭（临时模式）' if args.ephemeral_memory else '启用'}")
   print(f"  语音服务: {args.speech_url or '未启用'}")
   print(f"  完播同步: {f'port={args.callback_port}' if args.callback_port else '未启用'}")
+  if args.disable_local_translation:
+    print("  本地翻译: 关闭")
+  else:
+    base_url = args.translator_base_url or "LOCAL_QWEN_BASE_URL / http://localhost:8000/v1"
+    print(f"  本地翻译: {args.translator_model_name} @ {base_url}")
   print("=" * 60)
   print()
 
@@ -175,6 +192,9 @@ async def main():
       model_type=model_type,
       callback_port=args.callback_port,
       callback_host=args.callback_host,
+      translator_enabled=not args.disable_local_translation,
+      translator_model_name=args.translator_model_name,
+      translator_base_url=args.translator_base_url,
     )
     speech.attach(studio)
 

@@ -3,8 +3,14 @@
 所有可调常量汇总在此，方便调整和测试
 """
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Optional
+
+
+def _default_persist_directory() -> Optional[str]:
+  """允许用环境变量临时切换记忆库目录，便于离线修复验证。"""
+  return os.getenv("MEMORY_PERSIST_DIRECTORY", "data/memory_store")
 
 
 @dataclass(frozen=True)
@@ -66,7 +72,7 @@ class RetrievalConfig:
 class EmbeddingConfig:
   """嵌入模型配置"""
   model_name: str = "BAAI/bge-small-zh-v1.5"
-  persist_directory: Optional[str] = "data/memory_store"
+  persist_directory: Optional[str] = field(default_factory=_default_persist_directory)
 
 
 # 静态记忆类别定义：category -> 检索时添加的前缀

@@ -133,7 +133,7 @@ class StreamerResponse:
     content: 回复内容（原始 LLM 输出）
     reply_to: 回复的弹幕ID列表
     timestamp: 回复时间
-    mapped_content: 经过表情/动作映射后的文本（标签已替换为固定集名称）
+    mapped_content: 经过表情/动作/语音情绪映射后的文本（标签已替换为固定集名称）
     expression_motion_tags: 每个标签的映射详情列表
   """
   content: str
@@ -158,10 +158,13 @@ class StreamerResponse:
         {
           "original_action": t.original_action,
           "original_emotion": t.original_emotion,
+          "original_voice_emotion": t.original_voice_emotion,
           "mapped_motion": t.mapped_motion,
           "mapped_expression": t.mapped_expression,
+          "mapped_voice_emotion": t.mapped_voice_emotion,
           "motion_score": t.motion_score,
           "expression_score": t.expression_score,
+          "voice_emotion_score": t.voice_emotion_score,
         }
         for t in self.expression_motion_tags
       ]

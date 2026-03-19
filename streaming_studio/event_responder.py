@@ -17,6 +17,7 @@
 
 import json
 import random
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -26,28 +27,99 @@ from .config import EventResponderConfig
 from .models import Comment, StreamerResponse, EventType, GUARD_LEVEL_NAMES
 
 _GIFT_TIER_NAMES = ("free", "small", "medium", "large")
+_DEFAULT_TEMPLATE_VOICE_EMOTION = "serenity"
 
 _DEFAULT_GUARD_TEMPLATES = {
-  "captain": ["#[wave][happy] 谢谢{nickname}开通舰长！ / {nickname}、艦長ありがとう！"],
-  "admiral": ["#[wave][happy] 谢谢{nickname}开通提督！ / {nickname}、提督ありがとう！"],
-  "governor": ["#[wave][happy] 谢谢{nickname}开通总督！ / {nickname}、総督ありがとう！"],
+  "captain": ["#[wave][happy][joy] 谢谢{nickname}开通舰长！ / {nickname}、艦長ありがとう！"],
+  "admiral": ["#[wave][happy][joy] 谢谢{nickname}开通提督！ / {nickname}、提督ありがとう！"],
+  "governor": ["#[wave][happy][joy] 谢谢{nickname}开通总督！ / {nickname}、総督ありがとう！"],
 }
 
 _DEFAULT_GIFT_TEMPLATES = {
-  "free": {"single": ["#[wave][happy] 谢谢{nickname}的{gift_name}！ / {nickname}、ありがとう！"]},
-  "small": {"single": ["#[wave][happy] 谢谢{nickname}的{gift_name}！ / {nickname}、ありがとう！"]},
-  "medium": {"single": ["#[wave][happy] 谢谢{nickname}的{gift_name}！太感谢了！ / {nickname}、ありがとう！"]},
-  "large": {"single": ["#[wave][happy] 哇！谢谢{nickname}的{gift_name}！ / わぁ！{nickname}、ありがとう！"]},
+  "free": {"single": ["#[wave][happy][joy] 谢谢{nickname}的{gift_name}！ / {nickname}、ありがとう！"]},
+  "small": {"single": ["#[wave][happy][joy] 谢谢{nickname}的{gift_name}！ / {nickname}、ありがとう！"]},
+  "medium": {"single": ["#[wave][happy][joy] 谢谢{nickname}的{gift_name}！太感谢了！ / {nickname}、ありがとう！"]},
+  "large": {"single": ["#[wave][happy][joy] 哇！谢谢{nickname}的{gift_name}！ / わぁ！{nickname}、ありがとう！"]},
 }
 
 _DEFAULT_ENTRY_TEMPLATES = {
-  "single": ["#[wave][happy] 欢迎{nickname}~ / {nickname}いらっしゃい〜"],
-  "batch": ["#[wave][happy] 欢迎{names}~ / {names}いらっしゃい〜"],
-  "crowd": ["#[wave][happy] 欢迎大家~ / みんないらっしゃい〜"],
-  "vip": ["#[wave][happy] 哇！{level}{nickname}来了！ / わぁ！{level}の{nickname}が来た！"],
+  "single": ["#[wave][happy][joy] 欢迎{nickname}~ / {nickname}いらっしゃい〜"],
+  "batch": ["#[wave][happy][joy] 欢迎{names}~ / {names}いらっしゃい〜"],
+  "crowd": ["#[wave][happy][joy] 欢迎大家~ / みんないらっしゃい〜"],
+  "vip": ["#[wave][happy][joy] 哇！{level}{nickname}来了！ / わぁ！{level}の{nickname}が来た！"],
 }
 
 _GUARD_LEVEL_TO_TIER = {1: "captain", 2: "admiral", 3: "governor"}
+_TEMPLATE_TAG_RE = re.compile(r"(#\[[^\]]*\]\[[^\]]*\](?:\[[^\]]*\])?)")
+_TEMPLATE_TAG_PARSE_RE = re.compile(r"#\[([^\]]*)\]\[([^\]]*)\](?:\[([^\]]*)\])?")
+
+
+def _strip_japanese_tail(text: str) -> str:
+  """从模板文本中剥离 ` / ` 后的日语部分，保留原始中文与空白。"""
+  sep_idx = text.find(" / ")
+  return text[:sep_idx] if sep_idx >= 0 else text
+
+
+def _default_voice_emotion_for_template(expression: str) -> str:
+  emotion = expression.strip().lower()
+  mapping = {
+    "happy": "joy",
+    "excited": "anticipation",
+    "smile": "serenity",
+    "friendly": "serenity",
+    "thoughtful": "serenity",
+    "sad": "sadness",
+    "sorry": "sadness",
+    "surprised": "surprise",
+    "angry": "anger",
+    "annoyed": "agitation",
+    "frustrated": "agitation",
+    "curious": "curiosity",
+    "shy": "shyness",
+    "embarrassed": "shyness",
+    "脸红": "shyness",
+    "生气": "anger",
+    "星星": "curiosity",
+    "爱心": "joy",
+    "脸黑": "disgust",
+  }
+  return mapping.get(emotion, _DEFAULT_TEMPLATE_VOICE_EMOTION)
+
+
+def _normalize_template_tag(tag: str) -> str:
+  matched = _TEMPLATE_TAG_PARSE_RE.fullmatch(tag.strip())
+  if not matched:
+    return tag
+  motion = matched.group(1).strip()
+  expression = matched.group(2).strip()
+  voice_emotion = (matched.group(3) or "").strip()
+  if not voice_emotion:
+    voice_emotion = _default_voice_emotion_for_template(expression)
+  return f"#[{motion}][{expression}][{voice_emotion}]"
+
+
+def _normalize_template_text(text: str) -> str:
+  """将双语模板归一化为中文主文本，保留三标签。"""
+  if not text:
+    return text
+
+  parts = _TEMPLATE_TAG_RE.split(text)
+  if len(parts) == 1:
+    return _strip_japanese_tail(text).strip()
+
+  rebuilt: list[str] = []
+  leading = _strip_japanese_tail(parts[0]).strip()
+  if leading:
+    rebuilt.append(leading)
+
+  i = 1
+  while i + 1 < len(parts):
+    tag = _normalize_template_tag(parts[i])
+    body = _strip_japanese_tail(parts[i + 1]).rstrip()
+    rebuilt.append(f"{tag}{body}")
+    i += 2
+
+  return "".join(rebuilt).strip()
 
 
 class EventTemplateResponder:
@@ -117,8 +189,14 @@ class EventTemplateResponder:
       else:
         self._entry_queue.append((now, comment))
 
-  def next_high_priority(self) -> Optional[StreamerResponse]:
-    """取出最高优先级的 GUARD/GIFT/VIP入场 事件（优先级高于弹幕）"""
+  def next_high_priority(
+    self,
+    allow_vip_entry: bool = True,
+  ) -> Optional[StreamerResponse]:
+    """取出最高优先级的 GUARD/GIFT/VIP入场 事件（优先级高于弹幕）
+
+    allow_vip_entry=False 时，保留 VIP 入场队列，避免打断弹幕会话。
+    """
     self._expire_stale()
 
     if self._guard_queue:
@@ -127,12 +205,15 @@ class EventTemplateResponder:
     if self._gift_queue and self._cooldown_ready("gift"):
       return self._build_gift_response()
 
-    if self._vip_entry_queue:
+    if allow_vip_entry and self._vip_entry_queue:
       return self._build_vip_entry_response()
 
     return None
 
-  def consume_prefix(self) -> Optional[StreamerResponse]:
+  def consume_prefix(
+    self,
+    include_entry: bool = True,
+  ) -> Optional[StreamerResponse]:
     """消费低优先事件生成前缀回复（附带在 LLM 回复之前）
 
     合并 cheap_gift + normal_entry 为一条短消息。
@@ -142,7 +223,7 @@ class EventTemplateResponder:
     self._expire_stale()
     if not self._cooldown_ready("prefix"):
       return None
-    if not self._cheap_gift_queue and not self._entry_queue:
+    if not self._cheap_gift_queue and not (include_entry and self._entry_queue):
       return None
 
     parts = []
@@ -153,13 +234,13 @@ class EventTemplateResponder:
       parts.append(text)
       reply_ids.extend(ids)
 
-    if self._entry_queue:
+    if include_entry and self._entry_queue:
       text, ids = self._build_entry_text()
       parts.append(text)
       reply_ids.extend(ids)
 
     self._last_prefix_time = time.monotonic()
-    combined = " ".join(parts)
+    combined = _normalize_template_text(" ".join(parts))
     return StreamerResponse(
       content=combined,
       reply_to=tuple(reply_ids),
@@ -183,9 +264,9 @@ class EventTemplateResponder:
     pool = self._guard_templates.get(tier, [])
     n = self._config.guard_min_sentences
     templates = self._pick_multiple_templates(f"guard_{tier}", pool, n)
-    text = " ".join(
+    text = _normalize_template_text(" ".join(
       t.format(nickname=comment.nickname, level=level) for t in templates
-    )
+    ))
 
     return StreamerResponse(
       content=text,
@@ -248,21 +329,21 @@ class EventTemplateResponder:
       )
       if n_sentences > 1:
         templates = self._pick_multiple_templates(f"gift_{tier_name}_single", pool, n_sentences)
-        text = " ".join(t.format(**fmt_kwargs) for t in templates)
+        text = _normalize_template_text(" ".join(t.format(**fmt_kwargs) for t in templates))
       else:
         template = self._pick_template(f"gift_{tier_name}_single", pool)
-        text = template.format(**fmt_kwargs)
+        text = _normalize_template_text(template.format(**fmt_kwargs))
     else:
       pool = tier_templates.get("batch", tier_templates.get("single", []))
       template = self._pick_template(f"gift_{tier_name}_batch", pool)
       names = self._format_names(nicknames, max_n=self._config.entry_max_names)
-      text = template.format(
+      text = _normalize_template_text(template.format(
         names=names,
         nickname=nicknames[0],
         gift_name=comments[0].gift_name or "礼物",
         gift_num=sum(c.gift_num for c in comments),
         num_str="",
-      )
+      ))
 
     reply_to = tuple(c.id for c in comments)
     return StreamerResponse(
@@ -278,7 +359,9 @@ class EventTemplateResponder:
 
     pool = self._entry_templates.get("vip", [])
     template = self._pick_template("entry_vip", pool)
-    text = template.format(nickname=comment.nickname, level=level_name)
+    text = _normalize_template_text(
+      template.format(nickname=comment.nickname, level=level_name)
+    )
 
     return StreamerResponse(
       content=text,
@@ -311,23 +394,23 @@ class EventTemplateResponder:
       pool = tier_templates.get("single", [])
       template = self._pick_template(f"gift_{tier_name}_single", pool)
       num_str = f"x{c.gift_num}" if c.gift_num > 1 else ""
-      text = template.format(
+      text = _normalize_template_text(template.format(
         nickname=c.nickname,
         gift_name=c.gift_name or "礼物",
         gift_num=c.gift_num,
         num_str=num_str,
-      )
+      ))
     else:
       pool = tier_templates.get("batch", tier_templates.get("single", []))
       template = self._pick_template(f"gift_{tier_name}_batch", pool)
       names = self._format_names(nicknames, max_n=self._config.entry_max_names)
-      text = template.format(
+      text = _normalize_template_text(template.format(
         names=names,
         nickname=nicknames[0],
         gift_name=comments[0].gift_name or "礼物",
         gift_num=sum(c.gift_num for c in comments),
         num_str="",
-      )
+      ))
 
     return text, [c.id for c in comments]
 
@@ -350,18 +433,18 @@ class EventTemplateResponder:
       category = "single"
       pool = self._entry_templates.get(category, [])
       template = self._pick_template(f"entry_{category}", pool)
-      text = template.format(nickname=nicknames[0])
+      text = _normalize_template_text(template.format(nickname=nicknames[0]))
     elif count < self._config.entry_crowd_threshold:
       category = "batch"
       pool = self._entry_templates.get(category, [])
       template = self._pick_template(f"entry_{category}", pool)
       names = self._format_names(nicknames, max_n=self._config.entry_max_names)
-      text = template.format(names=names)
+      text = _normalize_template_text(template.format(names=names))
     else:
       category = "crowd"
       pool = self._entry_templates.get(category, [])
       template = self._pick_template(f"entry_{category}", pool)
-      text = template
+      text = _normalize_template_text(template)
 
     return text, [c.id for c in comments]
 
@@ -411,7 +494,7 @@ class EventTemplateResponder:
 
   def _pick_template(self, category_key: str, pool: list[str]) -> str:
     if not pool:
-      return "#[wave][happy] 谢谢！ / ありがとう！"
+      return "#[wave][happy] 谢谢！"
 
     if category_key not in self._recent_indices:
       self._recent_indices[category_key] = deque(maxlen=self._config.recent_dedup_count)

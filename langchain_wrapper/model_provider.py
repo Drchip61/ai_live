@@ -20,6 +20,9 @@ class ModelType(Enum):
   LOCAL_QWEN = "local_qwen"
 
 
+# OpenAI 默认大模型
+DEFAULT_OPENAI_LARGE = "gpt-5.4"
+
 # Anthropic 默认大模型（统一单一来源，避免多处硬编码不一致）
 DEFAULT_ANTHROPIC_LARGE = "claude-sonnet-4-6"
 # Anthropic 默认小模型（使用无日期别名，便于平滑升级）
@@ -29,7 +32,7 @@ DEFAULT_ANTHROPIC_SMALL = "claude-haiku-4-5"
 # 预设远程模型名称映射
 REMOTE_MODELS = {
   ModelType.OPENAI: {
-    "large": "gpt-5.2",
+    "large": DEFAULT_OPENAI_LARGE,
     "small": "gpt-5-mini",
   },
   ModelType.ANTHROPIC: {
@@ -121,7 +124,7 @@ class ModelProvider:
       raise ValueError("未配置 OpenAI API Key，请设置环境变量 OPENAI_API_KEY 或在 secrets/api_keys.json 中配置")
 
     return ChatOpenAI(
-      model=model_name or "gpt-5.2",
+      model=model_name or DEFAULT_OPENAI_LARGE,
       api_key=api_key,
       **kwargs
     )
@@ -181,7 +184,9 @@ class ModelProvider:
     """
     from langchain_openai import ChatOpenAI
 
-    base_url = self._get_secret("local_qwen_base_url")
+    base_url = kwargs.pop("base_url", None)
+    if not base_url:
+      base_url = self._get_secret("local_qwen_base_url")
     if not base_url:
       base_url = "http://localhost:8000/v1"
 
@@ -208,7 +213,7 @@ class ModelProvider:
     用途：主对话、复杂推理
 
     Args:
-      provider: 模型源，默认 OpenAI (gpt-5.2)
+      provider: 模型源，默认 OpenAI (gpt-5.4)
                 支持 ANTHROPIC (claude-sonnet-4-6)
     """
     model_name = REMOTE_MODELS[provider]["large"]

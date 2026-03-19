@@ -483,7 +483,7 @@ class TopicManager:
   # 无弹幕独白层（独立于话题表的 significance 生命周期）
   # ------------------------------------------------------------------
 
-  _EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\]\s*")
+  _EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\](?:\[[^\]]*\])?\s*")
   _MONOLOGUE_TEMPLATE: Optional[str] = None
 
   @classmethod

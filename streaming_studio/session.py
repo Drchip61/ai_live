@@ -35,7 +35,7 @@ _OPINION_MARKERS = re.compile(
   r"讲讲|说说|聊聊|介绍|评价|看法"
 )
 
-_EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\]\s*")
+_EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\](?:\[[^\]]*\])?\s*")
 
 
 class SessionType(str, Enum):

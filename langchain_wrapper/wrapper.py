@@ -40,7 +40,7 @@ _INJECTION_HINT_PATTERNS = [
   re.compile(r"(?i)(系统提示|提示词|忽略之前|忽略以上|越狱|注入)"),
 ]
 
-_EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\]")
+_EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\](?:\[[^\]]*\])?")
 
 
 def _strip_bilingual_for_memory(text: str) -> str:

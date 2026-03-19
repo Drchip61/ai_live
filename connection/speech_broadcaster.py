@@ -1,16 +1,20 @@
 """
 语音服务广播器
-将主播回复（内嵌中日双语）拆分后发送给语音合成+动作控制服务
+将主播回复拆分后发送给语音合成+动作控制服务
 
-主对话模型直接输出 '中文 / 日語' 格式，本模块只做解析和发送，无翻译步骤。
+主对话模型默认只输出中文，本模块在发往 TTS 前按规则决定：
+- 保留中文播报
+- 或调用本地 Qwen 生成日语播报
 
 支持完播同步：配置 callback_port 后，本端启动 HTTP 服务器接收 TTS 完播回调，
 主循环在语音播放完毕前不会生成下一条回复。
 
 数据流:
   StreamerResponse
-    → 按 #[motion][emotion] 标签拆分为片段
-    → 从每段提取 text_zh（中文）和 text（日语）
+    → 按 #[motion][emotion][voice_emotion] 标签拆分为片段
+    → 从每段提取 text_zh（中文）和 text/text_ja（已有日语或待补译）
+    → 应用中文优先播报规则
+    → 对需要日语播报的片段调用本地翻译
     → 逐段 POST 到语音 API（segment + batch_id + callback_url）
     → 等待 TTS 完播回调（可选）
 """
@@ -32,9 +36,11 @@ from streaming_studio.models import StreamerResponse
 
 logger = logging.getLogger(__name__)
 
-_TAG_RE = re.compile(r"#\[([^\]]*)\]\[([^\]]*)\]")
+_TAG_RE = re.compile(r"#\[([^\]]*)\]\[([^\]]*)\](?:\[([^\]]*)\])?")
+_EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\](?:\[[^\]]*\])?")
 _DEFAULT_EMOTION = "- -"
 _DEFAULT_MOTION = "Idle"
+_DEFAULT_VOICE_EMOTION = "serenity"
 
 _CHINESE_SPEECH_RE = re.compile(
   r"谢谢|感谢|多谢|谢啦|太感[谢动]|欢迎|来[了啦]"
@@ -42,13 +48,27 @@ _CHINESE_SPEECH_RE = re.compile(
 )
 
 _TRANSLATE_JA_SINGLE = (
+  "/no_think\n"
   "你是中日翻译器。将以下中文翻译成自然的日语口语。"
-  "保持说话者的语气和情感。只输出日语译文，不要任何解释。\n\n{text}"
+  "保持说话者的语气和情感。只输出日语译文，不要任何解释、说明或思考过程。\n\n{text}"
 )
 
 _TRANSLATE_JA_BATCH = (
+  "/no_think\n"
   "你是中日翻译器。将以下中文句子逐行翻译成自然的日语口语。"
-  "保持说话者的语气和情感。保持原始编号和行数，每行只输出日语译文。\n\n{lines}"
+  "保持说话者的语气和情感。保持原始编号和行数，每行只输出日语译文，不要解释或思考过程。\n\n{lines}"
+)
+
+_TRANSLATE_EN_SINGLE = (
+  "/no_think\n"
+  "You are a Chinese to English translator. Translate the following Chinese into natural spoken English. "
+  "Only output the translation, with no explanation or reasoning.\n\n{text}"
+)
+
+_TRANSLATE_EN_BATCH = (
+  "/no_think\n"
+  "You are a Chinese to English translator. Translate the following Chinese lines into natural spoken English. "
+  "Preserve the original numbering and line count. Only output the translated lines, with no explanation or reasoning.\n\n{lines}"
 )
 
 
@@ -66,10 +86,10 @@ def _detect_local_ip() -> str:
 
 class SpeechBroadcaster:
   """
-  监听主播回复，翻译后整体发送给语音/动作控制服务。
+  监听主播回复，在发往 TTS 前补齐最终播报文本。
 
-  将 StreamerResponse 按 #[motion][emotion] 标签拆分为片段，
-  批量翻译为日语+英语，整体 POST 到语音 API。
+  将 StreamerResponse 按 #[motion][emotion][voice_emotion] 标签拆分为片段，
+  对需要日语播报的片段调用本地翻译，再逐段 POST 到语音 API。
 
   配置 callback_port 后启用完播同步：
     - 本端启动 HTTP 服务器接收 TTS 完播回调
@@ -83,7 +103,7 @@ class SpeechBroadcaster:
       "timestamp": 1234567890.0,
       "segments": [
         {"text": "日語", "text_zh": "中文",
-         "emotion": "脸红", "motion": "Idle"},
+         "emotion": "脸红", "motion": "Idle", "voice_emotion": "joy"},
         ...
       ]
     }
@@ -101,12 +121,27 @@ class SpeechBroadcaster:
     enabled: bool = True,
     callback_port: Optional[int] = None,
     callback_host: Optional[str] = None,
+    translator_enabled: bool = True,
+    translator_model_name: str = "Qwen/Qwen3-8B",
+    translator_base_url: Optional[str] = None,
   ):
     self._url = api_url
     self._timeout = timeout
-    self._model = ModelProvider.remote_small(model_type)
     self._background_tasks: set[asyncio.Task] = set()
     self.enabled = enabled
+    self._translator_enabled = translator_enabled
+    self._translator_model_name = translator_model_name
+    self._translator_base_url = translator_base_url
+    self._translator = None
+    if translator_enabled:
+      translator_kwargs = {}
+      if translator_base_url:
+        translator_kwargs["base_url"] = translator_base_url
+      self._translator = ModelProvider().get_model(
+        ModelType.LOCAL_QWEN,
+        model_name=translator_model_name,
+        **translator_kwargs,
+      )
 
     # 完播回调
     self._callback_port = callback_port
@@ -175,7 +210,13 @@ class SpeechBroadcaster:
     studio.set_speech_gate(self.wait_for_playback)
     studio.set_speech_broadcaster(self)
     state = "开启" if self.enabled else "关闭（待手动开启）"
+    translator_state = (
+      f"{self._translator_model_name} @ "
+      f"{self._translator_base_url or 'LOCAL_QWEN_BASE_URL / http://localhost:8000/v1'}"
+      if self._translator_enabled else "关闭"
+    )
     print(f"[语音广播] 已挂载，目标: {self._url}，状态: {state}")
+    print(f"[语音广播] 本地翻译: {translator_state}")
     if self._callback_port:
       print(f"[语音广播] 完播同步: 已启用 (port={self._callback_port})")
     else:
@@ -261,7 +302,7 @@ class SpeechBroadcaster:
     await wait_for_playback() 等待完播回调。
 
     Args:
-      segment: TTS 段字典（text, text_zh, emotion, motion, language 等）
+      segment: TTS 段字典（text, text_zh, emotion, motion, voice_emotion, language 等）
 
     Returns:
       True 表示 POST 成功（2xx），False 表示失败
@@ -272,7 +313,7 @@ class SpeechBroadcaster:
     self._pending_batch_id = str(uuid.uuid4())
     self._playback_done.clear()
 
-    seg = dict(segment)
+    seg = (await self._prepare_segments_for_tts([dict(segment)]))[0]
     seg["timestamp"] = time.time()
     seg["batch_id"] = self._pending_batch_id
     seg["seq"] = 0
@@ -289,7 +330,7 @@ class SpeechBroadcaster:
   # ── 处理管线（旧路径，_on_response 回调使用）──────────
 
   async def _process(self, response: StreamerResponse) -> None:
-    """解析内嵌双语 → 逐条发送（无翻译步骤）"""
+    """解析标签并补齐最终播报文本后逐条发送。"""
     try:
       t_start = time.monotonic()
       segments = self._parse_segments(response.content)
@@ -298,6 +339,7 @@ class SpeechBroadcaster:
         return
 
       self._apply_chinese_speech(segments, response.response_style)
+      segments = await self._prepare_segments_for_tts(segments)
 
       total = len(segments)
       all_ok = True
@@ -346,10 +388,57 @@ class SpeechBroadcaster:
         seg["text"] = seg["text_zh"]
         seg["language"] = "Chinese"
 
+  async def _prepare_segments_for_tts(self, segments: list[dict]) -> list[dict]:
+    """根据最终 language 决定保留中文播报，还是在发送前补出日语。"""
+    if not segments:
+      return segments
+
+    translate_indices: list[int] = []
+    translate_texts: list[str] = []
+
+    for idx, seg in enumerate(segments):
+      text_zh = (seg.get("text_zh") or "").strip()
+      text_ja = (seg.get("text_ja") or "").strip()
+      language = seg.get("language", "Japanese")
+
+      if language != "Japanese":
+        if text_zh:
+          seg["text"] = text_zh
+        if not seg.get("text_ja"):
+          seg["text_ja"] = text_zh
+        continue
+
+      if text_zh and text_ja and text_ja != text_zh:
+        seg["text"] = text_ja
+        continue
+
+      if text_zh:
+        translate_indices.append(idx)
+        translate_texts.append(text_zh)
+
+    if not translate_texts:
+      return segments
+
+    translated, translation_ok = await self._translate_batch(translate_texts, lang="ja")
+    for idx, ja in zip(translate_indices, translated):
+      seg = segments[idx]
+      text_zh = (seg.get("text_zh") or "").strip()
+      text_ja = (ja or "").strip()
+      if translation_ok and text_ja:
+        seg["text"] = text_ja
+        seg["text_ja"] = text_ja
+        seg["language"] = "Japanese"
+      else:
+        seg["text"] = text_zh
+        seg["text_ja"] = text_zh
+        seg["language"] = "Chinese"
+
+    return segments
+
   @staticmethod
   def _extract_chinese(content: str) -> str:
     """剥离表情标签和日语翻译，只保留纯中文文本"""
-    parts = _TAG_RE.split(content)
+    parts = _EXPRESSION_TAG_RE.split(content)
     chinese_parts = []
     for part in parts:
       part = part.strip()
@@ -376,69 +465,74 @@ class SpeechBroadcaster:
     return (text.strip(), text.strip())
 
   @staticmethod
+  def _build_segment(
+    raw: str,
+    motion: str = _DEFAULT_MOTION,
+    emotion: str = _DEFAULT_EMOTION,
+    voice_emotion: str = _DEFAULT_VOICE_EMOTION,
+  ) -> dict:
+    zh, ja = SpeechBroadcaster._split_bilingual(raw)
+    return {
+      "text": ja,
+      "text_zh": zh,
+      "text_ja": ja,
+      "language": "Japanese",
+      "emotion": emotion,
+      "motion": motion,
+      "voice_emotion": voice_emotion,
+    }
+
+  @staticmethod
   def _parse_segments(content: str) -> list[dict]:
     """
-    按 #[motion][emotion] 标签拆分文本为片段，并提取内嵌双语。
+    按 #[motion][emotion][voice_emotion] 标签拆分文本为片段，并提取内嵌双语。
 
-    格式: "#[Jump][星星]好厉害！ / すごい！#[Nod][- -]嗯嗯"
+    格式: "#[Jump][星星][joy]好厉害！ / すごい！#[Nod][- -][serenity]嗯嗯"
       → [
-          {"text": "すごい！", "text_zh": "好厉害！", "emotion": "星星", "motion": "Jump"},
-          {"text": "嗯嗯", "text_zh": "嗯嗯", "emotion": "- -", "motion": "Nod"},
+          {"text": "すごい！", "text_zh": "好厉害！", "emotion": "星星", "motion": "Jump", "voice_emotion": "joy"},
+          {"text": "嗯嗯", "text_zh": "嗯嗯", "emotion": "- -", "motion": "Nod", "voice_emotion": "serenity"},
         ]
+
+    兼容旧双标签输入：缺第三标签时自动补默认 voice_emotion。
     """
-    parts = _TAG_RE.split(content)
     segments = []
+    matches = list(_TAG_RE.finditer(content))
 
-    leading = parts[0].strip()
-    if leading:
-      zh, ja = SpeechBroadcaster._split_bilingual(leading)
-      segments.append({
-        "text": ja,
-        "text_zh": zh,
-        "text_ja": ja,
-        "language": "Japanese",
-        "emotion": _DEFAULT_EMOTION,
-        "motion": _DEFAULT_MOTION,
-      })
-
-    i = 1
-    while i + 2 < len(parts):
-      motion = parts[i].strip() or _DEFAULT_MOTION
-      emotion = parts[i + 1].strip() or _DEFAULT_EMOTION
-      raw = parts[i + 2].strip()
-      if raw:
-        zh, ja = SpeechBroadcaster._split_bilingual(raw)
-        segments.append({
-          "text": ja,
-          "text_zh": zh,
-          "text_ja": ja,
-          "language": "Japanese",
-          "emotion": emotion,
-          "motion": motion,
-        })
-      i += 3
-
-    if not segments:
+    if not matches:
       clean = _TAG_RE.sub("", content).strip()
       if clean:
-        zh, ja = SpeechBroadcaster._split_bilingual(clean)
-        segments.append({
-          "text": ja,
-          "text_zh": zh,
-          "text_ja": ja,
-          "language": "Japanese",
-          "emotion": _DEFAULT_EMOTION,
-          "motion": _DEFAULT_MOTION,
-        })
+        segments.append(SpeechBroadcaster._build_segment(clean))
+      return segments
+
+    leading = content[:matches[0].start()].strip()
+    if leading:
+      segments.append(SpeechBroadcaster._build_segment(leading))
+
+    for idx, match in enumerate(matches):
+      motion = match.group(1).strip() or _DEFAULT_MOTION
+      emotion = match.group(2).strip() or _DEFAULT_EMOTION
+      voice_emotion = (match.group(3) or "").strip() or _DEFAULT_VOICE_EMOTION
+      body_start = match.end()
+      body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(content)
+      raw = content[body_start:body_end].strip()
+      if raw:
+        segments.append(SpeechBroadcaster._build_segment(
+          raw,
+          motion=motion,
+          emotion=emotion,
+          voice_emotion=voice_emotion,
+        ))
 
     return segments
 
   async def _translate_batch(
     self, texts: list[str], lang: str = "ja",
-  ) -> list[str]:
-    """用小模型批量翻译，lang: 'ja' 或 'en'"""
+  ) -> tuple[list[str], bool]:
+    """用小模型批量翻译，返回 (译文列表, 是否调用成功)。"""
     if not texts:
-      return []
+      return [], True
+    if self._translator is None:
+      return texts, False
 
     if lang == "en":
       tpl_single, tpl_batch = _TRANSLATE_EN_SINGLE, _TRANSLATE_EN_BATCH
@@ -452,28 +546,29 @@ class SpeechBroadcaster:
       prompt = tpl_batch.format(lines=numbered)
 
     try:
-      result = await self._model.ainvoke([HumanMessage(content=prompt)])
+      result = await self._translator.ainvoke([HumanMessage(content=prompt)])
       raw = result.content if hasattr(result, "content") else str(result)
       translated = self._parse_translation(raw, len(texts))
       logger.info("翻译完成 [%s]: %s → %s", lang, texts, translated)
-      return translated
+      return translated, True
     except Exception as e:
       logger.error("翻译失败 [%s]，降级为中文: %s", lang, e)
       print(f"[语音广播] 翻译失败 [{lang}]，降级为中文: {e}")
-      return texts
+      return texts, False
 
   @staticmethod
   def _parse_translation(raw: str, expected: int) -> list[str]:
     """解析翻译结果，提取逐行译文"""
     if expected == 1:
-      return [raw.strip()]
+      cleaned = re.sub(r"^(?:\d+[\.\、\)\]\s]+|[-*]\s+)", "", raw.strip()).strip()
+      return [cleaned]
 
     lines = []
     for line in raw.strip().splitlines():
       line = line.strip()
       if not line:
         continue
-      cleaned = re.sub(r"^\d+[\.\、\)\]\s]+", "", line).strip()
+      cleaned = re.sub(r"^(?:\d+[\.\、\)\]\s]+|[-*]\s+)", "", line).strip()
       if cleaned:
         lines.append(cleaned)
 
@@ -501,11 +596,12 @@ class SpeechBroadcaster:
       seq = segment["seq"]
       total = segment["total"]
       zh = segment.get("text_zh", "")[:60]
-      ja = segment["text"][:60]
+      spoken = segment["text"][:60]
+      language = segment.get("language", "Japanese")
       print(
         f"[语音广播] [{status}] batch={bid}… ({seq+1}/{total})\n"
-        f"  [{segment['emotion']}][{segment['motion']}] "
-        f"zh: {zh} / ja: {ja}"
+        f"  [{segment['motion']}][{segment['emotion']}][{segment.get('voice_emotion', _DEFAULT_VOICE_EMOTION)}] "
+        f"lang: {language} | zh: {zh} | tts: {spoken}"
       )
       if status >= 400:
         print(f"[语音广播] TTS 返回 {status}，跳过等待回调")

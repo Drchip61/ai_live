@@ -1,7 +1,7 @@
 """
 表情动作语义映射器
 
-将 LLM 输出的自由文本 #[action][emotion] 标签映射到
+将 LLM 输出的自由文本 #[action][emotion][voice_emotion] 标签映射到
 expression_motion_mapping.json 中的固定集合。
 
 采用 sentence embedding + cosine similarity 实现语义最近邻匹配，
@@ -19,7 +19,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_TAG_PATTERN = re.compile(r"#\[([^\]]*)\]\[([^\]]*)\]")
+_TAG_PATTERN = re.compile(r"#\[([^\]]*)\]\[([^\]]*)\](?:\[([^\]]*)\])?")
+_DEFAULT_VOICE_EMOTION = "serenity"
 
 # 中英双语关键词扩展，提升跨语言 embedding 匹配准确率。
 # key = mapping.json 中的 name，value = 追加的英文同义词列表。
@@ -38,6 +39,21 @@ _EMOTION_KEYWORDS: dict[str, list[str]] = {
     "脸黑": ["dark face", "speechless", "cringe", "awkward", "fail", "facepalm"],
     "荷包蛋": ["fried egg", "mind blown", "exhausted", "done", "broken", "overwhelmed", "shocked"],
     "阿尼亚": ["anya", "curious", "cute", "breaking character", "surprised", "waku waku"],
+}
+
+_VOICE_EMOTION_KEYWORDS: dict[str, list[str]] = {
+    "joy": ["happy", "joyful", "cheerful", "delighted", "playful", "开心", "快乐", "雀跃"],
+    "anticipation": ["anticipation", "excited", "eager", "expectant", "hyped", "期待", "兴奋", "跃跃欲试"],
+    "anger": ["anger", "angry", "mad", "furious", "rage", "生气", "火大", "发怒"],
+    "disgust": ["disgust", "grossed out", "repulsed", "revolted", "嫌弃", "厌恶", "反感"],
+    "sadness": ["sadness", "sad", "down", "depressed", "heartbroken", "难过", "失落", "委屈"],
+    "surprise": ["surprise", "surprised", "shocked", "startled", "惊讶", "意外", "吃惊"],
+    "fear": ["fear", "afraid", "scared", "terrified", "nervous", "害怕", "紧张", "担心"],
+    "serenity": ["serenity", "calm", "gentle", "steady", "neutral", "平静", "温柔", "自然"],
+    "curiosity": ["curiosity", "curious", "interested", "intrigued", "好奇", "想知道", "感兴趣"],
+    "agitation": ["agitation", "restless", "irritated", "worked up", "烦躁", "焦躁", "急了"],
+    "shyness": ["shyness", "shy", "bashful", "flustered", "害羞", "不好意思", "扭捏"],
+    "indignation": ["indignation", "indignant", "resentful", "wronged", "不服", "愤愤不平", "抗议"],
 }
 
 _MOTION_KEYWORDS: dict[str, list[str]] = {
@@ -104,16 +120,59 @@ _EN_ZH_MOTION: dict[str, str] = {
     "jump": "跳跃 开心 兴奋",
 }
 
+_EN_ZH_VOICE_EMOTION: dict[str, str] = {
+    "joy": "喜悦 开心 快乐 雀跃 轻快",
+    "anticipation": "期待 兴奋 激动 跃跃欲试 迫不及待",
+    "anger": "生气 愤怒 火大 恼火 发火",
+    "disgust": "嫌弃 厌恶 反感 无语 不耐烦",
+    "sadness": "难过 失落 悲伤 委屈 沮丧",
+    "surprise": "惊讶 意外 吃惊 吓一跳",
+    "fear": "害怕 紧张 担心 惊恐 忐忑",
+    "serenity": "平静 温柔 放松 稳定 自然",
+    "curiosity": "好奇 想知道 感兴趣 探究",
+    "agitation": "烦躁 焦躁 急了 情绪上来 不安",
+    "shyness": "害羞 不好意思 扭捏 脸红",
+    "indignation": "不服 愤愤不平 抗议 觉得委屈 被冤枉",
+    "happy": "喜悦 开心 快乐 雀跃",
+    "excited": "期待 兴奋 激动 跃跃欲试",
+    "friendly": "平静 温柔 亲切 自然",
+    "thoughtful": "平静 稳定 冷静 温和",
+    "sad": "难过 失落 悲伤 委屈",
+    "angry": "生气 愤怒 恼火 发火",
+    "sorry": "难过 低落 委屈 抱歉",
+    "shy": "害羞 不好意思 扭捏 脸红",
+    "embarrassed": "害羞 尴尬 不好意思 慌乱",
+    "proud": "喜悦 得意 开心 自信",
+    "curious": "好奇 想知道 感兴趣",
+    "bored": "平静 冷淡 无聊 放空",
+    "annoyed": "烦躁 焦躁 不耐烦 火气上来",
+    "surprised": "惊讶 意外 吃惊 吓一跳",
+    "confused": "好奇 困惑 想弄明白",
+    "determined": "期待 坚定 蓄势待发 想冲",
+    "playful": "喜悦 轻快 调皮 活泼",
+    "smug": "不服 得意 抗议 嘚瑟",
+    "nervous": "害怕 紧张 忐忑",
+    "touched": "平静 温柔 感动 安静",
+    "love": "喜悦 温柔 真诚 开心",
+    "worry": "害怕 担心 忧虑",
+    "flustered": "害羞 慌乱 手足无措",
+    "cold": "嫌弃 冷淡 反感",
+    "speechless": "嫌弃 无语 反感",
+}
+
 
 @dataclass
 class MappedTag:
-    """一个 #[action][emotion] 标签的映射结果"""
+    """一个 #[action][emotion][voice_emotion] 标签的映射结果"""
     original_action: str
     original_emotion: str
+    original_voice_emotion: str
     mapped_motion: str
     mapped_expression: str
+    mapped_voice_emotion: str
     motion_score: float
     expression_score: float
+    voice_emotion_score: float
 
 
 @dataclass
@@ -125,7 +184,7 @@ class MapperResult:
 
 class ExpressionMotionMapper:
     """
-    语义映射器：LLM 自由标签 → 固定表情/动作集
+    语义映射器：LLM 自由标签 → 固定动作/表情/语音情绪集
 
     初始化时从 mapping JSON 加载目标集合并预计算 embeddings，
     运行时用 cosine similarity 做最近邻查找。
@@ -141,13 +200,16 @@ class ExpressionMotionMapper:
 
         raw = json.loads(mapping_path.read_text(encoding="utf-8"))
         self._emotions: list[dict] = raw.get("emotions", [])
+        self._voice_emotions: list[dict] = raw.get("voice_emotions", [])
         self._motions: list[dict] = raw.get("motions", [])
 
         self._embeddings = embeddings
         self._emotion_names: list[str] = [e["name"] for e in self._emotions]
+        self._voice_emotion_names: list[str] = [v["name"] for v in self._voice_emotions]
         self._motion_names: list[str] = [m["name"] for m in self._motions]
 
         self._emotion_vectors: Optional[np.ndarray] = None
+        self._voice_emotion_vectors: Optional[np.ndarray] = None
         self._motion_vectors: Optional[np.ndarray] = None
 
         if embeddings is not None:
@@ -168,6 +230,12 @@ class ExpressionMotionMapper:
             text = f"{e['name']} ({', '.join(kw)}): {e['desc']}" if kw else f"{e['name']}: {e['desc']}"
             emotion_texts.append(text)
 
+        voice_texts = []
+        for v in self._voice_emotions:
+            kw = _VOICE_EMOTION_KEYWORDS.get(v["name"], [])
+            text = f"{v['name']} ({', '.join(kw)}): {v['desc']}" if kw else f"{v['name']}: {v['desc']}"
+            voice_texts.append(text)
+
         motion_texts = []
         for m in self._motions:
             kw = _MOTION_KEYWORDS.get(m["name"], [])
@@ -176,24 +244,30 @@ class ExpressionMotionMapper:
 
         try:
             ev = self._embeddings.embed_documents(emotion_texts)
+            vv = self._embeddings.embed_documents(voice_texts)
             mv = self._embeddings.embed_documents(motion_texts)
             self._emotion_vectors = self._normalize(np.array(ev, dtype=np.float32))
+            self._voice_emotion_vectors = self._normalize(np.array(vv, dtype=np.float32))
             self._motion_vectors = self._normalize(np.array(mv, dtype=np.float32))
             logger.info(
-                "ExpressionMotionMapper 预计算完成: %d emotions, %d motions",
-                len(self._emotion_names), len(self._motion_names),
+                "ExpressionMotionMapper 预计算完成: %d emotions, %d voice_emotions, %d motions",
+                len(self._emotion_names), len(self._voice_emotion_names), len(self._motion_names),
             )
         except Exception as e:
             logger.error("ExpressionMotionMapper 预计算失败: %s", e)
 
     def map_response(self, text: str) -> MapperResult:
         """
-        解析并映射整段回复文本中所有 #[action][emotion] 标签。
+        解析并映射整段回复文本中所有标签。
 
         Returns:
             MapperResult，包含替换后文本和每个标签的映射详情。
         """
-        if self._emotion_vectors is None or self._motion_vectors is None:
+        if (
+            self._emotion_vectors is None
+            or self._voice_emotion_vectors is None
+            or self._motion_vectors is None
+        ):
             return MapperResult(mapped_text=text)
 
         tags: list[MappedTag] = []
@@ -201,19 +275,25 @@ class ExpressionMotionMapper:
         def _replace(match: re.Match) -> str:
             action_raw = match.group(1).strip()
             emotion_raw = match.group(2).strip()
+            voice_raw = (match.group(3) or "").strip()
+            voice_query = voice_raw or emotion_raw or _DEFAULT_VOICE_EMOTION
 
             mapped_motion, m_score = self._find_nearest_motion(action_raw)
             mapped_expr, e_score = self._find_nearest_emotion(emotion_raw)
+            mapped_voice, v_score = self._find_nearest_voice_emotion(voice_query)
 
             tags.append(MappedTag(
                 original_action=action_raw,
                 original_emotion=emotion_raw,
+                original_voice_emotion=voice_query,
                 mapped_motion=mapped_motion,
                 mapped_expression=mapped_expr,
+                mapped_voice_emotion=mapped_voice,
                 motion_score=round(m_score, 4),
                 expression_score=round(e_score, 4),
+                voice_emotion_score=round(v_score, 4),
             ))
-            return f"#[{mapped_motion}][{mapped_expr}]"
+            return f"#[{mapped_motion}][{mapped_expr}][{mapped_voice}]"
 
         mapped_text = _TAG_PATTERN.sub(_replace, text)
         return MapperResult(mapped_text=mapped_text, tags=tags)
@@ -235,6 +315,16 @@ class ExpressionMotionMapper:
 
         enriched = self._enrich_query(query, _EN_ZH_MOTION)
         result = self._nearest(enriched, self._motion_names, self._motion_vectors)
+        self._cache[cache_key] = result
+        return result
+
+    def _find_nearest_voice_emotion(self, query: str) -> tuple[str, float]:
+        cache_key = f"v:{query}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        enriched = self._enrich_query(query, _EN_ZH_VOICE_EMOTION)
+        result = self._nearest(enriched, self._voice_emotion_names, self._voice_emotion_vectors)
         self._cache[cache_key] = result
         return result
 

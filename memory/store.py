@@ -190,15 +190,15 @@ class VectorStore:
     Returns:
       True 表示索引健康或为空，False 表示执行了自愈重建
     """
-    with self._lock:
-      n = self._store._collection.count()
-    if n == 0:
-      return True
+    collection_name = self._store._collection.name
     try:
+      with self._lock:
+        n = self._store._collection.count()
+      if n == 0:
+        return True
       self.search_raw(query="health_check", top_k=1)
       return True
     except Exception as e:
-      collection_name = self._store._collection.name
       logger.warning(
         "HNSW 索引损坏 (collection=%s): %s，开始自愈重建",
         collection_name, e,
@@ -206,9 +206,9 @@ class VectorStore:
       print(f"[记忆] {collection_name} 索引损坏，自愈重建中（数据零丢失）...")
       with self._lock:
         all_data = self._store._collection.get()
-        ids = all_data["ids"]
-        docs = all_data["documents"]
-        metas = all_data["metadatas"]
+        ids = all_data.get("ids") or []
+        docs = all_data.get("documents") or []
+        metas = all_data.get("metadatas") or []
         if ids:
           self._store._collection.delete(ids=ids)
         documents = [
