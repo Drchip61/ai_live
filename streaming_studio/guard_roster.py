@@ -2,16 +2,22 @@
 舰长/提督/总督会员名册
 持久化到 JSON 文件，自动过期清理。
 
+说明:
+  - JSON 顶层 key 是内部存储主键；文件内没有单独的 uid 字段。
+  - 条目内的 nickname 是展示昵称。
+  - 续费/存储仍按顶层 key 处理，运行时展示与 prompt 组装侧可按 nickname 匹配。
+
 用法:
   roster = GuardRoster("data/guard_roster.json")
   roster.add_or_extend("uid_123", "小明", guard_level=1, num_months=1)
-  print(roster.is_member("uid_123"))        # True
-  print(roster.get_level_name("uid_123"))   # "舰长"
+  print(roster.is_member("uid_123"))                   # True
+  print(roster.get_level_name("uid_123"))              # "舰长"
+  print(roster.get_level_name_by_nickname("小明"))      # "舰长"
 """
 
 import json
 import logging
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -21,6 +27,10 @@ logger = logging.getLogger(__name__)
 _BJT = timezone(timedelta(hours=8))
 _DAYS_PER_MONTH = 30
 _LEVEL_NAMES = {1: "舰长", 2: "提督", 3: "总督"}
+
+
+def _normalize_nickname(value: str) -> str:
+  return str(value or "").strip()
 
 
 @dataclass
@@ -44,7 +54,8 @@ class GuardRoster:
   """
   会员名册管理器
 
-  以 uid 为主键，nickname 为展示字段。
+  JSON 顶层 key 作为内部主键，nickname 为展示字段。
+  运行时如需根据弹幕判断舰长身份，应优先使用 nickname 匹配。
   每次公开读写操作前自动清理过期会员。
   """
 
@@ -111,6 +122,31 @@ class GuardRoster:
   def get_level_name(self, uid: str) -> str:
     """返回会员等级中文名，非会员返回空字符串"""
     member = self.get_member(uid)
+    return member.level_name if member else ""
+
+  def get_member_by_nickname(self, nickname: str) -> Optional[GuardMember]:
+    """
+    按展示昵称查找会员。
+
+    若出现重名，优先返回等级更高者；等级相同则返回到期时间更晚者。
+    """
+    self._cleanup()
+    target = _normalize_nickname(nickname)
+    if not target:
+      return None
+
+    matches = [
+      member for member in self._members.values()
+      if _normalize_nickname(member.nickname) == target
+    ]
+    if not matches:
+      return None
+
+    return max(matches, key=lambda member: (member.guard_level, member.expiry_time))
+
+  def get_level_name_by_nickname(self, nickname: str) -> str:
+    """按展示昵称返回会员等级中文名，未命中时返回空字符串"""
+    member = self.get_member_by_nickname(nickname)
     return member.level_name if member else ""
 
   def get_all_active(self) -> list[GuardMember]:

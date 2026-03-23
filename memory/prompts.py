@@ -15,10 +15,10 @@ INTERACTION_SUMMARY_PROMPT = _loader.load("memory/interaction_summary.txt")
 # 变量：{active_memories}, {recent_interactions}
 PERIODIC_SUMMARY_PROMPT = _loader.load("memory/periodic_summary.txt")
 
-# 立场提取 prompt
+# 自我记忆提取 prompt
 # 变量：{input}, {response}
 STANCE_EXTRACTION_PROMPT = _loader.load("memory/stance_extraction.txt")
 
-# 观众记忆筛选+改写 prompt
+# 用户记忆结构化抽取 prompt
 # 变量：{comments}, {ai_response}
 VIEWER_SUMMARY_PROMPT = _loader.load("memory/viewer_summary.txt")

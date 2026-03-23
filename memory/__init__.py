@@ -1,78 +1,70 @@
 """
 memory 模块
-分层记忆系统：active / temporary / summary / static / stance / viewer
 
-提供基于 RAG 的长期记忆能力，独立于 langchain_wrapper 和 streaming_studio，
-桥接两层之间的记忆读写需求。
+当前公开能力以 active + structured context 为主。
 """
 
 from .config import (
   MemoryConfig,
   ActiveConfig,
-  TemporaryConfig,
-  SummaryConfig,
-  StanceConfig,
-  ViewerConfig,
-  RetrievalConfig,
   EmbeddingConfig,
-  STATIC_CATEGORY_PREFIXES,
+  StructuredContextConfig,
 )
-from .significance import (
-  decay_significance,
-  boost_significance,
-  initial_significance,
+from .context_schema import (
+  UserMemoryRecord,
+  SelfMemoryRecord,
+  PersonaSpecRecord,
+  CorpusEntry,
+  ExternalKnowledgeEntry,
+  CompiledMemoryContext,
 )
+from .context_store import (
+  UserMemoryStore,
+  SelfMemoryStore,
+  PersonaSpecStore,
+  CorpusStore,
+  ExternalKnowledgeStore,
+)
+from .compiler import (
+  CompilerLimits,
+  MemoryCompiler,
+  ContextCompiler,
+)
+from .structured_retriever import StructuredMemoryRetriever
 from .store import VectorStore
-from .archive import MemoryArchive
 from .layers import (
-  MemoryEntry,
   ActiveLayer,
-  TemporaryLayer,
-  SummaryLayer,
-  StaticLayer,
-  StanceLayer,
-  ViewerMemoryLayer,
 )
-from .retriever import MemoryRetriever
 from .manager import MemoryManager
-from .formatter import (
-  format_active_memories,
-  format_retrieved_memories,
-  format_viewer_memories,
-)
 
 __all__ = [
   # 配置
   "MemoryConfig",
   "ActiveConfig",
-  "TemporaryConfig",
-  "SummaryConfig",
-  "StanceConfig",
-  "ViewerConfig",
-  "RetrievalConfig",
   "EmbeddingConfig",
-  "STATIC_CATEGORY_PREFIXES",
-  # significance
-  "decay_significance",
-  "boost_significance",
-  "initial_significance",
+  "StructuredContextConfig",
+  # 结构化 schema
+  "UserMemoryRecord",
+  "SelfMemoryRecord",
+  "PersonaSpecRecord",
+  "CorpusEntry",
+  "ExternalKnowledgeEntry",
+  "CompiledMemoryContext",
+  # 结构化存储
+  "UserMemoryStore",
+  "SelfMemoryStore",
+  "PersonaSpecStore",
+  "CorpusStore",
+  "ExternalKnowledgeStore",
+  # 编译器
+  "CompilerLimits",
+  "MemoryCompiler",
+  "ContextCompiler",
+  "StructuredMemoryRetriever",
   # 存储
   "VectorStore",
-  "MemoryArchive",
   # 层级
-  "MemoryEntry",
   "ActiveLayer",
-  "TemporaryLayer",
-  "SummaryLayer",
-  "StaticLayer",
-  "StanceLayer",
-  "ViewerMemoryLayer",
-  # 检索
-  "MemoryRetriever",
   # 管理器
   "MemoryManager",
-  # 格式化
-  "format_active_memories",
-  "format_retrieved_memories",
-  "format_viewer_memories",
 ]

@@ -101,9 +101,9 @@ class PromptLoader:
         headers[key.strip()] = value.strip()
     return headers
 
-  def get_base_instruction(self) -> str:
+  def get_system_core_instruction(self) -> str:
     """
-    获取基础指令
+    获取公共 system core 指令
 
     Returns:
       基础指令内容
@@ -119,9 +119,18 @@ class PromptLoader:
     """
     return self.load("security/anti_injection.txt")
 
+  def get_route_instruction(self, route_kind: str) -> str:
+    """
+    获取指定路由的专用提示片段
+
+    Args:
+      route_kind: chat / super_chat / gift / guard_buy / entry / vlm / proactive
+    """
+    return self.load(f"routes/{route_kind}.txt")
+
   def get_full_system_prompt(self, persona: str) -> str:
     """
-    获取完整的系统提示词（基础指令 + 角色提示词）
+    获取完整的系统提示词（system core + 安全规则 + 角色提示词）
 
     通过 PersonaLoader 获取角色专属提示词，与基础指令拼接。
 
@@ -131,7 +140,7 @@ class PromptLoader:
     Returns:
       完整的系统提示词
     """
-    base = self.get_base_instruction()
+    base = self.get_system_core_instruction()
     security = self.get_security_instruction()
     persona_prompt = self._persona_loader.get_system_prompt(persona)
     return f"{base}\n\n{security}\n\n{persona_prompt}"

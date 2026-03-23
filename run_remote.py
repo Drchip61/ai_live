@@ -86,6 +86,10 @@ def parse_args():
     "--ephemeral-memory", action="store_true", default=False,
     help="使用临时记忆（进程退出后丢弃，默认持久化到文件）",
   )
+  parser.add_argument(
+    "--state-card", action="store_true", default=False,
+    help="启用主播状态卡系统（维护精力/耐心/情绪惯性等状态，默认关闭）",
+  )
 
   parser.add_argument(
     "--speech-url", default=None,
@@ -113,6 +117,15 @@ def parse_args():
     help="本地翻译模型 OpenAI 兼容接口地址（默认读取 LOCAL_QWEN_BASE_URL 或 http://localhost:8000/v1）",
   )
 
+  parser.add_argument(
+    "--controller-url", default=None,
+    help="LLM Controller 接口地址（如 http://localhost:2001/v1），指定即启用 Controller 模式",
+  )
+  parser.add_argument(
+    "--controller-model", default="qwen3.5-9b",
+    help="Controller 使用的模型名称（默认 qwen3.5-9b）",
+  )
+
   return parser.parse_args()
 
 
@@ -137,6 +150,7 @@ async def main():
   print(f"  弹幕间隔: {args.danmaku_interval}s")
   print(f"  记忆: {'启用' if not args.no_memory else '禁用'}")
   print(f"  记忆持久化: {'关闭（临时模式）' if args.ephemeral_memory else '启用'}")
+  print(f"  状态卡: {'启用' if args.state_card else '关闭'}")
   print(f"  语音服务: {args.speech_url or '未启用'}")
   print(f"  完播同步: {f'port={args.callback_port}' if args.callback_port else '未启用'}")
   if args.disable_local_translation:
@@ -162,6 +176,10 @@ async def main():
     model_name=args.model_name,
     enable_memory=enable_memory,
     enable_global_memory=not args.ephemeral_memory,
+    enable_state_card=args.state_card,
+    enable_controller=bool(args.controller_url),
+    controller_url=args.controller_url or "http://localhost:2001/v1",
+    controller_model=args.controller_model,
     video_player=remote,
   )
   studio.enable_streaming = True

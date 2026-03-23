@@ -1,0 +1,21 @@
+{
+  "event_boosts": {
+    "gift":       {"energy": 0.05, "patience": 0.03},
+    "guard":      {"energy": 0.15, "patience": 0.10},
+    "super_chat": {"energy": 0.10, "patience": 0.08},
+    "good_topic": {"energy": 0.08, "patience": 0.05}
+  },
+  "floor": {
+    "energy": 0.25,
+    "patience": 0.20
+  },
+  "recovery_rate": {
+    "energy": 0.05,
+    "patience": 0.04
+  },
+  "natural_decay": {
+    "energy_per_round": 0.02,
+    "patience_per_round": 0.01
+  },
+  "max_delta_per_round": 0.15
+}

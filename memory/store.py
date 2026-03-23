@@ -104,6 +104,26 @@ class VectorStore:
     with self._lock:
       self._store.add_documents(documents=documents, ids=doc_ids)
 
+  def upsert_batch(
+    self,
+    doc_ids: list[str],
+    contents: list[str],
+    metadatas: list[dict],
+  ) -> None:
+    """
+    批量 upsert 文档（已存在则覆盖，不存在则新增）
+    """
+    if not doc_ids:
+      return
+    with self._lock:
+      embeddings = self._embeddings.embed_documents(contents)
+      self._store._collection.upsert(
+        ids=doc_ids,
+        documents=contents,
+        metadatas=metadatas,
+        embeddings=embeddings,
+      )
+
   def search(
     self,
     query: str,
@@ -170,6 +190,23 @@ class VectorStore:
     """获取 collection 中所有文档数据"""
     with self._lock:
       return self._store._collection.get()
+
+  def get(self, where: Optional[dict] = None) -> dict:
+    """按过滤条件获取文档数据"""
+    with self._lock:
+      kwargs = {}
+      if where is not None:
+        kwargs["where"] = where
+      return self._store._collection.get(**kwargs)
+
+  def delete_where(self, where: dict) -> int:
+    """按过滤条件删除文档，返回删除数量"""
+    with self._lock:
+      data = self._store._collection.get(where=where)
+      ids = data.get("ids") or []
+      if ids:
+        self._store._collection.delete(ids=ids)
+      return len(ids)
 
   def search_raw(
     self,

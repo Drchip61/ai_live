@@ -1,5 +1,5 @@
 """
-SpeechBroadcaster / EventTemplateResponder 轻量回归测试
+SpeechBroadcaster 轻量回归测试
 """
 
 import sys
@@ -10,7 +10,6 @@ if str(project_root) not in sys.path:
   sys.path.insert(0, str(project_root))
 
 from connection.speech_broadcaster import SpeechBroadcaster
-from streaming_studio.event_responder import _normalize_template_text
 
 
 def test_parse_segments_supports_triple_tags():
@@ -45,20 +44,11 @@ def test_extract_chinese_strips_triple_tags():
   assert text == "好厉害！嗯嗯"
   print("  [PASS] 三标签中文抽取正确")
 
-
-def test_template_normalizer_upgrades_legacy_double_tags():
-  """事件模板中的旧双标签会自动补成三标签"""
-  text = _normalize_template_text("#[wave][happy] 欢迎回来 / おかえり")
-  assert text == "#[wave][happy][joy] 欢迎回来"
-  print("  [PASS] 模板双标签自动补齐")
-
-
 def main():
   tests = [
     test_parse_segments_supports_triple_tags,
     test_parse_segments_keeps_legacy_double_tag_compatible,
     test_extract_chinese_strips_triple_tags,
-    test_template_normalizer_upgrades_legacy_double_tags,
   ]
 
   failed = 0

@@ -262,3 +262,24 @@ class ModelProvider:
       model_name="Qwen/Qwen3-1.7B",
       **kwargs,
     )
+
+  @classmethod
+  def controller(
+    cls,
+    base_url: str = "http://localhost:2001/v1",
+    model_name: str = "qwen3.5-9b",
+    **kwargs,
+  ) -> BaseChatModel:
+    """
+    Controller 调度器模型（本地 Qwen 3.5-9B）
+
+    用途：LLM Controller 统一场景化调度
+    """
+    return cls().get_model(
+      ModelType.LOCAL_QWEN,
+      model_name=model_name,
+      base_url=base_url,
+      temperature=0.3,
+      max_tokens=512,
+      **kwargs,
+    )

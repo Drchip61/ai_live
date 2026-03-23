@@ -88,6 +88,14 @@ def parse_args():
     "--speech-url", default=None,
     help="语音/动作服务 URL（如 http://10.81.7.115:9200/say），启用后回复自动翻译日语并推送",
   )
+  parser.add_argument(
+    "--controller-url", default=None,
+    help="LLM Controller 接口地址（如 http://localhost:2001/v1），指定即启用 Controller 模式",
+  )
+  parser.add_argument(
+    "--controller-model", default="qwen3.5-9b",
+    help="Controller 使用的模型名称（默认 qwen3.5-9b）",
+  )
   return parser.parse_args()
 
 
@@ -134,6 +142,9 @@ async def main():
     model_name=args.model_name,
     enable_memory=enable_memory,
     enable_global_memory=not args.ephemeral_memory,
+    enable_controller=bool(args.controller_url),
+    controller_url=args.controller_url or "http://localhost:2001/v1",
+    controller_model=args.controller_model,
     video_player=player,
   )
   studio.enable_streaming = True

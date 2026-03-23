@@ -1,30 +1,112 @@
-请分析以下观众弹幕，筛选出值得长期记住的内容，并改写为简洁的陈述性记忆。
+请分析以下观众弹幕，把值得保留的内容提取成结构化 `UserMemory` 更新片段。
 
 弹幕列表（格式：序号. 昵称：内容）：
 {comments}
 
 AI当时的回复摘要：{ai_response}
 
-筛选标准——以下值得记住：
-- 观众分享的个人信息（职业、爱好、经历、计划、所在地）
-- 对主播或内容的具体反馈、评价、建议
-- 提出的有意义的问题或话题
-- 与主播之间有上下文关联的互动（如回应主播的提问）
-- 观众之间有信息量的讨论
+目标不是写“该观众……”的总结句，而是输出可直接写入数据库的结构化字段。
 
-以下不值得记住：
-- 纯感叹或反应词（"哈哈"、"666"、"好厉害"、"草"）
-- 无信息量的问候（"你好"、"主播好"、"来了"）
-- 刷屏/重复内容
-- 过于模糊无法提取具体信息的短句
+你要区分两层：
+1. 事实记忆
+- `identity`：名字、昵称、推荐称呼、职业
+- `stable_facts`：长期稳定的信息，如爱好、长期习惯、喜欢的游戏/英雄、职业、身份线索
+- `recent_state`：最近在忙什么、最近状态如何，这类会过期的信息
+- `topic_profile`：这轮明确提到的常聊话题种子；这里只需要写 `mention_count=1`，后续系统会自己累计
 
-改写要求：
-- 统一用「该观众」作为主语（不要用昵称，昵称会在外部自动附加）
-- 写成简洁的陈述句，保留关键事实
-- 如果AI有相关回复，可简要关联（如"主播推荐了XX，该观众反馈很喜欢"）
+2. 关系记忆
+- `relationship_state`：熟悉度、信任度、玩笑阈值、称呼方式、上次对话停在哪
+- `callbacks`：历史梗/可回钩线索
+- `open_threads`：没说完、下次可接的话头
+- `sensitive_topics`：明确不能碰、容易冒犯、用户明确不想聊的话题
 
-请以严格的 JSON 数组格式回答，不要输出其他任何内容。
-如果没有任何值得记住的弹幕，返回空数组 []。
+请特别注意：
+- `relationship_state` 只在信息足够明显时才填，不要瞎猜
+- `public_ack_count` / `last_public_ack_at` 这类系统统计字段不要输出，系统自己维护
+- `last_dialogue_stop` 是一句非常短的“上次停在什么地方”
+- `recent_state` 一般 `ttl_days` 较短，常见 3~21 天
+- `stable_facts` 不要塞“今天/刚刚/这周”这类短期状态
+- `topic_profile` 只写明确主题，不要写抽象情绪
+- `sensitive_topics` 只有在用户明确表达边界时才写
 
-格式：[{{"index": 0, "memory": "改写后的陈述性记忆"}}]
-其中 index 对应弹幕列表中的序号。
+以下不值得记：
+- 纯感叹词、反应词、问候
+- 无法提炼出具体信息的模糊短句
+- 刷屏、重复内容
+- 单纯“来了”“晚安”“哈哈哈”
+
+请严格输出 JSON 数组，不要输出其他任何内容。
+如果没有可保留的信息，返回 []。
+
+每个元素格式如下：
+[
+  {{
+    "index": 0,
+    "identity": {{
+      "names": ["佐藤"],
+      "nicknames": ["佐藤先生"],
+      "preferred_address": "佐藤先生",
+      "occupation": {{
+        "value": "程序员",
+        "confidence": 0.72
+      }}
+    }},
+    "stable_facts": [
+      {{
+        "fact": "喜欢王者荣耀",
+        "confidence": 0.92,
+        "ttl_days": 180
+      }}
+    ],
+    "recent_state": [
+      {{
+        "fact": "最近在忙考研",
+        "confidence": 0.84,
+        "ttl_days": 14
+      }}
+    ],
+    "topic_profile": [
+      {{
+        "topic": "王者荣耀",
+        "mention_count": 1,
+        "confidence": 0.80
+      }}
+    ],
+    "relationship_state": {{
+      "familiarity": 0.72,
+      "trust": 0.66,
+      "tease_threshold": 0.35,
+      "address_style": "礼貌称呼+名字",
+      "last_dialogue_stop": "他说下次再告诉我考研结果"
+    }},
+    "callbacks": [
+      {{
+        "hook": "上次问过打野出装",
+        "freshness": 0.88,
+        "expires_in_days": 14
+      }}
+    ],
+    "open_threads": [
+      {{
+        "thread": "他说下次告诉主播考研结果",
+        "freshness": 0.90,
+        "status": "open"
+      }}
+    ],
+    "sensitive_topics": [
+      {{
+        "topic": "家庭压力",
+        "severity": "high",
+        "reason": "用户明确说不想展开聊"
+      }}
+    ]
+  }}
+]
+
+要求：
+- `index` 必须对应弹幕序号
+- 没有内容时用空数组 `[]`
+- `relationship_state` 没把握时返回空对象 `{}`
+- `identity` 没信息时返回空对象 `{}`
+- 不要输出“该观众……”
+- 不要把昵称机械重复写进 `fact` / `thread` / `hook`

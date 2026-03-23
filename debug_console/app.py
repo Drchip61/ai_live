@@ -32,6 +32,8 @@ def run(
   enable_global_memory: bool = True,
   enable_topic_manager: bool = True,
   speech_url: Optional[str] = None,
+  controller_url: Optional[str] = None,
+  controller_model: str = "qwen3.5-9b",
 ) -> None:
   """
   启动调试控制台
@@ -44,6 +46,8 @@ def run(
     enable_global_memory: 是否持久化记忆到文件（默认开启）
     enable_topic_manager: 是否启用话题管理器
     speech_url: 语音/动作服务 URL（None 则不启用）
+    controller_url: LLM Controller 接口地址（None 则不启用）
+    controller_model: Controller 使用的模型名称
   """
   # 初始化直播间
   studio = StreamingStudio(
@@ -53,6 +57,9 @@ def run(
     enable_memory=True,
     enable_global_memory=enable_global_memory,
     enable_topic_manager=enable_topic_manager,
+    enable_controller=bool(controller_url),
+    controller_url=controller_url or "http://localhost:2001/v1",
+    controller_model=controller_model,
   )
   studio.enable_streaming = True
   collector = StateCollector(studio)

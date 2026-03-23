@@ -48,6 +48,14 @@ def main():
     "--speech-url", default=None,
     help="语音/动作服务 URL（如 http://10.81.7.115:9200/say）",
   )
+  parser.add_argument(
+    "--controller-url", default=None,
+    help="LLM Controller 接口地址（如 http://localhost:2001/v1），指定即启用 Controller 模式",
+  )
+  parser.add_argument(
+    "--controller-model", default="qwen3.5-9b",
+    help="Controller 使用的模型名称（默认 qwen3.5-9b）",
+  )
 
   args = parser.parse_args()
 
@@ -65,6 +73,8 @@ def main():
       port=args.port,
       enable_global_memory=not args.ephemeral_memory,
       speech_url=args.speech_url,
+      controller_url=args.controller_url,
+      controller_model=args.controller_model,
     )
   except KeyboardInterrupt:
     print("\n正在关闭...")

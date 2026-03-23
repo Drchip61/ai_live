@@ -6,7 +6,6 @@
 
 import json
 import logging
-import random
 from pathlib import Path
 from typing import Optional
 
@@ -15,15 +14,6 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from memory.store import VectorStore
 
 logger = logging.getLogger(__name__)
-
-SITUATION_MAP = {
-  "react_comment": "回应弹幕",
-  "react_scene": "描述画面",
-  "proactive": "主动发言",
-  "comeback": "回击质疑",
-  "any": None,
-}
-
 
 class StyleBank:
   """
@@ -57,32 +47,10 @@ class StyleBank:
     self._retrieval_count: int = self._meta.get("retrieval_count", 3)
     self._categories: dict[str, str] = self._meta.get("categories", {})
 
-    # 双轨概率：inspire（日语表达灵感）+ original（中文原味）
-    has_dual = (
-      "injection_probability_inspire" in self._meta
-      or "injection_probability_original" in self._meta
+    self._header_targeted: str = self._meta.get(
+      "injection_header_inspire",
+      self._meta.get("injection_header", "【风格参考】"),
     )
-    if has_dual:
-      self._prob_inspire: float = self._meta.get(
-        "injection_probability_inspire", 0.0,
-      )
-      self._prob_original: float = self._meta.get(
-        "injection_probability_original", 0.0,
-      )
-    else:
-      legacy_prob = self._meta.get("injection_probability", 0.0)
-      self._prob_inspire = 0.0
-      self._prob_original = legacy_prob
-
-    self._header_original: str = self._meta.get(
-      "injection_header", "【风格参考】",
-    )
-    self._header_inspire: str = self._meta.get(
-      "injection_header_inspire", self._header_original,
-    )
-
-    # pre_roll 缓存：None=未决定, "inspire"/"original"=触发模式
-    self._next_mode: Optional[str] = None
 
     collection_name = f"style_bank_{persona_dir.name}"
     self._store = VectorStore(
@@ -129,66 +97,43 @@ class StyleBank:
 
     logger.info("StyleBank 已加载 %d 条语料", len(ids))
 
-  def pre_roll(self) -> Optional[str]:
-    """预判本轮触发模式，缓存结果供 retrieve() 使用。
-
-    Returns:
-      "inspire" / "original" / None（未触发）
-    """
-    r = random.random()
-    if r <= self._prob_inspire:
-      self._next_mode = "inspire"
-    elif r <= self._prob_inspire + self._prob_original:
-      self._next_mode = "original"
-    else:
-      self._next_mode = None
-    return self._next_mode
-
-  def retrieve(
+  def retrieve_targeted(
     self,
     query: str,
-    situation: Optional[str] = None,
+    style_tag: str = "",
+    scene_tag: str = "",
     top_k: Optional[int] = None,
   ) -> str:
     """
-    按情境语义检索风格示例，返回格式化文本
+    按 Controller 指定的 style + scene 标签定向检索语料
 
-    Args:
-      query: 当前场景描述或弹幕内容
-      situation: 情境标签（react_comment / react_scene / proactive / comeback）
-      top_k: 覆盖默认检索数量
-
-    Returns:
-      格式化后的风格参考文本，无结果时返回空字符串
+    这是当前唯一保留的检索入口：按 Controller 指定标签直接检索。
     """
-    mode = self._next_mode
-    self._next_mode = None
-    if mode is None:
-      return ""
-
     k = top_k or self._retrieval_count
 
     where = None
-    if situation and situation != "any":
+    if style_tag and scene_tag:
       where = {
-        "$or": [
-          {"situation": situation},
-          {"situation": "any"},
+        "$and": [
+          {"$or": [{"situation": scene_tag}, {"situation": "any"}]},
+          {"$or": [{"category": style_tag}, {"category": ""}]},
         ]
       }
+    elif style_tag:
+      where = {"$or": [{"category": style_tag}, {"category": ""}]}
+    elif scene_tag:
+      where = {"$or": [{"situation": scene_tag}, {"situation": "any"}]}
 
     results = self._store.search(query=query, top_k=k, where=where)
-
     if not results:
       return ""
 
-    header = self._header_inspire if mode == "inspire" else self._header_original
+    header = self._header_targeted
     lines = [header]
     for i, (doc, _score) in enumerate(results, 1):
       cat = doc.metadata.get("category", "")
       cat_label = self._categories.get(cat, cat)
       lines.append(f"{i}. [{cat_label}] {doc.page_content}")
-
     return "\n".join(lines)
 
   def debug_state(self) -> dict:

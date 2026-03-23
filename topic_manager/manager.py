@@ -248,6 +248,34 @@ class TopicManager:
         logger.exception("批量分类循环错误")
         await asyncio.sleep(1)
 
+  def apply_classifications(self, assignments: dict[str, str]) -> None:
+    """
+    接受 Controller 的弹幕→话题分类结果，直接更新话题表
+
+    不再依赖内置 classifier 的规则匹配或 LLM 分类。
+
+    Args:
+      assignments: {comment_id: topic_id / "new_话题名" / "none"}
+    """
+    for comment_id, topic_id in assignments.items():
+      if topic_id == "none" or not topic_id:
+        continue
+      if topic_id.startswith("new_"):
+        title = topic_id[4:]
+        new_topic = Topic(
+          topic_id=f"ctrl_{title}",
+          title=title,
+          significance=self._config.initial_significance,
+          topic_progress="",
+        )
+        self._table.add(new_topic)
+        self._table.add_comment_to_topic(new_topic.topic_id, comment_id, "")
+        logger.info("Controller 新话题: %s", title)
+      else:
+        existing = self._table.get(topic_id)
+        if existing:
+          self._table.add_comment_to_topic(topic_id, comment_id, "")
+
   def format_context(
     self,
     old_comments: list["Comment"],

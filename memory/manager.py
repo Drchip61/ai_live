@@ -1,33 +1,33 @@
 """
 记忆系统编排器
-统一管理六层初始化、记忆读写、定时汇总和清理
+
+当前实现以 structured store 为主，legacy 向量层已从主链移除。
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import re
-
-import json_repair
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
+import json_repair
 from langchain_core.language_models import BaseChatModel
 from langchain_huggingface import HuggingFaceEmbeddings
 
-from .config import MemoryConfig, EmbeddingConfig
-from .store import VectorStore
-from .archive import MemoryArchive
+from .config import EmbeddingConfig, MemoryConfig
+from .context_store import (
+  CorpusStore,
+  ExternalKnowledgeStore,
+  PersonaSpecStore,
+  SelfMemoryStore,
+  UserMemoryStore,
+)
+from .structured_retriever import StructuredMemoryRetriever
 from .layers.active import ActiveLayer
-from .layers.temporary import TemporaryLayer
-from .layers.summary import SummaryLayer
-from .layers.static import StaticLayer
-from .layers.stance import StanceLayer
-from .layers.viewer import ViewerMemoryLayer
-from .layers.user_profile import UserProfileLayer
-from .layers.character_profile import CharacterProfileLayer
-from .retriever import MemoryRetriever
 from .prompts import (
   INTERACTION_SUMMARY_PROMPT,
   PERIODIC_SUMMARY_PROMPT,
@@ -39,15 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
-  """
-  记忆系统顶层编排器
-
-  职责：
-  - 初始化六层记忆（active / temporary / summary / static / stance / viewer）
-    + 可选层（user_profile / character_profile）+ 共享 embeddings
-  - 编排记忆读取（检索）和写入（交互记录 + 立场提取 + 观众记忆）
-  - 管理定时汇总和清理任务的生命周期
-  """
+  """记忆系统顶层编排器（active + structured stores）"""
 
   _STANCE_INDICATORS = re.compile(
     r"我觉得|我认为|我喜欢|我讨厌|我比较|在我看来|我的看法|"
@@ -70,230 +62,243 @@ class MemoryManager:
     summary_model: Optional[BaseChatModel] = None,
     enable_global_memory: bool = True,
   ):
-    """
-    初始化记忆管理器
-
-    Args:
-      persona: 角色名称
-      config: 记忆系统总配置
-      summary_model: 用于总结的小 LLM（默认使用 ModelProvider.remote_small()）
-      enable_global_memory: 是否持久化记忆到文件（默认开启）
-    """
+    self._persona = persona
+    self._config = config
     self._enable_global_memory = enable_global_memory
+    self._summary_model = summary_model
+    self._session_id: Optional[str] = None
 
-    # 根据全局记忆开关决定持久化策略
     if enable_global_memory:
       embedding_config = config.embedding
     else:
-      # 纯内存模式：persist_directory=None → Chroma EphemeralClient
       embedding_config = EmbeddingConfig(
         model_name=config.embedding.model_name,
         persist_directory=None,
       )
 
-    # 创建共享 embeddings（避免重复加载模型，优先使用 GPU）
     import torch
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     self._embeddings = HuggingFaceEmbeddings(
       model_name=embedding_config.model_name,
       model_kwargs={"device": device},
     )
-    embeddings = self._embeddings
 
-    # 初始化归档器（纯内存模式下禁用）
-    self._archive = MemoryArchive(
-      persona,
-      enabled=enable_global_memory,
+    self._persona_static_dir = (
+      Path(__file__).resolve().parent.parent
+      / "personas"
+      / persona
+      / "static_memories"
     )
 
-    # 遗忘感知队列：记忆从 temporary 层衰减消失时推入此队列
-    from collections import deque
-    self._fading_memories: deque[str] = deque(maxlen=5)
+    self._structured_root: Optional[Path] = None
+    if enable_global_memory and config.embedding.persist_directory:
+      self._structured_root = Path(
+        config.embedding.persist_directory
+      ) / config.structured.directory_name
 
-    # 初始化四层
-    self._temporary = TemporaryLayer(
-      VectorStore("temporary", embedding_config, embeddings=embeddings),
-      self._archive,
-      config.temporary,
-      on_fade=lambda content: self._fading_memories.append(content),
+    user_memory_path = (
+      self._structured_root / config.structured.user_memory_filename
+      if self._structured_root is not None else None
     )
+    self_memory_path = (
+      self._structured_root / config.structured.self_memory_filename
+      if self._structured_root is not None else None
+    )
+    persona_spec_path = (
+      self._structured_root / config.structured.persona_spec_filename
+      if self._structured_root is not None else None
+    )
+    corpus_path = (
+      self._structured_root / config.structured.corpus_filename
+      if self._structured_root is not None else None
+    )
+    knowledge_path = (
+      self._structured_root / config.structured.external_knowledge_filename
+      if self._structured_root is not None else None
+    )
+
+    self._user_memory_store: Optional[UserMemoryStore] = None
+    self._self_memory_store: Optional[SelfMemoryStore] = None
+    self._persona_spec_store: Optional[PersonaSpecStore] = None
+    self._corpus_store: Optional[CorpusStore] = None
+    self._external_knowledge_store: Optional[ExternalKnowledgeStore] = None
+    self._structured_retriever: Optional[StructuredMemoryRetriever] = None
+
+    if config.structured.enabled:
+      self._user_memory_store = UserMemoryStore(user_memory_path)
+      self._self_memory_store = SelfMemoryStore(self_memory_path)
+      self._persona_spec_store = PersonaSpecStore(persona_spec_path, persona=persona)
+      self._corpus_store = CorpusStore(corpus_path)
+      self._external_knowledge_store = ExternalKnowledgeStore(knowledge_path)
+      self._persona_spec_store.load_from_static_dir(self._persona_static_dir)
+      self._structured_retriever = StructuredMemoryRetriever(
+        user_memory_store=self._user_memory_store,
+        self_memory_store=self._self_memory_store,
+        persona_spec_store=self._persona_spec_store,
+        corpus_store=self._corpus_store,
+        external_knowledge_store=self._external_knowledge_store,
+        embedding_config=embedding_config,
+        embeddings=self._embeddings,
+        config=config.structured,
+      )
+      self._structured_retriever.rebuild_all()
+      self._structured_retriever.ensure_healthy()
+
     self._active = ActiveLayer(
       config=config.active,
-      on_overflow=self._temporary.add,
-    )
-    self._summary_layer = SummaryLayer(
-      VectorStore("summary", embedding_config, embeddings=embeddings),
-      self._archive,
-      config.summary,
-    )
-    self._static = StaticLayer(
-      VectorStore("static", embedding_config, embeddings=embeddings),
-      persona=persona,
-    )
-    self._static.load()
-
-    # 用户画像层（可选）
-    self._user_profile: Optional[UserProfileLayer] = None
-    if config.user_profile.enabled:
-      persist_path = None
-      if enable_global_memory and config.embedding.persist_directory:
-        persist_path = Path(config.embedding.persist_directory) / config.user_profile.persist_filename
-      self._user_profile = UserProfileLayer(persist_path=persist_path)
-
-    # 角色设定档层（可选）
-    self._character_profile: Optional[CharacterProfileLayer] = None
-    if config.character_profile.enabled:
-      persist_path = None
-      if enable_global_memory and config.embedding.persist_directory:
-        persist_path = Path(config.embedding.persist_directory) / config.character_profile.persist_filename
-      self._character_profile = CharacterProfileLayer(persist_path=persist_path)
-
-    # 立场记忆层（默认启用）
-    self._stance: Optional[StanceLayer] = None
-    if config.stance.enabled:
-      self._stance = StanceLayer(
-        VectorStore("stance", embedding_config, embeddings=embeddings),
-        self._archive,
-        config.stance,
-      )
-
-    # 观众记忆层（默认启用）
-    self._viewer: Optional[ViewerMemoryLayer] = None
-    if config.viewer.enabled:
-      self._viewer = ViewerMemoryLayer(
-        VectorStore("viewer", embedding_config, embeddings=embeddings),
-        self._archive,
-        config.viewer,
-      )
-
-    # 当前会话 ID（由 studio 在 start() 时设置）
-    self._session_id: Optional[str] = None
-
-    # 跨层检索器
-    self._retriever = MemoryRetriever(
-      self._active,
-      self._temporary,
-      self._summary_layer,
-      self._static,
-      stance=self._stance,
-      viewer=self._viewer,
-      config=config.retrieval,
+      on_overflow=self._on_active_overflow,
     )
 
-    # 所有向量层启动健康检查（HNSW 索引损坏时自动重建，数据零丢失）
-    for _layer_name, _store in [
-      ("temporary", self._temporary._store),
-      ("summary", self._summary_layer._store),
-      ("viewer", self._viewer._store if self._viewer else None),
-      ("stance", self._stance._store if self._stance else None),
-    ]:
-      if _store is not None:
-        _store.ensure_healthy()
-
-    # 汇总用小 LLM
-    self._summary_model = summary_model
-    self._config = config
-
-    # 定时任务句柄
     self._summary_task: Optional[asyncio.Task] = None
-    self._cleanup_task: Optional[asyncio.Task] = None
-
-    # 近期交互缓冲（供定时汇总使用）
     self._recent_interactions: list[tuple[str, str, datetime]] = []
 
   @property
-  def user_profile(self) -> Optional[UserProfileLayer]:
-    return self._user_profile
+  def user_memory_store(self) -> Optional[UserMemoryStore]:
+    return self._user_memory_store
 
   @property
-  def character_profile(self) -> Optional[CharacterProfileLayer]:
-    return self._character_profile
+  def self_memory_store(self) -> Optional[SelfMemoryStore]:
+    return self._self_memory_store
+
+  @property
+  def persona_spec_store(self) -> Optional[PersonaSpecStore]:
+    return self._persona_spec_store
+
+  @property
+  def corpus_store(self) -> Optional[CorpusStore]:
+    return self._corpus_store
+
+  @property
+  def external_knowledge_store(self) -> Optional[ExternalKnowledgeStore]:
+    return self._external_knowledge_store
 
   @property
   def embeddings(self) -> HuggingFaceEmbeddings:
-    """共享的嵌入模型实例（供外部模块复用，避免重复加载）"""
     return self._embeddings
-
-  def pop_fading_memory(self) -> Optional[str]:
-    """弹出一条即将遗忘的记忆内容（用于遗忘感知触发），无则返回 None"""
-    if self._fading_memories:
-      return self._fading_memories.popleft()
-    return None
 
   @property
   def session_id(self) -> Optional[str]:
-    """当前直播会话 ID"""
     return self._session_id
 
   @session_id.setter
   def session_id(self, value: Optional[str]) -> None:
-    """设置当前直播会话 ID（同时传递给各层）"""
     self._session_id = value
-    self._temporary.session_id = value
-    self._summary_layer.session_id = value
-    if self._stance is not None:
-      self._stance.session_id = value
-    if self._viewer is not None:
-      self._viewer.session_id = value
-    self._retriever.session_id = value
+
+  def _on_active_overflow(self, content: str, _timestamp: datetime, _response: str) -> None:
+    """Active 层溢出后，把旧线头沉入 structured self threads。"""
+    if self._self_memory_store is None:
+      return
+    self._self_memory_store.add_thread_memory(
+      content,
+      source_layer="active_overflow",
+    )
+    self._refresh_self_structured_indexes(include_threads=True)
 
   def _get_summary_model(self) -> BaseChatModel:
-    """
-    获取汇总用小 LLM（延迟初始化）
-
-    Returns:
-      BaseChatModel 实例
-    """
     if self._summary_model is None:
       from langchain_wrapper.model_provider import ModelProvider
+
       self._summary_model = ModelProvider.remote_small()
     return self._summary_model
 
-  def retrieve(
-    self,
-    query: Union[str, list[str]],
-    viewer_ids: Optional[list[str]] = None,
-  ) -> tuple[str, str, str]:
-    """
-    执行跨层记忆检索
+  def list_persona_sections(self) -> list[str]:
+    if self._persona_spec_store is None:
+      return []
+    return self._persona_spec_store.list_sections()
 
-    Args:
-      query: 查询文本，支持单条字符串或多条列表。
-        多条时逐条检索 + 按 ID 去重，语义匹配更精准。
-      viewer_ids: 当前弹幕中出现的观众 user_id 列表
+  def list_knowledge_topics(self) -> list[str]:
+    if self._external_knowledge_store is None:
+      return []
+    return self._external_knowledge_store.list_topics()
 
-    Returns:
-      (active_text, rag_text, viewer_text) 三元组
-    """
-    return self._retriever.retrieve(query, viewer_ids=viewer_ids)
+  def list_corpus_style_tags(self) -> list[str]:
+    if self._corpus_store is None:
+      return []
+    return self._corpus_store.list_style_tags()
+
+  def list_corpus_scene_tags(self) -> list[str]:
+    if self._corpus_store is None:
+      return []
+    return self._corpus_store.list_scene_tags()
+
+  def get_persona_by_sections(self, sections: list[str]) -> str:
+    if not sections or self._persona_spec_store is None:
+      return ""
+    items = self._persona_spec_store.get_by_sections(sections)
+    if not items:
+      return ""
+    lines = []
+    for item in items:
+      section = str(item.get("section", "")).strip()
+      text = str(item.get("text", "")).strip()
+      if text:
+        lines.append(f"{section}：{text}" if section else text)
+    return "\n".join(lines)
+
+  def get_knowledge_by_topics(self, topics: list[str]) -> str:
+    if not topics or self._external_knowledge_store is None:
+      return ""
+    entries = self._external_knowledge_store.get_by_topics(topics)
+    if not entries:
+      return ""
+    parts = []
+    for entry in entries:
+      head = entry.topic or entry.category
+      text = f"【{head}】{entry.summary}"
+      if entry.facts:
+        text += "\n" + "\n".join(f"- {fact}" for fact in entry.facts[:5])
+      parts.append(text)
+    return "\n\n".join(parts)
 
   def retrieve_active_only(self) -> tuple[str, str, str]:
-    """
-    仅返回 Active 层记忆（不触发任何 RAG 检索和 significance 衰减）
+    active_memories = self._active.get_all()
+    if not active_memories:
+      return "", "", ""
+    lines = ["【近期记忆】"]
+    for memory in active_memories:
+      lines.append(f"- {memory.content}")
+      if memory.response:
+        lines.append(f"  → 我说：「{memory.response[:80]}」")
+    return "\n".join(lines), "", ""
 
-    用于主动发言等无弹幕场景：主播需要知道"我刚才说过什么"以避免重复，
-    但不应触发 Temporary/Summary/Static/Stance 的 RAG 检索和衰减。
+  def compile_structured_context(
+    self,
+    query: Union[str, list[str]] = "",
+    viewer_ids: Optional[list[str]] = None,
+    include_corpus: bool = False,
+    include_external_knowledge: bool = False,
+  ) -> str:
+    if self._structured_retriever is None:
+      return ""
+    return self._structured_retriever.compile_prompt_context(
+      query=query,
+      viewer_ids=viewer_ids,
+      include_corpus=include_corpus,
+      include_external_knowledge=include_external_knowledge,
+    )
 
-    Returns:
-      (active_text, "", "") 三元组
-    """
-    return self._retriever.retrieve_active_only()
+  def _refresh_user_structured_indexes(self, viewer_ids: set[str]) -> None:
+    if self._structured_retriever is None:
+      return
+    for viewer_id in viewer_ids:
+      normalized = str(viewer_id).strip()
+      if normalized:
+        self._structured_retriever.rebuild_user_record(normalized)
+
+  def _refresh_self_structured_indexes(self, include_threads: bool = False) -> None:
+    if self._structured_retriever is None:
+      return
+    self._structured_retriever.rebuild_self_said_indexes()
+    if include_threads:
+      self._structured_retriever.rebuild_self_thread_index()
 
   async def record_interaction(
     self,
     user_input: str,
     response: str,
   ) -> None:
-    """
-    异步记录一次交互（仅交互记忆，不含立场提取）
-
-    使用小 LLM 将对话总结为第一人称记忆，写入 active 层，
-    同时加入近期交互缓冲供定时汇总使用。
-
-    Args:
-      user_input: 用户输入
-      response: LLM 回复
-    """
+    """异步记录一次交互，并写入 active 层。"""
     try:
       model = self._get_summary_model()
       prompt = INTERACTION_SUMMARY_PROMPT.format(
@@ -303,31 +308,29 @@ class MemoryManager:
       summary = await model.ainvoke(prompt)
       summary_text = summary.content if hasattr(summary, "content") else str(summary)
       summary_text = summary_text.strip()
-
       if summary_text:
         self._active.add(summary_text, response=response)
-        self._recent_interactions.append(
-          (user_input, response, datetime.now())
-        )
+        self._recent_interactions.append((user_input, response, datetime.now()))
         logger.debug("记录交互记忆: %s", summary_text)
     except Exception as e:
       logger.error("记录交互记忆失败: %s", e)
+
+  def record_interaction_sync(
+    self,
+    user_input: str,
+    response: str,
+  ) -> None:
+    summary_text = f"我回复了一位观众：他说「{user_input}」，我说了「{response[:50]}」"
+    self._active.add(summary_text, response=response)
+    self._recent_interactions.append((user_input, response, datetime.now()))
 
   async def record_viewer_memories(
     self,
     comments: list,
     ai_response_summary: str = "",
   ) -> None:
-    """
-    用小 LLM 筛选+改写观众弹幕，写入 Viewer 层
-
-    流程：正则预过滤（省 token）→ 小 LLM 批量判断哪些值得记 + 改写为陈述性记忆 → 写入。
-
-    Args:
-      comments: Comment 对象列表（须含 user_id, nickname, content）
-      ai_response_summary: AI 回复摘要（可选，为 LLM 提供上下文）
-    """
-    if self._viewer is None:
+    """从观众弹幕中提取结构化用户记忆。"""
+    if self._user_memory_store is None:
       return
 
     candidates = []
@@ -351,8 +354,8 @@ class MemoryManager:
       return
 
     comments_text = "\n".join(
-      f"{i}. {c['nickname']}：{c['content']}"
-      for i, c in enumerate(candidates)
+      f"{idx}. {item['nickname']}：{item['content']}"
+      for idx, item in enumerate(candidates)
     )
     prompt = VIEWER_SUMMARY_PROMPT.format(
       comments=comments_text,
@@ -374,38 +377,98 @@ class MemoryManager:
         logger.debug("观众记忆 JSON 解析结果非 list: %s", type(memories).__name__)
         return
 
+      touched_viewers: set[str] = set()
       for item in memories:
         idx = item.get("index")
-        memory_text = item.get("memory", "").strip()
-        if not isinstance(idx, int) or not memory_text or idx < 0 or idx >= len(candidates):
+        if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
           continue
         src = candidates[idx]
-        self._viewer.add(
-          user_id=src["user_id"],
+        identity = item.get("identity")
+        stable_facts = item.get("stable_facts")
+        recent_state = item.get("recent_state")
+        topic_profile = item.get("topic_profile")
+        callbacks = item.get("callbacks")
+        open_threads = item.get("open_threads")
+        sensitive_topics = item.get("sensitive_topics")
+        relationship_state = item.get("relationship_state")
+
+        if not stable_facts and not callbacks and not recent_state and not open_threads:
+          memory_text = str(item.get("memory", "")).strip()
+          if memory_text:
+            stable_facts = [{
+              "fact": memory_text,
+              "confidence": 0.60,
+              "ttl_days": 30,
+              "source": "viewer_summary_extract",
+            }]
+
+        normalized_facts = [
+          fact for fact in (stable_facts or [])
+          if isinstance(fact, dict) and str(fact.get("fact", "")).strip()
+        ]
+        normalized_recent_state = [
+          state for state in (recent_state or [])
+          if isinstance(state, dict) and str(state.get("fact", "")).strip()
+        ]
+        normalized_topic_profile = [
+          topic for topic in (topic_profile or [])
+          if isinstance(topic, dict) and str(topic.get("topic", "")).strip()
+        ]
+        normalized_callbacks = [
+          hook for hook in (callbacks or [])
+          if isinstance(hook, dict) and str(hook.get("hook", "")).strip()
+        ]
+        normalized_open_threads = [
+          thread for thread in (open_threads or [])
+          if isinstance(thread, dict) and str(thread.get("thread", "")).strip()
+        ]
+        normalized_sensitive_topics = [
+          topic for topic in (sensitive_topics or [])
+          if isinstance(topic, dict) and str(topic.get("topic", "")).strip()
+        ]
+        normalized_identity = identity if isinstance(identity, dict) else None
+        normalized_relationship_state = relationship_state if isinstance(relationship_state, dict) else None
+
+        has_meaningful_update = any((
+          normalized_identity,
+          normalized_facts,
+          normalized_recent_state,
+          normalized_topic_profile,
+          normalized_relationship_state,
+          normalized_callbacks,
+          normalized_open_threads,
+          normalized_sensitive_topics,
+        ))
+        if not has_meaningful_update:
+          continue
+
+        self._user_memory_store.record_extract(
+          viewer_id=src["user_id"],
           nickname=src["nickname"],
-          content=memory_text,
-          ai_response_summary=ai_response_summary[:100],
+          identity=normalized_identity,
+          stable_facts=normalized_facts,
+          recent_state=normalized_recent_state,
+          topic_profile=normalized_topic_profile,
+          relationship_state=normalized_relationship_state,
+          callbacks=normalized_callbacks,
+          open_threads=normalized_open_threads,
+          sensitive_topics=normalized_sensitive_topics,
+          legacy_source="viewer_summary_extract",
+          was_addressed=bool(ai_response_summary),
         )
-        logger.debug("观众记忆 +新增: [%s] %s", src["nickname"], memory_text[:60])
+        touched_viewers.add(src["user_id"])
+
+      self._refresh_user_structured_indexes(touched_viewers)
     except Exception as e:
-      logger.error("观众记忆 LLM 筛选失败: %s", e)
+      logger.error("观众记忆提取失败: %s", e)
 
   async def extract_stances(
     self,
     response: str,
     context: str = "",
   ) -> None:
-    """
-    从 AI 回复中提取立场/观点并写入 Stance 层（独立于交互记忆）
-
-    先做正则预筛，通过后调用小 LLM 提取结构化立场数据。
-    无论是否有弹幕（包括主动发言场景）都应调用。
-
-    Args:
-      response: AI 的回复文本
-      context: 触发回复的上下文描述（有弹幕时为弹幕摘要，主动发言时可为空）
-    """
-    if self._stance is None:
+    """从 AI 回复中提取立场/观点并写入 structured self memory。"""
+    if self._self_memory_store is None:
       return
     if not self._may_contain_stance(response):
       return
@@ -414,28 +477,7 @@ class MemoryManager:
     except Exception as e:
       logger.error("立场提取失败: %s", e)
 
-  def record_interaction_sync(
-    self,
-    user_input: str,
-    response: str,
-  ) -> None:
-    """
-    同步记录一次交互（不使用 LLM 总结，直接拼接原文）
-
-    用于同步上下文中无法启动 asyncio task 的场景。
-
-    Args:
-      user_input: 用户输入
-      response: LLM 回复
-    """
-    summary_text = f"我回复了一位观众：他说「{user_input}」，我说了「{response[:50]}」"
-    self._active.add(summary_text, response=response)
-    self._recent_interactions.append(
-      (user_input, response, datetime.now())
-    )
-
   def _may_contain_stance(self, response: str) -> bool:
-    """规则预筛：检测回复中是否可能包含观点/立场性表达"""
     return bool(self._STANCE_INDICATORS.search(response))
 
   async def _extract_and_store_stances(
@@ -443,11 +485,9 @@ class MemoryManager:
     user_input: str,
     response: str,
   ) -> None:
-    """
-    用小模型从回复中提取立场并写入 StanceLayer
+    if self._self_memory_store is None:
+      return
 
-    仅在 _may_contain_stance() 预筛通过后调用。
-    """
     model = self._get_summary_model()
     prompt = STANCE_EXTRACTION_PROMPT.format(
       input=user_input,
@@ -457,7 +497,6 @@ class MemoryManager:
     text = result.content if hasattr(result, "content") else str(result)
     text = text.strip()
 
-    # 尝试从回复中提取 JSON（兼容被 markdown 代码块包裹的情况）
     json_match = re.search(r"\{.*\}", text, re.DOTALL)
     if not json_match:
       return
@@ -468,189 +507,82 @@ class MemoryManager:
       logger.debug("立场提取 JSON 解析失败: %s", text[:100])
       return
 
-    if not data.get("has_stance"):
+    has_stance = bool(data.get("has_stance")) or bool(data.get("has_memory"))
+    if not has_stance:
       return
 
     stances = data.get("stances", [])
-    for item in stances:
-      topic = item.get("topic", "").strip()
-      stance_text = item.get("stance", "").strip()
-      if topic and stance_text:
-        self._stance.add(
-          content=stance_text,
-          topic=topic,
-          response_excerpt=response[:200],
-        )
+    self_said = data.get("self_said", [])
+    commitments = data.get("commitments", [])
+    updated_self_memory = False
+
+    if not self_said and stances:
+      self_said = [
+        {
+          "topic": item.get("topic", ""),
+          "statement": item.get("stance", ""),
+        }
+        for item in stances
+        if isinstance(item, dict)
+      ]
+
+    for item in self_said:
+      if not isinstance(item, dict):
+        continue
+      topic = str(item.get("topic", "")).strip()
+      statement_text = str(
+        item.get("statement", "") or item.get("stance", "")
+      ).strip()
+      if not statement_text:
+        continue
+      self._self_memory_store.record_stance(
+        topic=topic,
+        statement=statement_text,
+        response_excerpt=response[:200],
+        source="stance_extraction",
+      )
+      updated_self_memory = True
+
+    for item in commitments:
+      if not isinstance(item, dict):
+        continue
+      text_value = str(item.get("text", "")).strip()
+      if not text_value:
+        continue
+      topic = str(item.get("topic", "")).strip()
+      status = str(item.get("status", "open")).strip() or "open"
+      self._self_memory_store.add_commitment(
+        text=text_value,
+        topic=topic,
+        source="stance_extraction",
+        status=status,
+      )
+      updated_self_memory = True
+
+    if updated_self_memory:
+      self._refresh_self_structured_indexes(include_threads=False)
 
   async def start(self) -> None:
-    """启动定时汇总和清理任务"""
     if self._summary_task is None:
       self._summary_task = asyncio.create_task(self._summary_loop())
       logger.info("记忆定时汇总任务已启动")
 
-    if self._cleanup_task is None:
-      self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-      logger.info("记忆定时清理任务已启动")
-
   async def stop(self) -> None:
-    """停止定时任务"""
-    for task, name in [
-      (self._summary_task, "汇总"),
-      (self._cleanup_task, "清理"),
-    ]:
-      if task is not None:
-        task.cancel()
-        try:
-          await task
-        except asyncio.CancelledError:
-          pass
-        logger.info("记忆定时%s任务已停止", name)
-
-    self._summary_task = None
-    self._cleanup_task = None
-
-  def clear_runtime_state(self, clear_summary: bool = True) -> None:
-    """
-    清空运行期记忆状态（用于“重开一局”场景）
-
-    会清空：
-    - active 层
-    - temporary 层
-    - 最近交互缓冲
-    - （可选）summary 层
-
-    不会清空 static 层（角色固定记忆）和 profile 层（跨会话持久化）。
-
-    Args:
-      clear_summary: 是否同时清空 summary 层，默认 True
-    """
-    self._active.clear()
-    self._temporary.clear()
-    if clear_summary:
-      self._summary_layer.clear()
-    self._recent_interactions.clear()
-    # 注意：stance / viewer / user_profile / character_profile 不随运行期清空（它们是跨会话的长期记忆）
-    logger.info("已清空运行期记忆状态 (clear_summary=%s)", clear_summary)
-
-  def debug_state(self) -> dict:
-    """
-    获取调试状态快照（供监控面板使用）
-
-    Returns:
-      包含记忆系统当前状态的字典
-    """
-    active_memories = self._active.get_all()
-
-    # temporary 层内容
-    temporary_memories = []
-    try:
-      temp_data = self._temporary._store.get_all()
-      for content, meta in zip(
-        temp_data.get("documents", []),
-        temp_data.get("metadatas", []),
-      ):
-        temporary_memories.append({
-          "content": content or "",
-          "timestamp": (meta or {}).get("timestamp", ""),
-          "significance": (meta or {}).get("significance", 0),
-        })
-    except Exception as e:
-      logger.debug("读取 temporary 层记忆失败: %s", e)
-
-    # summary 层内容
-    summary_memories = []
-    try:
-      sum_data = self._summary_layer._store.get_all()
-      for content, meta in zip(
-        sum_data.get("documents", []),
-        sum_data.get("metadatas", []),
-      ):
-        summary_memories.append({
-          "content": content or "",
-          "timestamp": (meta or {}).get("timestamp", ""),
-          "significance": (meta or {}).get("significance", 0),
-        })
-    except Exception as e:
-      logger.debug("读取 summary 层记忆失败: %s", e)
-
-    # static 层内容
-    static_memories = []
-    try:
-      stat_data = self._static._store.get_all()
-      for content, meta in zip(
-        stat_data.get("documents", []),
-        stat_data.get("metadatas", []),
-      ):
-        static_memories.append({
-          "content": content or "",
-          "category": (meta or {}).get("category", ""),
-        })
-    except Exception as e:
-      logger.debug("读取 static 层记忆失败: %s", e)
-
-    result = {
-      "active_count": self._active.count(),
-      "active_capacity": self._active._config.capacity,
-      "active_memories": [
-        {
-          "content": m.content,
-          "timestamp": m.timestamp.strftime("%H:%M:%S"),
-          "response": m.response,
-        }
-        for m in active_memories
-      ],
-      "temporary_count": self._temporary.count(),
-      "temporary_memories": temporary_memories,
-      "summary_count": self._summary_layer.count(),
-      "summary_memories": summary_memories,
-      "static_count": self._static.count(),
-      "static_memories": static_memories,
-      "recent_interactions": len(self._recent_interactions),
-      "summary_task_running": self._summary_task is not None and not self._summary_task.done(),
-      "cleanup_task_running": self._cleanup_task is not None and not self._cleanup_task.done(),
-    }
-
-    if self._stance is not None:
-      stance_memories = []
+    if self._summary_task is not None:
+      self._summary_task.cancel()
       try:
-        stance_data = self._stance._store.get_all()
-        for content, meta in zip(
-          stance_data.get("documents", []),
-          stance_data.get("metadatas", []),
-        ):
-          stance_memories.append({
-            "content": content or "",
-            "topic": (meta or {}).get("topic", ""),
-            "timestamp": (meta or {}).get("timestamp", ""),
-            "significance": (meta or {}).get("significance", 0),
-            "superseded_by": (meta or {}).get("superseded_by", ""),
-          })
-      except Exception as e:
-        logger.debug("读取 stance 层记忆失败: %s", e)
-      result["stance_count"] = self._stance.count()
-      result["stance_active_count"] = self._stance.count_active()
-      result["stance_memories"] = stance_memories
+        await self._summary_task
+      except asyncio.CancelledError:
+        pass
+      logger.info("记忆定时汇总任务已停止")
+    self._summary_task = None
 
-    if self._viewer is not None:
-      result["viewer"] = self._viewer.debug_state()
-
-    if self._user_profile is not None:
-      result["user_profile"] = self._user_profile.debug_state()
-    if self._character_profile is not None:
-      result["character_profile"] = self._character_profile.debug_state()
-
-    return result
+  def clear_runtime_state(self) -> None:
+    self._active.clear()
+    self._recent_interactions.clear()
+    logger.info("已清空运行期记忆状态")
 
   async def _summary_loop(self) -> None:
-    """
-    定时汇总循环
-
-    每 config.summary.interval_seconds 秒执行一次：
-    1. 收集 active 层当前记忆 + 近期交互缓冲
-    2. 用小 LLM 汇总为摘要
-    3. 写入 summary 层
-    4. 清空缓冲
-    """
     interval = self._config.summary.interval_seconds
     while True:
       try:
@@ -662,26 +594,22 @@ class MemoryManager:
         logger.error("定时汇总出错: %s", e)
 
   async def _do_summary(self) -> None:
-    """执行一次汇总"""
-    # 收集 active 层记忆
+    if self._self_memory_store is None:
+      return
+
     active_memories = self._active.get_all()
-    active_texts = [m.content for m in active_memories]
-
-    # 收集近期交互
+    active_texts = [memory.content for memory in active_memories]
     recent = list(self._recent_interactions)
-
-    # 如果没有任何内容可汇总，跳过
     if not active_texts and not recent:
       return
 
-    active_str = "\n".join(f"- {t}" for t in active_texts) if active_texts else "（无）"
+    active_str = "\n".join(f"- {text}" for text in active_texts) if active_texts else "（无）"
     recent_str = (
       "\n".join(
         f"- 观众说「{inp}」，我回复了「{resp[:50]}」"
         for inp, resp, _ in recent
       )
-      if recent
-      else "（无）"
+      if recent else "（无）"
     )
 
     prompt = PERIODIC_SUMMARY_PROMPT.format(
@@ -694,29 +622,48 @@ class MemoryManager:
       result = await model.ainvoke(prompt)
       summary_text = result.content if hasattr(result, "content") else str(result)
       summary_text = summary_text.strip()
+      if not summary_text:
+        return
 
-      if summary_text:
-        self._summary_layer.add(summary_text)
-        self._recent_interactions.clear()
-        logger.info("定时汇总完成: %s", summary_text[:60])
+      self._self_memory_store.add_thread_memory(
+        summary_text,
+        source_layer="summary_rollup",
+      )
+      self._refresh_self_structured_indexes(include_threads=True)
+      self._recent_interactions.clear()
+      logger.info("定时汇总完成: %s", summary_text[:60])
     except Exception as e:
       logger.error("定时汇总 LLM 调用失败: %s", e)
 
-  async def _cleanup_loop(self) -> None:
-    """
-    定时清理循环
+  def debug_state(self) -> dict:
+    active_memories = self._active.get_all()
+    result = {
+      "active_count": self._active.count(),
+      "active_capacity": self._active._config.capacity,
+      "active_memories": [
+        {
+          "content": memory.content,
+          "timestamp": memory.timestamp.strftime("%H:%M:%S"),
+          "response": memory.response,
+        }
+        for memory in active_memories
+      ],
+      "recent_interactions": len(self._recent_interactions),
+      "summary_task_running": self._summary_task is not None and not self._summary_task.done(),
+      "legacy_layers_removed": True,
+    }
 
-    每 config.summary.cleanup_interval_seconds 秒执行一次：
-    调用 SummaryLayer.cleanup() 删除最低 significance 的记忆
-    """
-    interval = self._config.summary.cleanup_interval_seconds
-    while True:
-      try:
-        await asyncio.sleep(interval)
-        deleted = self._summary_layer.cleanup()
-        if deleted > 0:
-          logger.info("定时清理完成，删除了 %d 条低 significance 记忆", deleted)
-      except asyncio.CancelledError:
-        break
-      except Exception as e:
-        logger.error("定时清理出错: %s", e)
+    if self._user_memory_store is not None:
+      result["user_memory_store"] = self._user_memory_store.debug_state()
+    if self._self_memory_store is not None:
+      result["self_memory_store"] = self._self_memory_store.debug_state()
+    if self._persona_spec_store is not None:
+      result["persona_spec_store"] = self._persona_spec_store.debug_state()
+    if self._corpus_store is not None:
+      result["corpus_store"] = self._corpus_store.debug_state()
+    if self._external_knowledge_store is not None:
+      result["external_knowledge_store"] = self._external_knowledge_store.debug_state()
+    if self._structured_retriever is not None:
+      result["structured_projection_indexes"] = self._structured_retriever.debug_state()
+
+    return result

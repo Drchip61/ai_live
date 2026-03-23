@@ -42,7 +42,6 @@ def test_comments_during_reply_should_not_be_dropped() -> None:
   studio = StreamingStudio(
     persona="kuro",
     model_type=ModelType.OPENAI,
-    enable_reply_decider=False,
   )
 
   base = datetime.now()
