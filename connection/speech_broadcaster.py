@@ -3,8 +3,8 @@
 将主播回复拆分后发送给语音合成+动作控制服务
 
 主对话模型默认只输出中文，本模块在发往 TTS 前按规则决定：
-- 保留中文播报
-- 或调用本地 Qwen 生成日语播报
+- `text` 始终使用中文播报
+- `text_ja` 仅作为日语字幕字段，按需调用本地 Qwen 生成
 
 支持完播同步：配置 callback_port 后，本端启动 HTTP 服务器接收 TTS 完播回调，
 主循环在语音播放完毕前不会生成下一条回复。
@@ -12,9 +12,9 @@
 数据流:
   StreamerResponse
     → 按 #[motion][emotion][voice_emotion] 标签拆分为片段
-    → 从每段提取 text_zh（中文）和 text/text_ja（已有日语或待补译）
-    → 应用中文优先播报规则
-    → 对需要日语播报的片段调用本地翻译
+    → 从每段提取 text_zh（中文）和 text_ja（已有日语或待补译）
+    → 统一固定为中文播报
+    → 对需要字幕的片段调用本地翻译，补齐 text_ja
     → 逐段 POST 到语音 API（segment + batch_id + callback_url）
     → 等待 TTS 完播回调（可选）
 """
@@ -89,7 +89,7 @@ class SpeechBroadcaster:
   监听主播回复，在发往 TTS 前补齐最终播报文本。
 
   将 StreamerResponse 按 #[motion][emotion][voice_emotion] 标签拆分为片段，
-  对需要日语播报的片段调用本地翻译，再逐段 POST 到语音 API。
+  固定使用中文播报，并为需要字幕的片段补齐日语 text_ja，再逐段 POST 到语音 API。
 
   配置 callback_port 后启用完播同步：
     - 本端启动 HTTP 服务器接收 TTS 完播回调
@@ -102,7 +102,7 @@ class SpeechBroadcaster:
       "callback_url": "http://host:port/speech_done",
       "timestamp": 1234567890.0,
       "segments": [
-        {"text": "日語", "text_zh": "中文",
+        {"text": "中文", "text_zh": "中文", "text_ja": "日語",
          "emotion": "脸红", "motion": "Idle", "voice_emotion": "joy"},
         ...
       ]
@@ -155,6 +155,7 @@ class SpeechBroadcaster:
 
     # 最新回复（供外部轮询）
     self._latest_response: Optional[dict] = None
+    self._prepared_response_cache: dict[str, dict] = {}
 
     # SpeechQueue 模式：旧 _on_response 回调跳过 TTS 发送（由 Dispatcher 接管）
     self._queue_mode = False
@@ -216,7 +217,7 @@ class SpeechBroadcaster:
       if self._translator_enabled else "关闭"
     )
     print(f"[语音广播] 已挂载，目标: {self._url}，状态: {state}")
-    print(f"[语音广播] 本地翻译: {translator_state}")
+    print(f"[语音广播] 本地日语字幕补译: {translator_state}")
     if self._callback_port:
       print(f"[语音广播] 完播同步: 已启用 (port={self._callback_port})")
     else:
@@ -275,13 +276,76 @@ class SpeechBroadcaster:
 
   def _update_latest_response(self, response: StreamerResponse) -> None:
     """回复回调：更新最新回复供 HTTP 端点返回"""
+    prepared = self._prepared_response_cache.get(response.id, {})
+    spoken_text_zh = str(
+      prepared.get("spoken_text_zh")
+      or self._extract_chinese(response.content)
+      or ""
+    ).strip()
+    subtitle_text_ja = str(prepared.get("subtitle_text_ja") or "").strip()
+    subtitle_complete = bool(prepared.get("subtitle_complete"))
     self._latest_response = {
       "id": response.id,
-      "text": self._extract_chinese(response.content),
+      "text": spoken_text_zh,
+      "spoken_text_zh": spoken_text_zh,
+      "text_ja": subtitle_text_ja,
+      "subtitle_text_ja": subtitle_text_ja,
+      "subtitle_complete": subtitle_complete,
       "raw": response.content,
       "timestamp": response.timestamp.isoformat(),
       "response_style": response.response_style,
+      "reply_target_text": response.reply_target_text,
+      "nickname": response.nickname,
     }
+    if response.controller_trace:
+      self._latest_response["controller_source"] = response.controller_trace.get("source", "")
+      self._latest_response["controller_latency_ms"] = response.controller_trace.get("latency_ms", 0.0)
+      self._latest_response["controller_plan_json"] = response.controller_trace.get("plan_json")
+    if response.timing_trace:
+      self._latest_response["timing_trace"] = response.timing_trace
+
+  def _remember_prepared_response(
+    self,
+    response: StreamerResponse,
+    segments: list[dict],
+  ) -> None:
+    spoken_text_zh = "".join(
+      str(seg.get("text_zh") or "").strip()
+      for seg in segments
+      if str(seg.get("text_zh") or "").strip()
+    )
+    subtitle_parts: list[str] = []
+    subtitle_complete = True
+    for seg in segments:
+      text_zh = str(seg.get("text_zh") or "").strip()
+      text_ja = str(seg.get("text_ja") or "").strip()
+      if text_zh and not text_ja:
+        subtitle_complete = False
+      if text_ja:
+        subtitle_parts.append(text_ja)
+    self._prepared_response_cache[response.id] = {
+      "spoken_text_zh": spoken_text_zh or self._extract_chinese(response.content),
+      "subtitle_text_ja": "".join(subtitle_parts),
+      "subtitle_complete": subtitle_complete and bool(subtitle_parts),
+    }
+    if len(self._prepared_response_cache) > 100:
+      stale_ids = list(self._prepared_response_cache)[:-50]
+      for rid in stale_ids:
+        self._prepared_response_cache.pop(rid, None)
+
+  async def prepare_segments_for_broadcast(
+    self,
+    response: StreamerResponse,
+    segments: list[dict],
+  ) -> list[dict]:
+    prepared = await self._prepare_segments_for_tts(
+      [dict(seg) for seg in segments]
+    )
+    for seg in prepared:
+      seg["reply_target_text"] = response.reply_target_text
+      seg["nickname"] = response.nickname
+    self._remember_prepared_response(response, prepared)
+    return prepared
 
   async def _handle_latest_response(self, request: web.Request) -> web.Response:
     """GET /latest_response — 返回最新回复供弹幕机器人轮询"""
@@ -322,7 +386,10 @@ class SpeechBroadcaster:
     if self._callback_url:
       seg["callback_url"] = self._callback_url
 
-    ok = await asyncio.to_thread(self._post_segment, seg)
+    ok = await asyncio.to_thread(
+      self._post_segment,
+      self._strip_private_segment_fields(seg),
+    )
     if not ok or not self._callback_url:
       self._playback_done.set()
     return ok
@@ -339,7 +406,8 @@ class SpeechBroadcaster:
         return
 
       self._apply_chinese_speech(segments, response.response_style)
-      segments = await self._prepare_segments_for_tts(segments)
+      segments = await self.prepare_segments_for_broadcast(response, segments)
+      self._update_latest_response(response)
 
       total = len(segments)
       all_ok = True
@@ -351,7 +419,10 @@ class SpeechBroadcaster:
         seg["is_last"] = (i == total - 1)
         if self._callback_url:
           seg["callback_url"] = self._callback_url
-        ok = await asyncio.to_thread(self._post_segment, seg)
+        ok = await asyncio.to_thread(
+          self._post_segment,
+          self._strip_private_segment_fields(seg),
+        )
         if not ok:
           all_ok = False
 
@@ -375,48 +446,61 @@ class SpeechBroadcaster:
   def _apply_chinese_speech(
     segments: list[dict], response_style: str,
   ) -> None:
-    """style_bank_original 全中文；style_bank_inspire 不覆盖（走日语）；
-    其他风格逐段关键词检测，感谢/欢迎段用中文。
-    被替换的段 language 从 'Japanese' 改为 'Chinese'。"""
-    if response_style == "style_bank_original":
-      for seg in segments:
-        seg["text"] = seg["text_zh"]
-        seg["language"] = "Chinese"
-      return
+    """当前 TTS 永远使用中文播报，text_ja 仅作为字幕字段。"""
+    _ = response_style
     for seg in segments:
-      if _CHINESE_SPEECH_RE.search(seg.get("text_zh", "")):
-        seg["text"] = seg["text_zh"]
-        seg["language"] = "Chinese"
+      text_zh = (seg.get("text_zh") or seg.get("text") or "").strip()
+      seg["text_zh"] = text_zh
+      seg["text"] = text_zh
+      seg["language"] = "Chinese"
 
   async def _prepare_segments_for_tts(self, segments: list[dict]) -> list[dict]:
-    """根据最终 language 决定保留中文播报，还是在发送前补出日语。"""
+    """固定中文播报；必要时补齐 text_ja 字幕字段。"""
     if not segments:
+      return segments
+    if not self._translator_enabled:
+      for seg in segments:
+        text_zh = (seg.get("text_zh") or seg.get("text") or "").strip()
+        seg["text_zh"] = text_zh
+        seg["text"] = text_zh
+        seg["text_ja"] = ""
+        seg["language"] = "Chinese"
+        seg["_subtitle_state"] = "missing"
+      return segments
+    if all(seg.get("_subtitle_state") in ("ready", "missing") for seg in segments):
+      for seg in segments:
+        text_zh = (seg.get("text_zh") or seg.get("text") or "").strip()
+        seg["text_zh"] = text_zh
+        seg["text"] = text_zh
+        seg["language"] = "Chinese"
       return segments
 
     translate_indices: list[int] = []
     translate_texts: list[str] = []
 
     for idx, seg in enumerate(segments):
-      text_zh = (seg.get("text_zh") or "").strip()
+      text_zh = (seg.get("text_zh") or seg.get("text") or "").strip()
       text_ja = (seg.get("text_ja") or "").strip()
-      language = seg.get("language", "Japanese")
-
-      if language != "Japanese":
-        if text_zh:
-          seg["text"] = text_zh
-        if not seg.get("text_ja"):
-          seg["text_ja"] = text_zh
-        continue
+      seg["text_zh"] = text_zh
+      seg["text"] = text_zh
+      seg["language"] = "Chinese"
 
       if text_zh and text_ja and text_ja != text_zh:
-        seg["text"] = text_ja
+        seg["_subtitle_state"] = "ready"
         continue
 
       if text_zh:
         translate_indices.append(idx)
         translate_texts.append(text_zh)
+      else:
+        seg["text_ja"] = ""
+        seg["_subtitle_state"] = "missing"
 
     if not translate_texts:
+      for seg in segments:
+        if seg.get("_subtitle_state") not in ("ready", "missing"):
+          seg["text_ja"] = str(seg.get("text_ja") or "").strip()
+          seg["_subtitle_state"] = "ready" if seg["text_ja"] else "missing"
       return segments
 
     translated, translation_ok = await self._translate_batch(translate_texts, lang="ja")
@@ -425,13 +509,11 @@ class SpeechBroadcaster:
       text_zh = (seg.get("text_zh") or "").strip()
       text_ja = (ja or "").strip()
       if translation_ok and text_ja:
-        seg["text"] = text_ja
         seg["text_ja"] = text_ja
-        seg["language"] = "Japanese"
+        seg["_subtitle_state"] = "ready"
       else:
-        seg["text"] = text_zh
-        seg["text_ja"] = text_zh
-        seg["language"] = "Chinese"
+        seg["text_ja"] = ""
+        seg["_subtitle_state"] = "missing"
 
     return segments
 
@@ -473,10 +555,10 @@ class SpeechBroadcaster:
   ) -> dict:
     zh, ja = SpeechBroadcaster._split_bilingual(raw)
     return {
-      "text": ja,
+      "text": zh,
       "text_zh": zh,
-      "text_ja": ja,
-      "language": "Japanese",
+      "text_ja": ja if ja and ja != zh else "",
+      "language": "Chinese",
       "emotion": emotion,
       "motion": motion,
       "voice_emotion": voice_emotion,
@@ -489,8 +571,8 @@ class SpeechBroadcaster:
 
     格式: "#[Jump][星星][joy]好厉害！ / すごい！#[Nod][- -][serenity]嗯嗯"
       → [
-          {"text": "すごい！", "text_zh": "好厉害！", "emotion": "星星", "motion": "Jump", "voice_emotion": "joy"},
-          {"text": "嗯嗯", "text_zh": "嗯嗯", "emotion": "- -", "motion": "Nod", "voice_emotion": "serenity"},
+          {"text": "好厉害！", "text_zh": "好厉害！", "text_ja": "すごい！", "emotion": "星星", "motion": "Jump", "voice_emotion": "joy"},
+          {"text": "嗯嗯", "text_zh": "嗯嗯", "text_ja": "", "emotion": "- -", "motion": "Nod", "voice_emotion": "serenity"},
         ]
 
     兼容旧双标签输入：缺第三标签时自动补默认 voice_emotion。
@@ -580,9 +662,24 @@ class SpeechBroadcaster:
       lines.append("")
     return lines
 
+  @staticmethod
+  def _strip_private_segment_fields(segment: dict) -> dict:
+    return {
+      key: value
+      for key, value in segment.items()
+      if not str(key).startswith("_")
+    }
+
   def _post_segment(self, segment: dict) -> bool:
     """POST 单条语音段到语音服务，返回是否成功（2xx）"""
     import json as _json
+
+    def _preview(text: str, limit: int = 120) -> str:
+      text = str(text or "")
+      if len(text) <= limit:
+        return text
+      return text[:limit] + "...<仅截断日志预览>"
+
     try:
       logger.info(
         "发送语音段:\n%s",
@@ -595,13 +692,17 @@ class SpeechBroadcaster:
       bid = segment["batch_id"][:8]
       seq = segment["seq"]
       total = segment["total"]
-      zh = segment.get("text_zh", "")[:60]
-      spoken = segment["text"][:60]
-      language = segment.get("language", "Japanese")
+      zh = str(segment.get("text_zh", "") or "")
+      ja = str(segment.get("text_ja", "") or "")
+      spoken = str(segment.get("text", "") or "")
+      language = segment.get("language", "Chinese")
       print(
         f"[语音广播] [{status}] batch={bid}… ({seq+1}/{total})\n"
         f"  [{segment['motion']}][{segment['emotion']}][{segment.get('voice_emotion', _DEFAULT_VOICE_EMOTION)}] "
-        f"lang: {language} | zh: {zh} | tts: {spoken}"
+        f"lang: {language} | payload_chars zh={len(zh)} ja={len(ja)} tts={len(spoken)}\n"
+        f"  zh_preview: {_preview(zh) or '-'}\n"
+        f"  ja_preview: {_preview(ja) or '-'}\n"
+        f"  tts_preview: {_preview(spoken) or '-'}"
       )
       if status >= 400:
         print(f"[语音广播] TTS 返回 {status}，跳过等待回调")

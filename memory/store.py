@@ -21,7 +21,7 @@ class VectorStore:
   Chroma 向量存储封装
 
   每个记忆层持有独立的 collection，共享同一个嵌入模型实例。
-  所有操作通过 threading.Lock 串行化，防止 asyncio.to_thread 检索
+  所有操作通过 threading.RLock 串行化，防止 asyncio.to_thread 检索
   与事件循环线程写入并发访问 HNSW 索引导致 'Error finding id'。
   """
 
@@ -56,7 +56,7 @@ class VectorStore:
       chroma_kwargs["persist_directory"] = config.persist_directory
 
     self._store = Chroma(**chroma_kwargs)
-    self._lock = threading.Lock()
+    self._lock = threading.RLock()
 
   @property
   def embeddings(self) -> HuggingFaceEmbeddings:
@@ -103,6 +103,76 @@ class VectorStore:
     ]
     with self._lock:
       self._store.add_documents(documents=documents, ids=doc_ids)
+
+  @staticmethod
+  def _build_documents(contents: list[str], metadatas: list[dict]) -> list[Document]:
+    return [
+      Document(page_content=content, metadata=meta)
+      for content, meta in zip(contents, metadatas)
+    ]
+
+  @property
+  def collection_name(self) -> str:
+    return self._store._collection.name
+
+  @staticmethod
+  def _is_recoverable_index_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+      "nothing found on disk",
+      "hnsw segment reader",
+      "error finding id",
+    ))
+
+  def _replace_documents_locked(
+    self,
+    *,
+    delete_ids: list[str],
+    doc_ids: list[str],
+    contents: list[str],
+    metadatas: list[dict],
+  ) -> None:
+    if delete_ids:
+      self._store._collection.delete(ids=delete_ids)
+    if doc_ids:
+      documents = self._build_documents(contents, metadatas)
+      self._store.add_documents(documents=documents, ids=doc_ids)
+
+  def replace_all(
+    self,
+    doc_ids: list[str],
+    contents: list[str],
+    metadatas: list[dict],
+  ) -> None:
+    """原子替换整个 collection。"""
+    with self._lock:
+      all_data = self._store._collection.get()
+      delete_ids = all_data.get("ids") or []
+      self._replace_documents_locked(
+        delete_ids=delete_ids,
+        doc_ids=doc_ids,
+        contents=contents,
+        metadatas=metadatas,
+      )
+
+  def replace_where(
+    self,
+    where: dict,
+    doc_ids: list[str],
+    contents: list[str],
+    metadatas: list[dict],
+  ) -> int:
+    """原子替换满足 where 的文档集合，返回删除数量。"""
+    with self._lock:
+      data = self._store._collection.get(where=where)
+      delete_ids = data.get("ids") or []
+      self._replace_documents_locked(
+        delete_ids=delete_ids,
+        doc_ids=doc_ids,
+        contents=contents,
+        metadatas=metadatas,
+      )
+      return len(delete_ids)
 
   def upsert_batch(
     self,
@@ -152,7 +222,25 @@ class VectorStore:
           **kwargs,
         )
     except Exception as e:
-      logger.error("向量检索失败 (collection=%s): %s", self._store._collection.name, e)
+      if self._is_recoverable_index_error(e):
+        logger.warning(
+          "向量检索命中损坏索引 (collection=%s): %s，尝试自愈后重试",
+          self.collection_name, e,
+        )
+        try:
+          self.ensure_healthy()
+          with self._lock:
+            return self._store.similarity_search_with_score(
+              query=query,
+              **kwargs,
+            )
+        except Exception as retry_error:
+          logger.error(
+            "向量检索自愈后仍失败 (collection=%s): %s",
+            self.collection_name, retry_error,
+          )
+          return []
+      logger.error("向量检索失败 (collection=%s): %s", self.collection_name, e)
       return []
 
   def delete(self, doc_ids: list[str]) -> None:
@@ -227,13 +315,13 @@ class VectorStore:
     Returns:
       True 表示索引健康或为空，False 表示执行了自愈重建
     """
-    collection_name = self._store._collection.name
+    collection_name = self.collection_name
     try:
       with self._lock:
         n = self._store._collection.count()
-      if n == 0:
-        return True
-      self.search_raw(query="health_check", top_k=1)
+        if n == 0:
+          return True
+        self._store.similarity_search_with_score(query="health_check", k=1)
       return True
     except Exception as e:
       logger.warning(
@@ -246,14 +334,12 @@ class VectorStore:
         ids = all_data.get("ids") or []
         docs = all_data.get("documents") or []
         metas = all_data.get("metadatas") or []
-        if ids:
-          self._store._collection.delete(ids=ids)
-        documents = [
-          Document(page_content=content, metadata=meta)
-          for content, meta in zip(docs, metas)
-        ]
-        if documents:
-          self._store.add_documents(documents=documents, ids=ids)
+        self._replace_documents_locked(
+          delete_ids=ids,
+          doc_ids=ids,
+          contents=docs,
+          metadatas=metas,
+        )
       logger.info(
         "索引重建完成 (collection=%s)，%d 条记忆已恢复",
         collection_name, len(ids),
@@ -268,7 +354,4 @@ class VectorStore:
 
   def clear(self) -> None:
     """清空所有文档"""
-    with self._lock:
-      all_data = self._store._collection.get()
-      if all_data["ids"]:
-        self._store._collection.delete(ids=all_data["ids"])
+    self.replace_all([], [], [])

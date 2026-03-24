@@ -6,6 +6,8 @@
 
 import asyncio
 import base64
+from dataclasses import replace
+import json
 import logging
 import logging.handlers
 import random
@@ -16,7 +18,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -27,19 +29,21 @@ if str(project_root) not in sys.path:
   sys.path.insert(0, str(project_root))
 
 from langchain_wrapper import LLMWrapper, ModelType, ModelProvider
+from llm_controller.schema import ResourceCatalog
 from prompts import PromptLoader
 from .models import Comment, StreamerResponse, ResponseChunk, EventType, GUARD_LEVEL_NAMES, EVENT_PRIORITY_ORDER
 from .database import CommentDatabase
 from .config import StudioConfig, CommentClustererConfig, SceneMemoryConfig, SpeechQueueConfig
 from .comment_clusterer import CommentClusterer, ClusterResult
 from .scene_memory import SceneMemoryCache
-from .route_composer import RoutePromptComposer
+from .route_composer import PromptComposer, RoutePromptComposer
 from .speech_queue import SpeechQueue, SpeechItem
 from .timer import PipelineTimer
 from .guard_roster import GuardRoster
-from .controller_bridge import build_controller_input
+from .controller_bridge import TurnSnapshot, build_controller_input, build_turn_snapshot
 
 if TYPE_CHECKING:
+  from llm_controller import LLMController
   from video_source import VideoPlayer
 
 
@@ -124,6 +128,20 @@ def _beijing_time_tag() -> str:
   now = datetime.now(_BEIJING_TZ)
   return f"[当前北京时间] {now.strftime('%Y-%m-%d %A %H:%M')}\n"
 
+
+def _round_ms(value: float) -> float:
+  return round(max(value, 0.0), 1)
+
+
+def _round_timings_payload(timings) -> dict[str, Any]:
+  return {
+    "round_id": timings.round_id,
+    "timestamp": timings.timestamp.isoformat(),
+    "skipped": timings.skipped,
+    "stages_ms": {name: _round_ms(ms) for name, ms in timings.stages},
+    "total_ms": _round_ms(timings.total_ms),
+  }
+
 _DANMAKU_INJECTION_PATTERNS = [
   re.compile(r"(?i)\bignore\b.{0,40}\b(instruction|rule|prompt)s?\b"),
   re.compile(r"(?i)\byou\s+are\s+now\b"),
@@ -164,6 +182,7 @@ class StreamingStudio:
     enable_controller: bool = False,
     controller_url: str = "http://localhost:2001/v1",
     controller_model: str = "qwen3.5-9b",
+    controller: Optional["LLMController"] = None,
     # 高级定制
     llm_wrapper: Optional[LLMWrapper] = None,
     database: Optional[CommentDatabase] = None,
@@ -182,6 +201,7 @@ class StreamingStudio:
       enable_topic_manager: 是否启用话题管理器（追踪、分类和管理直播话题）
       enable_comment_clusterer: 是否启用弹幕聚类器（合并语义相似弹幕，节省 token）
       video_player: 视频播放器（传入后启用 VLM 模式，自动从视频提取帧和弹幕）
+      controller: 可选，直接注入自定义 LLMController 实例
       llm_wrapper: 自定义 LLM 封装（高级用户，传入后忽略 persona/model_type/enable_memory）
       database: 自定义数据库（高级用户）
       config: 自定义行为配置（高级用户）
@@ -288,6 +308,8 @@ class StreamingStudio:
     self._last_generate_time: Optional[datetime] = None
     # 上次进入回复生成的起始时间（用于区分新旧弹幕）
     self._last_collect_time: Optional[datetime] = None
+    self._last_collect_seq: int = 0
+    self._comment_receive_seq: int = 0
 
     # 主动发言快捷等待：_check_proactive_speak 失败时记录距阈值的差值，
     # 下一轮定时器用此值替代 random(min, max)，避免空轮后重新等完整周期
@@ -380,23 +402,40 @@ class StreamingStudio:
     self._interaction_instruction = _loader.load("studio/interaction_instruction.txt")
     self._silence_notice = _loader.load("studio/silence_notice.txt")
     self._guard_thanks_reference = _loader.load_optional("studio/guard_thanks_reference.txt") or ""
+    self._gift_thanks_reference = _loader.load_optional("studio/gift_thanks_reference.txt") or ""
+    self._super_chat_reference = _loader.load_optional("studio/super_chat_reference.txt") or ""
     self._route_composer = RoutePromptComposer(_loader)
+    self._prompt_composer = PromptComposer(
+      self._route_composer,
+      style_instructions=_STYLE_INSTRUCTIONS,
+      engaging_question_probability=self.config.engaging_question_probability,
+      engaging_question_hint=_ENGAGING_QUESTION_HINT,
+      guard_thanks_reference=self._guard_thanks_reference,
+      gift_thanks_reference=self._gift_thanks_reference,
+      super_chat_reference=self._super_chat_reference,
+    )
+    self._last_turn_snapshot: Optional[TurnSnapshot] = None
+    self._last_controller_trace: Optional[dict[str, Any]] = None
+    self._last_prompt_timing_trace: Optional[dict[str, Any]] = None
 
     # 会员名册（舰长/提督/总督）
     self._guard_roster = GuardRoster()
 
     # LLM Controller（统一场景化调度）
     self._controller = None
-    self._controller_resource_catalog: dict[str, tuple[str, ...]] = {}
+    self._controller_resource_catalog = ResourceCatalog()
     self._round_count: int = 0
-    _ctrl_url = controller_url if enable_controller else self.config.controller_url
-    _ctrl_model = controller_model if enable_controller else self.config.controller_model
-    from llm_controller import LLMController
+    if controller is not None:
+      self._controller = controller
+    else:
+      _ctrl_url = controller_url if enable_controller else self.config.controller_url
+      _ctrl_model = controller_model if enable_controller else self.config.controller_model
+      from llm_controller import LLMController
 
-    self._controller = LLMController(
-      base_url=_ctrl_url,
-      model_name=_ctrl_model,
-    )
+      self._controller = LLMController(
+        base_url=_ctrl_url,
+        model_name=_ctrl_model,
+      )
     self._init_controller_catalog()
 
     # 对话记录日志（弹幕+回复 → logs/chat.log）
@@ -494,6 +533,14 @@ class StreamingStudio:
     Args:
       comment: 弹幕对象
     """
+    ingress_time = datetime.now()
+    self._comment_receive_seq += 1
+    comment = replace(
+      comment,
+      received_at=ingress_time,
+      receive_seq=self._comment_receive_seq,
+    )
+
     # 异步写库（fire-and-forget），避免阻塞事件循环
     loop = asyncio.get_event_loop()
     if loop.is_running():
@@ -649,6 +696,8 @@ class StreamingStudio:
     self._last_reply_time = None
     self._last_generate_time = None
     self._last_collect_time = None
+    self._last_collect_seq = 0
+    self._comment_receive_seq = 0
 
     # 在当前事件循环中创建 Event（Python 3.9 兼容）
     self._comment_arrived = asyncio.Event()
@@ -882,6 +931,7 @@ class StreamingStudio:
 
         timings = self._timer.finish()
         print(timings.format_summary())
+        self._chat_log.info("%s", timings.format_summary())
 
       except asyncio.CancelledError:
         break
@@ -901,6 +951,7 @@ class StreamingStudio:
 
     self._timer.mark("Controller调度")
     plan = await self._dispatch_controller(old_comments, new_comments)
+    controller_trace = self._last_controller_trace
     preview = " | ".join(c.content for c in (old_comments + new_comments))[:60]
 
     if not old_comments and not new_comments and not plan.proactive_speak:
@@ -937,10 +988,12 @@ class StreamingStudio:
 
     response = await self._generate_response_with_plan(
       old_comments, new_comments, plan, images=images,
+      controller_trace=controller_trace,
     )
 
     if response:
       self._chat_log.info("[主播] %s", response.content)
+      self._log_response_observation(response)
       await asyncio.to_thread(self.database.save_response, response)
       await self._response_queue.put(response)
       for callback in self._response_callbacks:
@@ -951,10 +1004,13 @@ class StreamingStudio:
 
       if old_comments or new_comments:
         self._last_collect_time = reply_started_at
+        self._last_collect_seq = max(
+          comment.receive_seq for comment in (old_comments + new_comments)
+        )
       self._last_reply_time = datetime.now()
       self._last_round_skipped = False
       self._was_silent = not (old_comments or new_comments)
-      self._last_response_style = plan.response_style
+      self._remember_turn_state(plan, old_comments, new_comments)
       for c in (old_comments + new_comments):
         if c.event_type != EventType.DANMAKU or c.priority:
           self._responded_event_ids.append(c.id)
@@ -1002,14 +1058,11 @@ class StreamingStudio:
     old, new = self._collect_comments()
 
     if old or new:
-      await self._speech_queue.flush_source("video")
-      await self._speech_queue.flush_source("monologue")
-      await self._speech_queue.flush_source("danmaku")
-
       if self._comment_clusterer and new:
         self._last_cluster_result = self._comment_clusterer.cluster(new)
 
       plan = await self._dispatch_controller(old, new)
+      controller_trace = self._last_controller_trace
       preview = " | ".join(c.content for c in (old + new))[:60]
 
       if not plan.should_reply:
@@ -1022,19 +1075,27 @@ class StreamingStudio:
         f"n={plan.sentences} p={plan.priority} ← {preview}"
       )
       source = "danmaku"
-      if plan.route_kind == "vlm" or plan.session_mode == "video_focus":
+      if plan.route_kind == "entry":
+        source = "entry"
+      elif plan.route_kind == "vlm" or plan.session_mode == "video_focus":
         source = "video"
       elif plan.route_kind == "proactive":
         source = "monologue"
 
-      await self._generate_and_enqueue_with_plan(old, new, plan, source=source)
+      await self._generate_and_enqueue_with_plan(
+        old,
+        new,
+        plan,
+        source=source,
+        controller_trace=controller_trace,
+      )
       return
 
     if self._speech_queue.size <= 1:
-      has_pending_danmaku = any(
-        i.source == "danmaku" for i in self._speech_queue._items
+      has_pending_user_reply = any(
+        i.source in ("danmaku", "entry") for i in self._speech_queue._items
       )
-      if has_pending_danmaku:
+      if has_pending_user_reply:
         self._comment_arrived.clear()
         try:
           await asyncio.wait_for(self._comment_arrived.wait(), timeout=2.0)
@@ -1053,13 +1114,25 @@ class StreamingStudio:
           self._running = False
           return
 
-      plan = await self._dispatch_controller([], [])
+      plan = await self._dispatch_controller(
+        [],
+        [],
+        force_fallback=True,
+        fallback_source="fallback_video_only",
+      )
+      controller_trace = self._last_controller_trace
       if plan.proactive_speak:
         source = "video" if (
           plan.route_kind == "vlm" or plan.session_mode == "video_focus"
         ) else "monologue"
         print(f"[Controller] 主动发言: {plan.proactive_reason} mode={plan.session_mode}")
-        await self._generate_and_enqueue_with_plan([], [], plan, source=source)
+        await self._generate_and_enqueue_with_plan(
+          [],
+          [],
+          plan,
+          source=source,
+          controller_trace=controller_trace,
+        )
         return
 
     self._comment_arrived.clear()
@@ -1074,6 +1147,7 @@ class StreamingStudio:
     new_comments: list[Comment],
     plan,
     source: str = "danmaku",
+    controller_trace: Optional[dict[str, Any]] = None,
   ) -> Optional[StreamerResponse]:
     """
     按 Controller PromptPlan 生成回复并入队
@@ -1091,11 +1165,10 @@ class StreamingStudio:
       except Exception as e:
         print(f"pre_response 回调错误: {e}")
 
+    await self._flush_lower_priority_queue_for_chat(source, new_comments)
     self._detect_emotion_from_comments(new_comments)
 
     max_chars = 0
-    if source in ("monologue", "video"):
-      max_chars = 10
 
     images = None
     if self._current_frame_b64:
@@ -1108,11 +1181,13 @@ class StreamingStudio:
       response = await self._generate_response_streaming_with_plan(
         old_comments, new_comments, plan,
         images=images, max_chars=max_chars,
+        controller_trace=controller_trace,
       )
     else:
       response = await self._generate_response_with_plan(
         old_comments, new_comments, plan,
         images=images, max_chars=max_chars,
+        controller_trace=controller_trace,
       )
 
     if response is None:
@@ -1132,23 +1207,16 @@ class StreamingStudio:
 
     segments = SpeechBroadcaster._parse_segments(response.content)
     SpeechBroadcaster._apply_chinese_speech(segments, response.response_style)
+    if self._speech_broadcaster is not None:
+      segments = await self._speech_broadcaster.prepare_segments_for_broadcast(
+        response,
+        segments,
+      )
 
-    if source in ("monologue", "video"):
-      if len(segments) > 1:
-        segments = segments[:1]
-      if max_chars > 0 and segments:
-        seg = segments[0]
-        text_zh = seg.get("text_zh", "")
-        if len(text_zh) > max_chars:
-          cut = text_zh[:max_chars]
-          last_punct = max(cut.rfind(p) for p in "。！？…，、")
-          if last_punct > max_chars // 2:
-            cut = cut[:last_punct + 1]
-          seg["text_zh"] = cut
-          if seg.get("language") == "Chinese":
-            seg["text"] = cut
-
-    for seg in segments:
+    enqueue_started = time.monotonic()
+    pushed_items: list[SpeechItem] = []
+    total_segments = max(len(segments), 1)
+    for idx, seg in enumerate(segments):
       item = SpeechItem(
         segment=seg,
         priority=priority,
@@ -1156,15 +1224,35 @@ class StreamingStudio:
         source=source,
         response_id=response.id,
         response=response,
+        segment_index=idx,
+        segment_total=total_segments,
         comments=list(new_comments),
         generated_at=time.monotonic(),
       )
       evicted = await self._speech_queue.push(item)
+      pushed_items.append(item)
       for ev in evicted:
         print(f"[SpeechQueue] 驱逐: {ev.source} p={ev.priority} «{ev.segment.get('text_zh', '')[:20]}»")
 
     timings = self._timer.finish()
+    response = self._merge_response_timing_trace(
+      response,
+      {
+        "enqueue_ms": _round_ms((time.monotonic() - enqueue_started) * 1000),
+        "segment_count": len(segments),
+        "pipeline_round": _round_timings_payload(timings),
+      },
+    )
+    for item in pushed_items:
+      item.response = response
     print(f"[Producer·Controller] {source} → {len(segments)}句入队 | {timings.format_summary()}")
+    self._chat_log.info(
+      "[Producer·Controller] %s → %d句入队 | %s",
+      source,
+      len(segments),
+      timings.format_summary(),
+    )
+    self._log_response_observation(response)
 
     await self._response_queue.put(response)
     for callback in self._response_callbacks:
@@ -1175,14 +1263,35 @@ class StreamingStudio:
 
     if old_comments or new_comments:
       self._last_collect_time = reply_started_at
+      self._last_collect_seq = max(
+        comment.receive_seq for comment in (old_comments + new_comments)
+      )
 
     for c in (old_comments + new_comments):
       if c.event_type != EventType.DANMAKU or c.priority:
         self._responded_event_ids.append(c.id)
 
-    self._last_response_style = plan.response_style
+    self._remember_turn_state(plan, old_comments, new_comments)
 
     return response
+
+  async def _flush_lower_priority_queue_for_chat(
+    self,
+    source: str,
+    new_comments: list[Comment],
+  ) -> None:
+    """新聊天到来时，清掉待播的欢迎词/主动解说，避免打断对话。"""
+    if self._speech_queue is None or source != "danmaku":
+      return
+    if not any(comment.event_type == EventType.DANMAKU for comment in new_comments):
+      return
+
+    flushed: list[SpeechItem] = []
+    for pending_source in ("entry", "video", "monologue"):
+      flushed.extend(await self._speech_queue.flush_source(pending_source))
+    for item in flushed:
+      preview = str(item.segment.get("text_zh", "") or "")[:20]
+      print(f"[SpeechQueue] 聊天优先，清理待播 {item.source}: «{preview}»")
 
   async def _tts_dispatch_loop(self) -> None:
     """
@@ -1218,8 +1327,7 @@ class StreamingStudio:
     """
     单句播放完毕回调。
 
-    避免对同一 response_id 重复执行回调（多句拆分时只在最后一句触发完整回调）。
-    每句播放后都更新时间戳和 response_style 记录。
+    每句播放后都更新时间戳；整条回复相关的副作用只在最后一句触发。
     """
     text_zh = item.segment.get("text_zh", "")
     self._chat_log.info("[主播·播放] %s", text_zh)
@@ -1228,7 +1336,10 @@ class StreamingStudio:
     self._last_reply_time = datetime.now()
     self._was_silent = not bool(item.comments)
 
-    # 同一回复的后续句不重复触发 session/topic 回调
+    if not item.is_last_segment:
+      return
+
+    # 同一回复的后续重放不重复触发 session/topic 回调
     if item.response_id in self._played_response_ids:
       return
     self._played_response_ids.add(item.response_id)
@@ -1396,27 +1507,32 @@ class StreamingStudio:
   # ------------------------------------------------------------------
 
   def _init_controller_catalog(self) -> None:
-    """启动时缓存可用资源目录，供 ControllerInput 使用"""
+    """统一 controller catalog 真源，优先以 runtime StyleBank 为准。"""
     mem = self.llm_wrapper.memory_manager
-    if mem is not None:
-      self._controller_resource_catalog = {
-        "persona_sections": tuple(mem.list_persona_sections()),
-        "knowledge_topics": tuple(mem.list_knowledge_topics()),
-        "corpus_styles": tuple(mem.list_corpus_style_tags()),
-        "corpus_scenes": tuple(mem.list_corpus_scene_tags()),
-      }
-    else:
-      self._controller_resource_catalog = {
-        "persona_sections": (),
-        "knowledge_topics": (),
-        "corpus_styles": (),
-        "corpus_scenes": (),
-      }
+    style_bank = getattr(self.llm_wrapper, "_style_bank", None)
+    corpus_styles: tuple[str, ...] = ()
+    corpus_scenes: tuple[str, ...] = ()
+    if style_bank is not None:
+      corpus_styles = tuple(style_bank.list_categories())
+      corpus_scenes = tuple(style_bank.list_situations())
+    elif mem is not None:
+      corpus_styles = tuple(mem.list_corpus_style_tags())
+      corpus_scenes = tuple(mem.list_corpus_scene_tags())
+
+    self._controller_resource_catalog = ResourceCatalog(
+      persona_sections=tuple(mem.list_persona_sections()) if mem is not None else (),
+      knowledge_topics=tuple(mem.list_knowledge_topics()) if mem is not None else (),
+      corpus_styles=corpus_styles,
+      corpus_scenes=corpus_scenes,
+    )
 
   async def _dispatch_controller(
     self,
     old_comments: list[Comment],
     new_comments: list[Comment],
+    *,
+    force_fallback: bool = False,
+    fallback_source: str = "fallback_forced",
   ):
     """
     调用 Controller 获取 PromptPlan
@@ -1424,8 +1540,6 @@ class StreamingStudio:
     Returns:
       PromptPlan 对象
     """
-    from llm_controller.schema import PromptPlan
-
     candidates = [t for t in (self._last_reply_time, self._last_generate_time) if t]
     silence = 0.0
     if candidates:
@@ -1436,10 +1550,9 @@ class StreamingStudio:
     has_scene = self._scene_memory is not None and len(self._scene_memory._recent) > 0
     scene_desc = ""
     if self._scene_memory and self._scene_memory._recent:
-      scene_desc = self._scene_memory._recent[-1].get("description", "")[:60]
+      scene_desc = self._scene_memory._recent[-1].description[:60]
 
-    catalog = self._controller_resource_catalog
-    ctrl_input = build_controller_input(
+    snapshot = build_turn_snapshot(
       old_comments=old_comments,
       new_comments=new_comments,
       guard_roster=self._guard_roster,
@@ -1455,13 +1568,18 @@ class StreamingStudio:
       round_count=self._round_count,
       last_response_style=getattr(self, '_last_response_style', 'normal'),
       last_topic=getattr(self, '_last_topic_str', ''),
-      available_persona_sections=catalog.get("persona_sections", ()),
-      available_knowledge_topics=catalog.get("knowledge_topics", ()),
-      available_corpus_styles=catalog.get("corpus_styles", ()),
-      available_corpus_scenes=catalog.get("corpus_scenes", ()),
+      resource_catalog=self._controller_resource_catalog,
     )
+    self._last_turn_snapshot = snapshot
+    ctrl_input = build_controller_input(snapshot=snapshot)
 
-    plan = await self._controller.dispatch(ctrl_input)
+    plan = await self._controller.dispatch(
+      ctrl_input,
+      force_fallback=force_fallback,
+      fallback_source=fallback_source,
+    )
+    self._last_controller_trace = self._controller.last_dispatch_trace
+    self._log_controller_trace(plan)
     self._round_count += 1
 
     if self._topic_manager and plan.topic_assignments:
@@ -1469,9 +1587,106 @@ class StreamingStudio:
 
     return plan
 
+  def _log_controller_trace(self, plan) -> None:
+    trace = self._last_controller_trace or {}
+    payload = {
+      "source": trace.get("source", ""),
+      "model_name": trace.get("model_name", ""),
+      "latency_ms": trace.get("latency_ms", 0.0),
+      "error": trace.get("error", ""),
+      "raw_output": str(trace.get("raw_output", "") or "")[:1000],
+      "plan_json": trace.get("plan_json") or getattr(plan, "to_dict", lambda **_: {})(nested=False),
+    }
+    self._chat_log.info("[Controller决策] %s", json.dumps(payload, ensure_ascii=False))
+
+  def _log_response_observation(self, response: StreamerResponse) -> None:
+    controller_trace = response.controller_trace or {}
+    payload = {
+      "response_id": response.id,
+      "response_style": response.response_style,
+      "controller": {
+        "source": controller_trace.get("source", ""),
+        "latency_ms": controller_trace.get("latency_ms", 0.0),
+        "raw_output": str(controller_trace.get("raw_output", "") or "")[:400],
+        "plan_json": controller_trace.get("plan_json"),
+      },
+      "timings": response.timing_trace or {},
+    }
+    self._chat_log.info("[回复观测] %s", json.dumps(payload, ensure_ascii=False))
+
+  @staticmethod
+  def _compact_last_topic(text: str, max_len: int = 40) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip())
+    return normalized[:max_len]
+
+  def _derive_last_topic(self, plan, comments: list[Comment]) -> str:
+    session_anchor = self._compact_last_topic(getattr(plan, "session_anchor", ""))
+    if session_anchor:
+      return session_anchor
+    knowledge_topics = tuple(getattr(plan, "knowledge_topics", ()) or ())
+    if knowledge_topics:
+      return f"知识:{knowledge_topics[0]}"
+    viewer_focus_ids = tuple(getattr(plan, "viewer_focus_ids", ()) or ())
+    if viewer_focus_ids:
+      focus_id = viewer_focus_ids[0]
+      for comment in reversed(comments):
+        if str(getattr(comment, "user_id", "") or "").strip() == focus_id:
+          nickname = str(getattr(comment, "nickname", "") or "").strip() or focus_id
+          return f"关系:{nickname}"
+    for comment in reversed(comments):
+      payload = self._compact_last_topic(str(getattr(comment, "content", "") or ""), max_len=32)
+      if payload:
+        return payload
+    persona_sections = tuple(getattr(plan, "persona_sections", ()) or ())
+    if persona_sections:
+      return f"人设:{persona_sections[0]}"
+    return ""
+
+  def _remember_turn_state(
+    self,
+    plan,
+    old_comments: list[Comment],
+    new_comments: list[Comment],
+  ) -> None:
+    self._last_response_style = plan.response_style
+    last_topic = self._derive_last_topic(plan, old_comments + new_comments)
+    if last_topic:
+      self._last_topic_str = last_topic
+
+  def _build_response_timing_trace(
+    self,
+    *,
+    controller_trace: Optional[dict[str, Any]],
+    prompt_timing_trace: Optional[dict[str, Any]],
+    generation_mode: str,
+    llm_total_ms: float,
+    postprocess_ms: float,
+    response_total_ms: float,
+    llm_first_token_ms: Optional[float] = None,
+  ) -> dict[str, Any]:
+    timing_trace = dict(prompt_timing_trace or {})
+    if controller_trace and controller_trace.get("latency_ms") is not None:
+      timing_trace["controller_dispatch_ms"] = controller_trace.get("latency_ms")
+    timing_trace["generation_mode"] = generation_mode
+    timing_trace["llm_total_ms"] = _round_ms(llm_total_ms)
+    if llm_first_token_ms is not None:
+      timing_trace["llm_first_token_ms"] = _round_ms(llm_first_token_ms)
+    timing_trace["postprocess_ms"] = _round_ms(postprocess_ms)
+    timing_trace["response_total_ms"] = _round_ms(response_total_ms)
+    return timing_trace
+
+  @staticmethod
+  def _merge_response_timing_trace(
+    response: StreamerResponse,
+    extra_timing_trace: Optional[dict[str, Any]],
+  ) -> StreamerResponse:
+    merged = dict(response.timing_trace or {})
+    merged.update(extra_timing_trace or {})
+    return replace(response, timing_trace=merged)
+
   def _collect_comments(self) -> tuple[list[Comment], list[Comment]]:
     """
-    从缓冲区收集最近弹幕，按“上次开始回复时间”分割为旧弹幕和新弹幕
+    从缓冲区收集最近弹幕，按“上次已处理的本地接收序号”分割为旧弹幕和新弹幕
 
     实际弹幕上限 = min(recent_comments_limit, 新弹幕数 * new_comment_context_ratio)
 
@@ -1493,8 +1708,8 @@ class StreamingStudio:
     if self._last_collect_time is None:
       return [], recent
 
-    old = [c for c in recent if c.timestamp < self._last_collect_time]
-    new = [c for c in recent if c.timestamp >= self._last_collect_time]
+    old = [c for c in recent if c.receive_seq <= self._last_collect_seq]
+    new = [c for c in recent if c.receive_seq > self._last_collect_seq]
 
     # 优先弹幕 + 未回复的特殊事件（礼物/SC/上舰/入场）：无论时间戳如何，始终归入新弹幕
     # 防止事件在回复生成期间到达后卡在 old 里不被处理
@@ -1502,7 +1717,11 @@ class StreamingStudio:
     def _should_promote(c: Comment) -> bool:
       if c.id in self._responded_event_ids:
         return False
-      return c.priority or c.event_type != EventType.DANMAKU
+      return c.priority or c.event_type in (
+        EventType.GUARD_BUY,
+        EventType.SUPER_CHAT,
+        EventType.GIFT,
+      )
 
     promoted = [c for c in old if _should_promote(c)]
     if promoted:
@@ -1665,6 +1884,9 @@ class StreamingStudio:
       return f"[礼物] {comment.nickname} 赠送了 {comment.gift_name} x{comment.gift_num}"
 
     if comment.event_type == EventType.ENTRY:
+      badge = self._guard_roster.get_level_name_by_nickname(comment.nickname)
+      if badge:
+        return f"[进入直播间] [{badge}] {comment.nickname}"
       return f"[进入直播间] {comment.nickname}"
 
     # 普通弹幕：查询会员身份，有则加徽章
@@ -1814,19 +2036,19 @@ class StreamingStudio:
       hint = _ENGAGING_QUESTION_HINT + hint
     return hint
 
-  def _compose_prompt_with_plan(
+  async def _resolve_prompt_invocation_with_plan(
     self,
     old_comments: list[Comment],
     new_comments: list[Comment],
     plan,
     images: Optional[list[str]] = None,
     max_chars: int = 0,
-  ) -> tuple[str, object, str]:
-    """按 route_kind 组装当前轮 user prompt。"""
+  ):
+    """按 controller -> retriever -> composer 三阶段解析本轮调用。"""
+    self._last_prompt_timing_trace = None
+    resolve_started = time.monotonic()
+    prompt_prep_started = time.monotonic()
     route_kind = getattr(plan, "route_kind", "chat")
-    response_style = plan.response_style
-    sentences = plan.sentences
-
     annotations = None
     interaction_targets = None
     topic_context = ""
@@ -1845,30 +2067,62 @@ class StreamingStudio:
       interaction_targets=interaction_targets,
       cluster_result=cluster_result,
     )
-
     reply_images = images if self._current_frame_b64 else None
-    bundle = self._route_composer.compose(
-      route_kind=route_kind,
+    scene_context = self._scene_memory.to_prompt() if self._scene_memory else ""
+    viewer_ids = [
+      viewer_id for viewer_id in dict.fromkeys(
+        str(getattr(comment, "user_id", "") or "").strip()
+        for comment in (old_comments + new_comments)
+        if str(getattr(comment, "user_id", "") or "").strip()
+      )
+    ]
+    prompt_prep_ms = (time.monotonic() - prompt_prep_started) * 1000
+
+    retrieve_started = time.monotonic()
+    retrieved_context = await self.llm_wrapper.resolve_context_from_plan(
+      plan,
+      old_comments=old_comments,
+      new_comments=new_comments,
+      scene_context=scene_context,
+      viewer_ids=viewer_ids,
+    )
+    retrieve_ms = (time.monotonic() - retrieve_started) * 1000
+    compose_started = time.monotonic()
+    composed_prompt = self._prompt_composer.compose(
+      plan=plan,
       formatted_comments=formatted_comments,
       old_comments=old_comments,
       new_comments=new_comments,
       time_tag=_beijing_time_tag(),
       conversation_mode=self._in_conversation_mode,
-      scene_context=self._scene_memory.to_prompt() if self._scene_memory else "",
+      scene_context=scene_context,
       stream_timestamp=self._get_stream_timestamp() if reply_images else "",
       images=reply_images,
-      session_mode=plan.session_mode,
-      fake_gift_ids=plan.fake_gift_ids,
+      topic_context=topic_context,
+      max_chars=max_chars,
+      retrieved_context=retrieved_context,
     )
+    compose_ms = (time.monotonic() - compose_started) * 1000
+    self._last_prompt_timing_trace = {
+      "prompt_prep_ms": _round_ms(prompt_prep_ms),
+      "retrieve_ms": _round_ms(retrieve_ms),
+      "compose_ms": _round_ms(compose_ms),
+      "resolve_prompt_ms": _round_ms((time.monotonic() - resolve_started) * 1000),
+      "context_debug": retrieved_context.debug_view(),
+    }
+    return composed_prompt, retrieved_context
 
-    prompt = bundle.prompt
-    if topic_context:
-      prompt = f"{topic_context}\n\n{prompt}"
-
-    style_hint = self._build_style_hint(response_style, sentences, max_chars)
-    if style_hint:
-      prompt = style_hint + prompt
-    return prompt, bundle, response_style
+  def _compose_prompt_with_plan(
+    self,
+    old_comments: list[Comment],
+    new_comments: list[Comment],
+    plan,
+    images: Optional[list[str]] = None,
+    max_chars: int = 0,
+  ):
+    raise RuntimeError(
+      "_compose_prompt_with_plan 已被三阶段重构替换，请改用异步的 _resolve_prompt_invocation_with_plan。"
+    )
 
   async def _generate_response_with_plan(
     self,
@@ -1877,27 +2131,29 @@ class StreamingStudio:
     plan,
     images: Optional[list[str]] = None,
     max_chars: int = 0,
+    controller_trace: Optional[dict[str, Any]] = None,
   ) -> Optional[StreamerResponse]:
-    """按 Controller PromptPlan 生成非流式回复。"""
-    prompt, bundle, response_style = self._compose_prompt_with_plan(
+    """按三阶段链路生成非流式回复。"""
+    response_started = time.monotonic()
+    composed_prompt, retrieved_context = await self._resolve_prompt_invocation_with_plan(
       old_comments,
       new_comments,
       plan,
       images=images,
       max_chars=max_chars,
     )
+    prompt_timing_trace = dict(self._last_prompt_timing_trace or {})
     all_comments = old_comments + new_comments
-    self._last_prompt = prompt
+    self._last_prompt = composed_prompt.invocation.user_prompt
 
     self._timer.mark("LLM生成")
+    llm_started = time.monotonic()
     try:
       content = await self.llm_wrapper.achat_with_plan(
-        prompt,
+        composed_prompt.invocation,
         plan=plan,
-        rag_query=bundle.rag_query,
-        images=bundle.reply_images,
-        memory_input=bundle.memory_input,
         comments=all_comments,
+        retrieved_context=retrieved_context,
       )
     except Exception as e:
       print(f"LLM 调用错误: {e}")
@@ -1905,8 +2161,29 @@ class StreamingStudio:
       return None
 
     self._timer.mark("后处理")
-    reply_ids = tuple(c.id for c in new_comments)
-    return self._build_response(content, reply_ids, response_style=response_style)
+    postprocess_started = time.monotonic()
+    llm_total_ms = (postprocess_started - llm_started) * 1000
+    reply_ids = tuple(comment.id for comment in new_comments)
+    reply_target = self._pick_primary_reply_target(new_comments, plan)
+    response = self._build_response(
+      content,
+      reply_ids,
+      reply_target_text=self._reply_target_text(reply_target),
+      reply_target_nickname=reply_target.nickname if reply_target is not None else "",
+      response_style=composed_prompt.invocation.response_style,
+      controller_trace=controller_trace,
+    )
+    return replace(
+      response,
+      timing_trace=self._build_response_timing_trace(
+        controller_trace=controller_trace,
+        prompt_timing_trace=prompt_timing_trace,
+        generation_mode="non_streaming",
+        llm_total_ms=llm_total_ms,
+        postprocess_ms=(time.monotonic() - postprocess_started) * 1000,
+        response_total_ms=(time.monotonic() - response_started) * 1000,
+      ),
+    )
 
   async def _generate_response_streaming_with_plan(
     self,
@@ -1915,33 +2192,38 @@ class StreamingStudio:
     plan,
     images: Optional[list[str]] = None,
     max_chars: int = 0,
+    controller_trace: Optional[dict[str, Any]] = None,
   ) -> Optional[StreamerResponse]:
-    """按 Controller PromptPlan 流式生成回复。"""
-    prompt, bundle, response_style = self._compose_prompt_with_plan(
+    """按三阶段链路流式生成回复。"""
+    response_started = time.monotonic()
+    composed_prompt, retrieved_context = await self._resolve_prompt_invocation_with_plan(
       old_comments,
       new_comments,
       plan,
       images=images,
       max_chars=max_chars,
     )
+    prompt_timing_trace = dict(self._last_prompt_timing_trace or {})
     all_comments = old_comments + new_comments
-    reply_ids = tuple(c.id for c in new_comments)
+    reply_ids = tuple(comment.id for comment in new_comments)
+    reply_target = self._pick_primary_reply_target(new_comments, plan)
     response_id = str(uuid.uuid4())
     accumulated = ""
     first_token_received = False
-    self._last_prompt = prompt
+    llm_first_token_ms: Optional[float] = None
+    self._last_prompt = composed_prompt.invocation.user_prompt
 
     self._timer.mark("LLM生成")
+    llm_started = time.monotonic()
     try:
       async for chunk in self.llm_wrapper.achat_stream_with_plan(
-        prompt,
+        composed_prompt.invocation,
         plan=plan,
-        rag_query=bundle.rag_query,
-        images=bundle.reply_images,
-        memory_input=bundle.memory_input,
         comments=all_comments,
+        retrieved_context=retrieved_context,
       ):
         if not first_token_received:
+          llm_first_token_ms = (time.monotonic() - llm_started) * 1000
           self._timer.mark("LLM流式输出")
           first_token_received = True
         accumulated += chunk
@@ -1972,6 +2254,8 @@ class StreamingStudio:
       return None
 
     self._timer.mark("后处理")
+    postprocess_started = time.monotonic()
+    llm_total_ms = (postprocess_started - llm_started) * 1000
     display_text, em_tags = self._apply_expression_mapping(accumulated)
     done_chunk = ResponseChunk(
       response_id=response_id,
@@ -1988,10 +2272,22 @@ class StreamingStudio:
     kwargs: dict = {
       "content": display_text,
       "reply_to": reply_ids,
+      "reply_target_text": self._reply_target_text(reply_target),
+      "nickname": reply_target.nickname if reply_target is not None else "",
       "id": response_id,
       "mapped_content": display_text if em_tags else None,
       "expression_motion_tags": em_tags,
-      "response_style": response_style,
+      "response_style": composed_prompt.invocation.response_style,
+      "controller_trace": controller_trace,
+      "timing_trace": self._build_response_timing_trace(
+        controller_trace=controller_trace,
+        prompt_timing_trace=prompt_timing_trace,
+        generation_mode="streaming",
+        llm_total_ms=llm_total_ms,
+        llm_first_token_ms=llm_first_token_ms,
+        postprocess_ms=(time.monotonic() - postprocess_started) * 1000,
+        response_total_ms=(time.monotonic() - response_started) * 1000,
+      ),
     }
     return StreamerResponse(**kwargs)
 
@@ -2015,12 +2311,78 @@ class StreamingStudio:
       print(f"表情动作映射失败: {e}")
       return text, ()
 
+  @classmethod
+  def _reply_target_text(cls, comment: Optional[Comment], max_len: int = 120) -> str:
+    if comment is None:
+      return ""
+    content = cls._normalize_comment_text(comment.content, max_len=max_len)
+    if content:
+      return content
+    return cls._normalize_comment_text(comment.format_for_llm(), max_len=max_len)
+
+  def _pick_primary_reply_target(
+    self,
+    new_comments: list[Comment],
+    plan,
+  ) -> Optional[Comment]:
+    if not new_comments:
+      return None
+
+    route_kind = str(getattr(plan, "route_kind", "chat") or "chat")
+    viewer_focus_ids = {
+      str(viewer_id).strip()
+      for viewer_id in tuple(getattr(plan, "viewer_focus_ids", ()) or ())
+      if str(viewer_id).strip()
+    }
+    route_targets = {
+      "guard_buy": (EventType.GUARD_BUY,),
+      "super_chat": (EventType.SUPER_CHAT,),
+      "gift": (EventType.GIFT,),
+      "entry": (EventType.ENTRY,),
+      "chat": (EventType.DANMAKU,),
+    }.get(route_kind, ())
+
+    def pick_for_types(event_types: tuple[EventType, ...]) -> Optional[Comment]:
+      if not event_types:
+        return None
+      if viewer_focus_ids:
+        for comment in reversed(new_comments):
+          if comment.event_type in event_types and comment.user_id in viewer_focus_ids:
+            return comment
+      for comment in reversed(new_comments):
+        if comment.event_type in event_types:
+          return comment
+      return None
+
+    target = pick_for_types(route_targets)
+    if target is not None:
+      return target
+
+    if viewer_focus_ids:
+      for comment in reversed(new_comments):
+        if comment.user_id in viewer_focus_ids:
+          return comment
+
+    for comment in reversed(new_comments):
+      if comment.priority or comment.is_paid_event:
+        return comment
+
+    for comment in reversed(new_comments):
+      if comment.event_type == EventType.DANMAKU:
+        return comment
+
+    return max(new_comments, key=lambda comment: comment.receive_seq)
+
   def _build_response(
     self,
     content: str,
     reply_ids: tuple[str, ...],
+    reply_target_text: str = "",
+    reply_target_nickname: str = "",
     response_id: Optional[str] = None,
     response_style: str = "normal",
+    controller_trace: Optional[dict[str, Any]] = None,
+    timing_trace: Optional[dict[str, Any]] = None,
   ) -> StreamerResponse:
     """统一构建 StreamerResponse（非流式路径），content 直接使用映射后文本"""
     display_text, em_tags = self._apply_expression_mapping(content)
@@ -2028,9 +2390,13 @@ class StreamingStudio:
     kwargs: dict = {
       "content": display_text,
       "reply_to": reply_ids,
+      "reply_target_text": reply_target_text,
+      "nickname": reply_target_nickname,
       "mapped_content": display_text if em_tags else None,
       "expression_motion_tags": em_tags,
       "response_style": response_style,
+      "controller_trace": controller_trace,
+      "timing_trace": timing_trace,
     }
     if response_id is not None:
       kwargs["id"] = response_id
@@ -2114,6 +2480,7 @@ class StreamingStudio:
       "video_player": self._video_player.debug_state() if self._video_player else None,
       "scene_memory": self._scene_memory.debug_state() if self._scene_memory else None,
       "pipeline_timer": self._timer.debug_state(),
+      "last_prompt_timing_trace": self._last_prompt_timing_trace,
       "guard_roster": self._guard_roster.debug_state(),
       "controller": self._controller.debug_state() if self._controller else None,
       "speech_queue": self._speech_queue.debug_state() if self._speech_queue else None,

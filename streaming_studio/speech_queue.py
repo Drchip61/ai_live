@@ -35,6 +35,8 @@ class SpeechItem:
   source: str
   response_id: str
   response: StreamerResponse
+  segment_index: int = 0
+  segment_total: int = 1
   comments: list[Comment] = field(default_factory=list)
   generated_at: float = field(default_factory=time.monotonic)
   id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -46,6 +48,10 @@ class SpeechItem:
   @property
   def age(self) -> float:
     return time.monotonic() - self.generated_at
+
+  @property
+  def is_last_segment(self) -> bool:
+    return self.segment_index >= max(self.segment_total - 1, 0)
 
 
 class SpeechQueue:
@@ -95,7 +101,11 @@ class SpeechQueue:
 
       evicted: list[SpeechItem] = []
       while len(self._items) >= self._max_size:
-        worst = max(self._items, key=lambda i: (i.priority, i.generated_at))
+        candidate_pool = [
+          queued for queued in self._items
+          if queued.response_id != item.response_id
+        ] or list(self._items)
+        worst = max(candidate_pool, key=lambda i: (i.priority, i.generated_at))
         if worst.priority >= item.priority:
           self._items.remove(worst)
           evicted.append(worst)
@@ -172,6 +182,7 @@ class SpeechQueue:
       items_preview.append({
         "source": item.source,
         "priority": item.priority,
+        "segment": f"{item.segment_index + 1}/{item.segment_total}",
         "age": round(item.age, 1),
         "ttl": item.ttl,
         "expired": item.expired,

@@ -23,6 +23,12 @@ class ActiveConfig:
 
 
 @dataclass(frozen=True)
+class SummaryConfig:
+  """定时汇总配置"""
+  interval_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
 class EmbeddingConfig:
   """嵌入模型配置"""
   model_name: str = "BAAI/bge-small-zh-v1.5"
@@ -54,11 +60,13 @@ class StructuredContextConfig:
   persona_top_k: int = 4
   corpus_top_k: int = 3
   knowledge_top_k: int = 3
+  semantic_max_distance: float = 1.5
 
 
 @dataclass(frozen=True)
 class MemoryConfig:
   """记忆系统总配置"""
-  active: ActiveConfig = ActiveConfig()
-  embedding: EmbeddingConfig = EmbeddingConfig()
-  structured: StructuredContextConfig = StructuredContextConfig()
+  active: ActiveConfig = field(default_factory=ActiveConfig)
+  summary: SummaryConfig = field(default_factory=SummaryConfig)
+  embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
+  structured: StructuredContextConfig = field(default_factory=StructuredContextConfig)

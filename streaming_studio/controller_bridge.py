@@ -1,21 +1,24 @@
 """
 Controller 桥接层
 
-将 StreamingStudio 的运行时状态映射为 ControllerInput，
-并将 PromptPlan 应用到执行层。
+将 StreamingStudio 的运行时状态先收束为 TurnSnapshot，
+再映射为 ControllerInput，稳定 controller / retriever / composer 的输入边界。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
 from llm_controller.schema import (
   CommentBrief,
   ControllerInput,
+  ResourceCatalog,
   TopicBrief,
   ViewerBrief,
 )
+from memory.context_schema import resolve_preferred_address
 
 if TYPE_CHECKING:
   from .models import Comment
@@ -27,6 +30,33 @@ if TYPE_CHECKING:
 
 
 _GUARD_LEVEL_NAMES = {1: "舰长", 2: "提督", 3: "总督"}
+
+
+@dataclass(frozen=True)
+class TurnSnapshot:
+  """单轮共享快照，供 controller / retriever / composer 共用。"""
+
+  old_comments: tuple["Comment", ...] = ()
+  new_comments: tuple["Comment", ...] = ()
+  guard_roster: Optional["GuardRoster"] = None
+  memory_manager: Optional["MemoryManager"] = None
+  topic_manager: Optional["TopicManager"] = None
+  state_card: Optional["StateCard"] = None
+  scene_memory: Optional["SceneMemoryCache"] = None
+  is_conversation_mode: bool = False
+  has_scene_change: bool = False
+  scene_description: str = ""
+  silence_seconds: float = 0.0
+  comment_rate: float = -1.0
+  round_count: int = 0
+  last_response_style: str = "normal"
+  last_topic: str = ""
+  stream_phase: str = "直播中"
+  resource_catalog: ResourceCatalog = field(default_factory=ResourceCatalog)
+
+  @property
+  def all_comments(self) -> list["Comment"]:
+    return list(self.old_comments + self.new_comments)
 
 
 def _controller_content(comment: "Comment") -> str:
@@ -51,7 +81,7 @@ def _controller_content(comment: "Comment") -> str:
   return comment.content
 
 
-def build_controller_input(
+def build_turn_snapshot(
   *,
   old_comments: list["Comment"],
   new_comments: list["Comment"],
@@ -69,49 +99,135 @@ def build_controller_input(
   last_response_style: str,
   last_topic: str,
   stream_phase: str = "直播中",
+  resource_catalog: Optional[ResourceCatalog] = None,
+  available_persona_sections: tuple[str, ...] = (),
+  available_knowledge_topics: tuple[str, ...] = (),
+  available_corpus_styles: tuple[str, ...] = (),
+  available_corpus_scenes: tuple[str, ...] = (),
+) -> TurnSnapshot:
+  catalog = resource_catalog or ResourceCatalog(
+    persona_sections=available_persona_sections,
+    knowledge_topics=available_knowledge_topics,
+    corpus_styles=available_corpus_styles,
+    corpus_scenes=available_corpus_scenes,
+  )
+  resolved_stream_phase = stream_phase
+  if state_card is not None and getattr(state_card, "stream_phase", ""):
+    resolved_stream_phase = getattr(state_card, "stream_phase", "") or stream_phase
+
+  return TurnSnapshot(
+    old_comments=tuple(old_comments),
+    new_comments=tuple(new_comments),
+    guard_roster=guard_roster,
+    memory_manager=memory_manager,
+    topic_manager=topic_manager,
+    state_card=state_card,
+    scene_memory=scene_memory,
+    is_conversation_mode=is_conversation_mode,
+    has_scene_change=has_scene_change,
+    scene_description=scene_description,
+    silence_seconds=silence_seconds,
+    comment_rate=comment_rate,
+    round_count=round_count,
+    last_response_style=last_response_style,
+    last_topic=last_topic,
+    stream_phase=resolved_stream_phase,
+    resource_catalog=catalog,
+  )
+
+
+def build_controller_input(
+  *,
+  snapshot: Optional[TurnSnapshot] = None,
+  old_comments: Optional[list["Comment"]] = None,
+  new_comments: Optional[list["Comment"]] = None,
+  guard_roster: Optional["GuardRoster"] = None,
+  memory_manager: Optional["MemoryManager"] = None,
+  topic_manager: Optional["TopicManager"] = None,
+  state_card: Optional["StateCard"] = None,
+  scene_memory: Optional["SceneMemoryCache"] = None,
+  is_conversation_mode: bool = False,
+  has_scene_change: bool = False,
+  scene_description: str = "",
+  silence_seconds: float = 0.0,
+  comment_rate: float = -1.0,
+  round_count: int = 0,
+  last_response_style: str = "normal",
+  last_topic: str = "",
+  stream_phase: str = "直播中",
+  resource_catalog: Optional[ResourceCatalog] = None,
   available_persona_sections: tuple[str, ...] = (),
   available_knowledge_topics: tuple[str, ...] = (),
   available_corpus_styles: tuple[str, ...] = (),
   available_corpus_scenes: tuple[str, ...] = (),
 ) -> ControllerInput:
-  """从 Studio 运行时状态构建 ControllerInput"""
-  now = datetime.now()
+  """从 Studio 运行时状态构建 ControllerInput。"""
+  if snapshot is None:
+    if guard_roster is None:
+      raise ValueError("build_controller_input 需要 snapshot 或 guard_roster")
+    snapshot = build_turn_snapshot(
+      old_comments=old_comments or [],
+      new_comments=new_comments or [],
+      guard_roster=guard_roster,
+      memory_manager=memory_manager,
+      topic_manager=topic_manager,
+      state_card=state_card,
+      scene_memory=scene_memory,
+      is_conversation_mode=is_conversation_mode,
+      has_scene_change=has_scene_change,
+      scene_description=scene_description,
+      silence_seconds=silence_seconds,
+      comment_rate=comment_rate,
+      round_count=round_count,
+      last_response_style=last_response_style,
+      last_topic=last_topic,
+      stream_phase=stream_phase,
+      resource_catalog=resource_catalog,
+      available_persona_sections=available_persona_sections,
+      available_knowledge_topics=available_knowledge_topics,
+      available_corpus_styles=available_corpus_styles,
+      available_corpus_scenes=available_corpus_scenes,
+    )
 
+  now = datetime.now()
   comment_briefs: list[CommentBrief] = []
   viewer_ids_seen: set[str] = set()
 
-  all_comments = old_comments + new_comments
-  new_ids = {c.id for c in new_comments}
+  all_comments = snapshot.all_comments
+  new_ids = {c.id for c in snapshot.new_comments}
   viewer_nickname_map = {
     c.user_id: str(c.nickname).strip()
     for c in all_comments
     if str(c.nickname).strip()
   }
 
-  for c in all_comments:
-    seconds_ago = (now - c.timestamp).total_seconds()
-    member = guard_roster.get_member_by_nickname(c.nickname)
+  for comment in all_comments:
+    seconds_ago = (now - comment.timestamp).total_seconds()
+    member = (
+      snapshot.guard_roster.get_member_by_nickname(comment.nickname)
+      if snapshot.guard_roster is not None else None
+    )
     is_guard = member is not None
     guard_level_name = member.level_name if member else ""
 
     comment_briefs.append(CommentBrief(
-      id=c.id,
-      user_id=c.user_id,
-      nickname=c.nickname,
-      content=_controller_content(c),
-      event_type=c.event_type.value if hasattr(c.event_type, 'value') else str(c.event_type),
-      price=getattr(c, 'price', 0.0) or 0.0,
-      guard_level=getattr(c, 'guard_level', 0) or 0,
+      id=comment.id,
+      user_id=comment.user_id,
+      nickname=comment.nickname,
+      content=_controller_content(comment),
+      event_type=comment.event_type.value if hasattr(comment.event_type, "value") else str(comment.event_type),
+      price=getattr(comment, "price", 0.0) or 0.0,
+      guard_level=getattr(comment, "guard_level", 0) or 0,
       is_guard_member=is_guard,
       guard_member_level=guard_level_name,
       seconds_ago=seconds_ago,
-      is_new=c.id in new_ids,
+      is_new=comment.id in new_ids,
     ))
-    viewer_ids_seen.add(c.user_id)
+    viewer_ids_seen.add(comment.user_id)
 
   viewer_briefs: list[ViewerBrief] = []
-  if memory_manager is not None:
-    user_store = memory_manager.user_memory_store
+  if snapshot.memory_manager is not None:
+    user_store = snapshot.memory_manager.user_memory_store
     for viewer_id in viewer_ids_seen:
       record = user_store.get(viewer_id) if user_store else None
       comment_nickname = viewer_nickname_map.get(viewer_id, "")
@@ -124,7 +240,12 @@ def build_controller_input(
 
       if record is not None:
         identity = record.identity or {}
-        nickname = str(identity.get("preferred_address", "")).strip() or nickname
+        nickname = resolve_preferred_address(
+          identity,
+          fallback_nicknames=tuple(identity.get("nicknames", ())),
+          raw_aliases=(viewer_id, comment_nickname),
+          fallback=nickname,
+        ) or nickname
         rel = record.relationship_state or {}
         familiarity = float(rel.get("familiarity", 0) or 0)
         trust = float(rel.get("trust", 0) or 0)
@@ -133,7 +254,10 @@ def build_controller_input(
         if record.topic_profile:
           last_topic_str = str(record.topic_profile[-1].get("topic", ""))
 
-      member = guard_roster.get_member_by_nickname(comment_nickname or nickname)
+      member = (
+        snapshot.guard_roster.get_member_by_nickname(comment_nickname or nickname)
+        if snapshot.guard_roster is not None else None
+      )
 
       viewer_briefs.append(ViewerBrief(
         viewer_id=viewer_id,
@@ -148,14 +272,14 @@ def build_controller_input(
       ))
 
   topic_briefs: list[TopicBrief] = []
-  if topic_manager is not None:
-    for t in topic_manager.table.get_all():
-      idle = (now - t.last_discussed_at).total_seconds()
+  if snapshot.topic_manager is not None:
+    for topic in snapshot.topic_manager.table.get_all():
+      idle = (now - topic.last_discussed_at).total_seconds()
       topic_briefs.append(TopicBrief(
-        topic_id=t.topic_id,
-        title=t.title,
-        significance=t.significance,
-        stale=t.stale,
+        topic_id=topic.topic_id,
+        title=topic.title,
+        significance=topic.significance,
+        stale=topic.stale,
         idle_seconds=idle,
       ))
 
@@ -163,31 +287,37 @@ def build_controller_input(
   patience = 0.7
   atmosphere = ""
   emotion = ""
-  if state_card is not None:
-    energy = state_card.energy
-    patience = state_card.patience
-    atmosphere = getattr(state_card, 'atmosphere', '') or ""
-    emotion = getattr(state_card, 'emotion', '') or ""
+  stream_phase_value = snapshot.stream_phase
+  if snapshot.state_card is not None:
+    energy = snapshot.state_card.energy
+    patience = snapshot.state_card.patience
+    atmosphere = getattr(snapshot.state_card, "atmosphere", "") or ""
+    emotion = (
+      getattr(snapshot.state_card, "undigested_emotion", "") or
+      getattr(snapshot.state_card, "emotion", "") or
+      ""
+    )
+    stream_phase_value = getattr(snapshot.state_card, "stream_phase", "") or stream_phase_value
 
   return ControllerInput(
     energy=energy,
     patience=patience,
     atmosphere=atmosphere,
     emotion=emotion,
-    stream_phase=stream_phase,
-    round_count=round_count,
+    stream_phase=stream_phase_value,
+    round_count=snapshot.round_count,
     comments=tuple(comment_briefs),
-    comment_rate=comment_rate,
-    silence_seconds=silence_seconds,
+    comment_rate=snapshot.comment_rate,
+    silence_seconds=snapshot.silence_seconds,
     viewer_briefs=tuple(viewer_briefs),
     active_topics=tuple(topic_briefs),
-    is_conversation_mode=is_conversation_mode,
-    has_scene_change=has_scene_change,
-    scene_description=scene_description,
-    last_response_style=last_response_style,
-    last_topic=last_topic,
-    available_persona_sections=available_persona_sections,
-    available_knowledge_topics=available_knowledge_topics,
-    available_corpus_styles=available_corpus_styles,
-    available_corpus_scenes=available_corpus_scenes,
+    is_conversation_mode=snapshot.is_conversation_mode,
+    has_scene_change=snapshot.has_scene_change,
+    scene_description=snapshot.scene_description,
+    last_response_style=snapshot.last_response_style,
+    last_topic=snapshot.last_topic,
+    available_persona_sections=snapshot.resource_catalog.persona_sections,
+    available_knowledge_topics=snapshot.resource_catalog.knowledge_topics,
+    available_corpus_styles=snapshot.resource_catalog.corpus_styles,
+    available_corpus_scenes=snapshot.resource_catalog.corpus_scenes,
   )

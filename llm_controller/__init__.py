@@ -4,6 +4,10 @@ from .schema import (
   CommentBrief,
   ControllerInput,
   PromptPlan,
+  ReplyDecision,
+  ResourceCatalog,
+  RetrievalPlan,
+  SideEffectPlan,
   TopicBrief,
   ViewerBrief,
 )
@@ -14,6 +18,10 @@ __all__ = [
   "ControllerInput",
   "LLMController",
   "PromptPlan",
+  "ReplyDecision",
+  "RetrievalPlan",
+  "SideEffectPlan",
+  "ResourceCatalog",
   "TopicBrief",
   "ViewerBrief",
 ]

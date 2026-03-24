@@ -11,6 +11,7 @@ from typing import Optional
 
 from langchain_huggingface import HuggingFaceEmbeddings
 
+from memory.config import EmbeddingConfig
 from memory.store import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ class StyleBank:
   """
   风格参考库
 
-  初始化时将 corpus.jsonl 全量灌入 Chroma（EphemeralClient），
+  初始化时将 corpus.jsonl 全量灌入临时 Chroma，
   运行时按情境做语义检索，返回格式化文本供 _build_extra_context 注入。
   """
 
@@ -46,6 +47,7 @@ class StyleBank:
 
     self._retrieval_count: int = self._meta.get("retrieval_count", 3)
     self._categories: dict[str, str] = self._meta.get("categories", {})
+    self._situations: set[str] = set()
 
     self._header_targeted: str = self._meta.get(
       "injection_header_inspire",
@@ -55,6 +57,7 @@ class StyleBank:
     collection_name = f"style_bank_{persona_dir.name}"
     self._store = VectorStore(
       collection_name=collection_name,
+      config=EmbeddingConfig(persist_directory=None),
       embeddings=embeddings,
     )
 
@@ -74,9 +77,13 @@ class StyleBank:
         item = json.loads(line)
         ids.append(item["id"])
         texts.append(item["text"])
+        category = str(item.get("category", "") or "").strip()
+        situation = str(item.get("situation", "any") or "any").strip()
+        if situation:
+          self._situations.add(situation)
         meta = {
-          "category": item.get("category", ""),
-          "situation": item.get("situation", "any"),
+          "category": category,
+          "situation": situation,
           "score": item.get("score", 3),
         }
         if "source" in item:
@@ -96,6 +103,26 @@ class StyleBank:
       )
 
     logger.info("StyleBank 已加载 %d 条语料", len(ids))
+
+  def list_categories(self) -> list[str]:
+    tags = set(self._categories.keys())
+    raw = self._store.get_all().get("metadatas", [])
+    for meta in raw:
+      if isinstance(meta, dict):
+        category = str(meta.get("category", "")).strip()
+        if category:
+          tags.add(category)
+    return sorted(tags)
+
+  def list_situations(self) -> list[str]:
+    tags = set(self._situations)
+    raw = self._store.get_all().get("metadatas", [])
+    for meta in raw:
+      if isinstance(meta, dict):
+        situation = str(meta.get("situation", "")).strip()
+        if situation:
+          tags.add(situation)
+    return sorted(tag for tag in tags if tag)
 
   def retrieve_targeted(
     self,
@@ -141,5 +168,6 @@ class StyleBank:
     return {
       "corpus_count": self._store.count(),
       "retrieval_count": self._retrieval_count,
-      "categories": list(self._categories.keys()),
+      "categories": self.list_categories(),
+      "situations": self.list_situations(),
     }

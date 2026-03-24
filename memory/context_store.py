@@ -18,6 +18,9 @@ from .context_schema import (
   PersonaSpecRecord,
   SelfMemoryRecord,
   UserMemoryRecord,
+  extract_requested_address,
+  normalize_preferred_address,
+  resolve_preferred_address,
 )
 
 logger = logging.getLogger(__name__)
@@ -229,10 +232,16 @@ def _merge_identity(existing: dict, incoming: Optional[dict], nickname: str = ""
     + list(incoming_identity.get("nicknames", ()))
     + ([nickname] if nickname else [])
   )
-  preferred_address = (
-    str(incoming_identity.get("preferred_address", "")).strip()
-    or str(current.get("preferred_address", "")).strip()
-    or (nicknames[-1] if nicknames else "")
+  preferred_address = resolve_preferred_address(
+    {
+      "nicknames": nicknames,
+      "preferred_address": (
+        incoming_identity.get("preferred_address")
+        or current.get("preferred_address", "")
+      ),
+    },
+    fallback_nicknames=nicknames,
+    raw_aliases=(nickname,),
   )
 
   occupation = dict(current.get("occupation", {}) or {})
@@ -308,11 +317,19 @@ def _merge_relationship_state(
 
   for key in ("interaction_style", "address_style", "preferred_address", "last_dialogue_stop"):
     value = payload.get(key)
+    if key == "preferred_address":
+      value = normalize_preferred_address(value)
     if value not in (None, "", []):
       merged[key] = value
 
-  if preferred_address and merged.get("preferred_address") in (None, ""):
-    merged["preferred_address"] = preferred_address
+  merged_preferred_address = normalize_preferred_address(merged.get("preferred_address", ""))
+  normalized_preferred_address = normalize_preferred_address(preferred_address)
+  if normalized_preferred_address:
+    merged["preferred_address"] = normalized_preferred_address
+  elif merged_preferred_address:
+    merged["preferred_address"] = merged_preferred_address
+  else:
+    merged.pop("preferred_address", None)
 
   if payload.get("publicly_acknowledged") not in (None, ""):
     merged["publicly_acknowledged"] = bool(payload.get("publicly_acknowledged"))
@@ -372,9 +389,14 @@ class UserMemoryStore(_JsonStoreBase):
     for viewer_id, record in raw.items():
       if not isinstance(record, dict):
         continue
-      if not self._looks_like_current_schema(record):
+      normalized_record = UserMemoryRecord.from_dict(record)
+      if (
+        not self._looks_like_current_schema(record)
+        or json.dumps(record, ensure_ascii=False, sort_keys=True)
+        != json.dumps(normalized_record.to_dict(), ensure_ascii=False, sort_keys=True)
+      ):
         needs_rewrite = True
-      self._records[viewer_id] = UserMemoryRecord.from_dict(record)
+      self._records[viewer_id] = normalized_record
     if needs_rewrite:
       self._persist()
 
@@ -410,6 +432,31 @@ class UserMemoryStore(_JsonStoreBase):
     callback_items = _merge_text_entries(record.callbacks, callbacks or [], "hook", semantic_mode="callback")
     open_thread_items = _merge_text_entries(record.open_threads, open_threads or [], "thread", semantic_mode="callback")
     sensitive_topic_items = _merge_named_entries(record.sensitive_topics, sensitive_topics or [], "topic")
+    requested_address = extract_requested_address(
+      *(str(item.get("hook", "")) for item in callback_items),
+      *(str(item.get("thread", "")) for item in open_thread_items),
+      str((relationship_state or {}).get("last_dialogue_stop", "")),
+    )
+    resolved_preferred_address = resolve_preferred_address(
+      merged_identity,
+      fallback_nicknames=tuple(merged_identity.get("nicknames", ())),
+      raw_aliases=(viewer_id, nickname),
+      requested_address=requested_address,
+      fallback=nickname or viewer_id,
+    )
+    merged_identity = dict(merged_identity)
+    if requested_address:
+      merged_identity["nicknames"] = _unique_keep_order(
+        list(merged_identity.get("nicknames", ())) + [requested_address]
+      )
+    if resolved_preferred_address:
+      merged_identity["preferred_address"] = resolved_preferred_address
+    elif normalize_preferred_address(merged_identity.get("preferred_address", "")):
+      merged_identity["preferred_address"] = normalize_preferred_address(
+        merged_identity.get("preferred_address", "")
+      )
+    else:
+      merged_identity.pop("preferred_address", None)
     merged_relationship = _merge_relationship_state(
       record.relationship_state,
       relationship_state,

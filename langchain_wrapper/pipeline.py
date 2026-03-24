@@ -13,6 +13,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
+from .contracts import ModelInvocation
+
 
 # 类型别名：处理器函数签名
 Processor = Callable[[str], str]
@@ -44,6 +46,41 @@ def wrap_untrusted_context(extra_context: str) -> str:
     f"{extra_context}\n"
     "[END_UNTRUSTED_CONTEXT]"
   )
+
+
+def split_context_channels(
+  extra_context: str = "",
+  trusted_context: str = "",
+  untrusted_context: str = "",
+) -> tuple[str, str]:
+  """兼容旧 extra_context，并拆分 trusted / untrusted 通道。"""
+  legacy = str(extra_context or "").strip()
+  trusted = str(trusted_context or "").strip()
+  untrusted = str(untrusted_context or "").strip()
+  if legacy:
+    untrusted = f"{untrusted}\n\n{legacy}".strip() if untrusted else legacy
+  return trusted, untrusted
+
+
+def build_system_prompt(
+  system_prompt: str,
+  *,
+  extra_context: str = "",
+  trusted_context: str = "",
+  untrusted_context: str = "",
+) -> str:
+  """把 trusted / untrusted 上下文按不同 authority 通道拼进 system prompt。"""
+  prompt = system_prompt
+  trusted, untrusted = split_context_channels(
+    extra_context=extra_context,
+    trusted_context=trusted_context,
+    untrusted_context=untrusted_context,
+  )
+  if trusted:
+    prompt = f"{prompt}\n\n{trusted}"
+  if untrusted:
+    prompt = f"{prompt}\n\n{wrap_untrusted_context(untrusted)}"
+  return prompt
 
 
 def _build_multimodal_content(
@@ -120,10 +157,12 @@ class StreamingPipeline:
     messages = []
 
     # system prompt
-    prompt = self.system_prompt
-    extra = data.get("extra_context", "")
-    if extra:
-      prompt = f"{prompt}\n\n{wrap_untrusted_context(extra)}"
+    prompt = build_system_prompt(
+      self.system_prompt,
+      extra_context=data.get("extra_context", ""),
+      trusted_context=data.get("trusted_context", ""),
+      untrusted_context=data.get("untrusted_context", ""),
+    )
     messages.append(SystemMessage(content=prompt))
 
     # history
@@ -182,10 +221,12 @@ class StreamingPipeline:
 
     # 注入系统提示词（支持 extra_context 追加）
     def inject_system_prompt(data: dict) -> dict:
-      prompt = self.system_prompt
-      extra = data.get("extra_context", "")
-      if extra:
-        prompt = f"{prompt}\n\n{wrap_untrusted_context(extra)}"
+      prompt = build_system_prompt(
+        self.system_prompt,
+        extra_context=data.get("extra_context", ""),
+        trusted_context=data.get("trusted_context", ""),
+        untrusted_context=data.get("untrusted_context", ""),
+      )
       return {**data, "system_prompt": prompt}
 
     # 基础管道（流式使用，不含后处理器）— 纯文本路径
@@ -306,6 +347,8 @@ class StreamingPipeline:
     input_text: str,
     history: Optional[list[tuple[str, str]]] = None,
     extra_context: str = "",
+    trusted_context: str = "",
+    untrusted_context: str = "",
     images: Optional[list[str]] = None,
   ) -> str:
     """
@@ -325,6 +368,8 @@ class StreamingPipeline:
         "input": input_text,
         "history": history,
         "extra_context": extra_context,
+        "trusted_context": trusted_context,
+        "untrusted_context": untrusted_context,
         "images": images,
       })
       result = self.model.invoke(messages)
@@ -337,6 +382,8 @@ class StreamingPipeline:
       "input": input_text,
       "history": history,
       "extra_context": extra_context,
+      "trusted_context": trusted_context,
+      "untrusted_context": untrusted_context,
     })
 
   async def ainvoke(
@@ -344,6 +391,8 @@ class StreamingPipeline:
     input_text: str,
     history: Optional[list[tuple[str, str]]] = None,
     extra_context: str = "",
+    trusted_context: str = "",
+    untrusted_context: str = "",
     images: Optional[list[str]] = None,
   ) -> str:
     """
@@ -363,6 +412,8 @@ class StreamingPipeline:
         "input": input_text,
         "history": history,
         "extra_context": extra_context,
+        "trusted_context": trusted_context,
+        "untrusted_context": untrusted_context,
         "images": images,
       })
       result = await self.model.ainvoke(messages)
@@ -375,6 +426,8 @@ class StreamingPipeline:
       "input": input_text,
       "history": history,
       "extra_context": extra_context,
+      "trusted_context": trusted_context,
+      "untrusted_context": untrusted_context,
     })
 
   async def astream(
@@ -382,6 +435,8 @@ class StreamingPipeline:
     input_text: str,
     history: Optional[list[tuple[str, str]]] = None,
     extra_context: str = "",
+    trusted_context: str = "",
+    untrusted_context: str = "",
     images: Optional[list[str]] = None,
   ) -> AsyncIterator[str]:
     """
@@ -403,6 +458,8 @@ class StreamingPipeline:
         "input": input_text,
         "history": history,
         "extra_context": extra_context,
+        "trusted_context": trusted_context,
+        "untrusted_context": untrusted_context,
         "images": images,
       })
       async for chunk in self.model.astream(messages):
@@ -413,7 +470,49 @@ class StreamingPipeline:
       "input": input_text,
       "history": history,
       "extra_context": extra_context,
+      "trusted_context": trusted_context,
+      "untrusted_context": untrusted_context,
     }):
+      yield chunk
+
+  def invoke_invocation(
+    self,
+    invocation: ModelInvocation,
+    history: Optional[list[tuple[str, str]]] = None,
+  ) -> str:
+    return self.invoke(
+      invocation.user_prompt,
+      history=history,
+      trusted_context=invocation.trusted_context,
+      untrusted_context=invocation.untrusted_context,
+      images=invocation.images,
+    )
+
+  async def ainvoke_invocation(
+    self,
+    invocation: ModelInvocation,
+    history: Optional[list[tuple[str, str]]] = None,
+  ) -> str:
+    return await self.ainvoke(
+      invocation.user_prompt,
+      history=history,
+      trusted_context=invocation.trusted_context,
+      untrusted_context=invocation.untrusted_context,
+      images=invocation.images,
+    )
+
+  async def astream_invocation(
+    self,
+    invocation: ModelInvocation,
+    history: Optional[list[tuple[str, str]]] = None,
+  ) -> AsyncIterator[str]:
+    async for chunk in self.astream(
+      invocation.user_prompt,
+      history=history,
+      trusted_context=invocation.trusted_context,
+      untrusted_context=invocation.untrusted_context,
+      images=invocation.images,
+    ):
       yield chunk
 
 

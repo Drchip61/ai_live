@@ -7,7 +7,7 @@ PromptPlan       — Controller 的输出（结构化决策）
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -138,6 +138,15 @@ class ControllerInput:
   def old_comments(self) -> list[CommentBrief]:
     return [c for c in self.comments if not c.is_new]
 
+  @property
+  def resource_catalog(self) -> "ResourceCatalog":
+    return ResourceCatalog(
+      persona_sections=self.available_persona_sections,
+      knowledge_topics=self.available_knowledge_topics,
+      corpus_styles=self.available_corpus_styles,
+      corpus_scenes=self.available_corpus_scenes,
+    )
+
 
 # ------------------------------------------------------------------
 # 输出侧
@@ -157,6 +166,68 @@ _VALID_ROUTE_KINDS = frozenset({
   "vlm",
   "proactive",
 })
+
+
+def _normalize_priority_for_route(route_kind: str, priority: int) -> int:
+  if route_kind in ("guard_buy", "super_chat"):
+    return 0
+  if route_kind == "chat":
+    return 1
+  if route_kind == "entry":
+    return 2
+  if route_kind in ("vlm", "proactive"):
+    return 3
+  return priority
+
+
+@dataclass(frozen=True)
+class ResourceCatalog:
+  """Controller 可见的资源目录。"""
+
+  persona_sections: tuple[str, ...] = ()
+  knowledge_topics: tuple[str, ...] = ()
+  corpus_styles: tuple[str, ...] = ()
+  corpus_scenes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReplyDecision:
+  """Controller 的回复策略决策。"""
+
+  should_reply: bool = True
+  urgency: int = 5
+  route_kind: str = "chat"
+  response_style: str = "normal"
+  sentences: int = 2
+  tone_hint: str = ""
+  fake_gift_ids: tuple[str, ...] = ()
+  session_mode: str = "none"
+  session_anchor: str = ""
+  priority: int = 1
+  proactive_speak: bool = False
+  proactive_reason: str = ""
+
+
+@dataclass(frozen=True)
+class RetrievalPlan:
+  """Controller 的检索计划。"""
+
+  memory_strategy: str = "normal"
+  viewer_focus_ids: tuple[str, ...] = ()
+  persona_sections: tuple[str, ...] = ()
+  corpus_style: str = ""
+  corpus_scene: str = ""
+  knowledge_topics: tuple[str, ...] = ()
+  extra_instructions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SideEffectPlan:
+  """Controller 的调度/副作用建议。"""
+
+  topic_assignments: dict[str, str] = field(default_factory=dict)
+  suggested_wait_min: float = 3.0
+  suggested_wait_max: float = 8.0
 
 
 @dataclass(frozen=True)
@@ -208,6 +279,75 @@ class PromptPlan:
   # 动态指令
   extra_instructions: tuple[str, ...] = ()
 
+  @property
+  def reply(self) -> ReplyDecision:
+    return ReplyDecision(
+      should_reply=self.should_reply,
+      urgency=self.urgency,
+      route_kind=self.route_kind,
+      response_style=self.response_style,
+      sentences=self.sentences,
+      tone_hint=self.tone_hint,
+      fake_gift_ids=self.fake_gift_ids,
+      session_mode=self.session_mode,
+      session_anchor=self.session_anchor,
+      priority=self.priority,
+      proactive_speak=self.proactive_speak,
+      proactive_reason=self.proactive_reason,
+    )
+
+  @property
+  def retrieval(self) -> RetrievalPlan:
+    return RetrievalPlan(
+      memory_strategy=self.memory_strategy,
+      viewer_focus_ids=self.viewer_focus_ids,
+      persona_sections=self.persona_sections,
+      corpus_style=self.corpus_style,
+      corpus_scene=self.corpus_scene,
+      knowledge_topics=self.knowledge_topics,
+      extra_instructions=self.extra_instructions,
+    )
+
+  @property
+  def effects(self) -> SideEffectPlan:
+    return SideEffectPlan(
+      topic_assignments=dict(self.topic_assignments),
+      suggested_wait_min=self.suggested_wait_min,
+      suggested_wait_max=self.suggested_wait_max,
+    )
+
+  def to_dict(self, nested: bool = True) -> dict[str, Any]:
+    if nested:
+      return {
+        "reply": asdict(self.reply),
+        "retrieval": asdict(self.retrieval),
+        "effects": asdict(self.effects),
+      }
+    return {
+      "should_reply": self.should_reply,
+      "urgency": self.urgency,
+      "route_kind": self.route_kind,
+      "response_style": self.response_style,
+      "sentences": self.sentences,
+      "tone_hint": self.tone_hint,
+      "memory_strategy": self.memory_strategy,
+      "viewer_focus_ids": list(self.viewer_focus_ids),
+      "persona_sections": list(self.persona_sections),
+      "corpus_style": self.corpus_style,
+      "corpus_scene": self.corpus_scene,
+      "knowledge_topics": list(self.knowledge_topics),
+      "topic_assignments": dict(self.topic_assignments),
+      "fake_gift_ids": list(self.fake_gift_ids),
+      "session_mode": self.session_mode,
+      "session_anchor": self.session_anchor,
+      "suggested_wait_min": self.suggested_wait_min,
+      "suggested_wait_max": self.suggested_wait_max,
+      "priority": self.priority,
+      "proactive_speak": self.proactive_speak,
+      "proactive_reason": self.proactive_reason,
+      "extra_instructions": list(self.extra_instructions),
+    }
+
   @classmethod
   def from_dict(cls, data: dict[str, Any]) -> PromptPlan:
     """从 Controller LLM 的 JSON 输出构建 PromptPlan，所有字段有安全默认值"""
@@ -227,6 +367,7 @@ class PromptPlan:
     route_kind = str(data.get("route_kind", "chat") or "chat").strip()
     if route_kind not in _VALID_ROUTE_KINDS:
       route_kind = "chat"
+    priority = _normalize_priority_for_route(route_kind, priority)
 
     memory_strategy = data.get("memory_strategy", "normal")
     if memory_strategy not in ("minimal", "normal", "deep_recall"):
@@ -241,6 +382,16 @@ class PromptPlan:
         return tuple(str(v) for v in val if v)
       return ()
 
+    topic_assignments = data.get("topic_assignments") or {}
+    if not isinstance(topic_assignments, dict):
+      topic_assignments = {}
+    else:
+      topic_assignments = {
+        str(key): str(value)
+        for key, value in topic_assignments.items()
+        if str(key).strip() and str(value).strip()
+      }
+
     return cls(
       should_reply=bool(data.get("should_reply", True)),
       urgency=urgency,
@@ -254,7 +405,7 @@ class PromptPlan:
       corpus_style=str(data.get("corpus_style", "") or ""),
       corpus_scene=str(data.get("corpus_scene", "") or ""),
       knowledge_topics=_to_str_tuple(data.get("knowledge_topics")),
-      topic_assignments=data.get("topic_assignments") or {},
+      topic_assignments=topic_assignments,
       fake_gift_ids=_to_str_tuple(data.get("fake_gift_ids")),
       session_mode=session_mode,
       session_anchor=str(data.get("session_anchor", "") or ""),

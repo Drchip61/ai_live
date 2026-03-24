@@ -37,6 +37,7 @@ def test_from_dict_normal():
   data = {
     "should_reply": True,
     "urgency": 7,
+    "route_kind": "super_chat",
     "response_style": "detailed",
     "sentences": 3,
     "memory_strategy": "deep_recall",
@@ -87,10 +88,20 @@ def test_from_dict_clamping():
   })
   assert plan.urgency == 9
   assert plan.sentences == 1
-  assert plan.priority == 3
+  assert plan.priority == 1
   assert plan.response_style == "normal"
   assert plan.memory_strategy == "normal"
   print("  [OK] from_dict 非法值自动钳位/回退默认")
+
+
+def test_from_dict_route_priority_normalization():
+  entry_plan = PromptPlan.from_dict({"route_kind": "entry", "priority": 0})
+  chat_plan = PromptPlan.from_dict({"route_kind": "chat", "priority": 3})
+  vlm_plan = PromptPlan.from_dict({"route_kind": "vlm", "priority": 1})
+  assert entry_plan.priority == 2
+  assert chat_plan.priority == 1
+  assert vlm_plan.priority == 3
+  print("  [OK] from_dict 按路由归一化优先级")
 
 
 # ================================================================
@@ -202,6 +213,64 @@ def test_fallback_normal():
   print("  [OK] fallback 普通弹幕")
 
 
+def test_fallback_guard_entry():
+  inp = ControllerInput(
+    comments=(
+      CommentBrief(
+        id="entry_guard_1",
+        user_id="u4",
+        nickname="舰长大人",
+        content="舰长大人 进入直播间",
+        event_type="entry",
+        is_guard_member=True,
+        guard_member_level="舰长",
+        is_new=True,
+      ),
+    ),
+    silence_seconds=0,
+    available_persona_sections=("relationships",),
+  )
+  plan = LLMController._fallback(inp)
+  assert plan.route_kind == "entry"
+  assert plan.urgency == 6
+  assert plan.response_style == "normal"
+  assert plan.sentences == 2
+  assert plan.memory_strategy == "normal"
+  assert plan.priority == 2
+  assert plan.persona_sections == ("relationships",)
+  assert plan.extra_instructions == ("这是会员进场欢迎，要比普通入场更热情，点名并点出等级，但不要误说成新上舰。",)
+  print("  [OK] fallback 会员入场欢迎更隆重")
+
+
+def test_fallback_entry_with_danmaku_prefers_chat():
+  inp = ControllerInput(
+    comments=(
+      CommentBrief(
+        id="entry_1",
+        user_id="u_entry",
+        nickname="路人甲",
+        content="路人甲 进入直播间",
+        event_type="entry",
+        is_new=True,
+      ),
+      CommentBrief(
+        id="chat_1",
+        user_id="u_chat",
+        nickname="聊天观众",
+        content="主播你还记得我吗",
+        event_type="danmaku",
+        is_new=True,
+      ),
+    ),
+    silence_seconds=0,
+    available_persona_sections=("relationships",),
+  )
+  plan = LLMController._fallback(inp)
+  assert plan.route_kind == "chat"
+  assert plan.priority == 1
+  print("  [OK] fallback 混合轮次优先接聊天")
+
+
 def test_fallback_no_comments_short_silence():
   inp = ControllerInput(comments=(), silence_seconds=5)
   plan = LLMController._fallback(inp)
@@ -245,6 +314,12 @@ def test_dispatch_normal():
   assert plan.should_reply is True
   assert plan.urgency == 7
   assert model.ainvoke.call_count == 1
+  trace = ctrl.last_dispatch_trace
+  assert trace is not None
+  assert trace["source"] == "llm"
+  assert trace["plan_json"]["urgency"] == 7
+  assert trace["raw_output"].startswith("{")
+  assert trace["latency_ms"] >= 0
   print("  [OK] dispatch 正常返回")
 
 
@@ -263,6 +338,11 @@ def test_dispatch_timeout():
   plan = asyncio.run(ctrl.dispatch(inp))
   assert plan.should_reply is True
   assert plan.urgency == 5
+  trace = ctrl.last_dispatch_trace
+  assert trace is not None
+  assert trace["source"] == "fallback_timeout"
+  assert trace["plan_json"]["urgency"] == 5
+  assert "timeout" in trace["error"]
   print("  [OK] dispatch 超时走 fallback")
 
 
@@ -278,7 +358,63 @@ def test_dispatch_error():
   )
   plan = asyncio.run(ctrl.dispatch(inp))
   assert plan.should_reply is True
+  trace = ctrl.last_dispatch_trace
+  assert trace is not None
+  assert trace["source"] == "fallback_error"
+  assert trace["plan_json"]["should_reply"] is True
+  assert "模拟错误" in trace["error"]
   print("  [OK] dispatch 异常走 fallback")
+
+
+def test_dispatch_entry_with_new_chat_coerces_to_chat():
+  model = _make_mock_model(
+    '{"should_reply": true, "route_kind": "entry", "priority": 2, "response_style": "brief", "sentences": 1}'
+  )
+  ctrl = LLMController(model=model)
+  inp = ControllerInput(
+    comments=(
+      CommentBrief(
+        id="entry_1",
+        user_id="u_entry",
+        nickname="路人甲",
+        content="路人甲 进入直播间",
+        event_type="entry",
+        is_new=True,
+      ),
+      CommentBrief(
+        id="chat_1",
+        user_id="u_chat",
+        nickname="聊天观众",
+        content="主播你还记得我吗",
+        is_new=True,
+      ),
+    ),
+    available_persona_sections=("relationships",),
+  )
+  plan = asyncio.run(ctrl.dispatch(inp))
+  assert plan.route_kind == "chat"
+  assert plan.priority == 1
+  assert plan.should_reply is True
+  print("  [OK] dispatch 遇到聊天时不会被 entry 抢路由")
+
+
+def test_dispatch_vlm_with_new_chat_coerces_to_chat():
+  model = _make_mock_model(
+    '{"should_reply": false, "route_kind": "vlm", "priority": 3, "proactive_speak": true, "proactive_reason": "scene"}'
+  )
+  ctrl = LLMController(model=model)
+  inp = ControllerInput(
+    comments=(
+      CommentBrief(id="chat_1", user_id="u1", nickname="A", content="现在在聊啥", is_new=True),
+    ),
+    available_persona_sections=("streaming",),
+  )
+  plan = asyncio.run(ctrl.dispatch(inp))
+  assert plan.route_kind == "chat"
+  assert plan.priority == 1
+  assert plan.proactive_speak is False
+  assert plan.should_reply is True
+  print("  [OK] dispatch 有新聊天时不会切到 vlm")
 
 
 # ================================================================
@@ -330,6 +466,7 @@ if __name__ == "__main__":
       test_from_dict_normal,
       test_from_dict_defaults,
       test_from_dict_clamping,
+      test_from_dict_route_priority_normalization,
     ]),
     ("CommentBrief.to_prompt_line", [
       test_comment_brief_danmaku,
@@ -344,6 +481,8 @@ if __name__ == "__main__":
       test_fallback_paid,
       test_fallback_guard,
       test_fallback_normal,
+      test_fallback_guard_entry,
+      test_fallback_entry_with_danmaku_prefers_chat,
       test_fallback_no_comments_short_silence,
       test_fallback_no_comments_long_silence,
     ]),
@@ -351,6 +490,8 @@ if __name__ == "__main__":
       test_dispatch_normal,
       test_dispatch_timeout,
       test_dispatch_error,
+      test_dispatch_entry_with_new_chat_coerces_to_chat,
+      test_dispatch_vlm_with_new_chat_coerces_to_chat,
     ]),
     ("_render_prompt", [
       test_render_prompt,

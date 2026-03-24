@@ -14,6 +14,7 @@ from .context_schema import (
   PersonaSpecRecord,
   SelfMemoryRecord,
   UserMemoryRecord,
+  resolve_preferred_address,
 )
 
 
@@ -54,7 +55,12 @@ class MemoryCompiler:
     identity = user_memory.identity or {}
     nicknames = tuple(identity.get("nicknames", ()))
     names = tuple(identity.get("names", ()))
-    nickname = str(identity.get("preferred_address", "")).strip() or (nicknames[-1] if nicknames else user_memory.viewer_id)
+    nickname = resolve_preferred_address(
+      identity,
+      fallback_nicknames=nicknames,
+      raw_aliases=(user_memory.viewer_id,),
+      fallback=user_memory.viewer_id,
+    )
     lines.append(f"当前关注对象：{nickname}")
 
     state = user_memory.relationship_state or {}
@@ -205,8 +211,14 @@ class ContextCompiler:
     lines: list[str] = []
     for entry in entries[:self._limits.max_knowledge_items]:
       head = entry.topic or entry.category
+      stance = str(entry.streamer_stance or "").strip()
       if head and entry.summary:
-        lines.append(f"{head}：{entry.summary}")
+        line = f"{head}：{entry.summary}"
       elif entry.summary:
-        lines.append(entry.summary)
+        line = entry.summary
+      else:
+        continue
+      if stance:
+        line = f"{line}\n主播立场：{stance}"
+      lines.append(line)
     return lines

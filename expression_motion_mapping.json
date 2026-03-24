@@ -8,18 +8,14 @@
   ],
 
   "voice_emotions": [
-    { "name": "joy",          "desc": "喜悦、开心、雀跃、笑着说话、收到好消息时" },
-    { "name": "anticipation", "desc": "期待、兴奋、跃跃欲试、准备迎接接下来的事情" },
-    { "name": "anger",        "desc": "生气、恼火、火大、被惹到时的直接怒气" },
-    { "name": "disgust",      "desc": "嫌弃、厌恶、反感、对离谱内容很不耐烦" },
-    { "name": "sadness",      "desc": "难过、失落、委屈、沮丧、想叹气时" },
-    { "name": "surprise",     "desc": "惊讶、意外、被突然发生的事情吓一跳" },
-    { "name": "fear",         "desc": "害怕、紧张、担心、被危险场面或突发情况吓到" },
-    { "name": "serenity",     "desc": "平静、温柔、放松、自然聊天时的稳定语气" },
-    { "name": "curiosity",    "desc": "好奇、想知道、被新话题吸引、忍不住追问" },
-    { "name": "agitation",    "desc": "烦躁、焦躁、急了、情绪被带起来但还没彻底发火" },
-    { "name": "shyness",      "desc": "害羞、扭捏、被夸到不好意思、嘴硬心虚" },
-    { "name": "indignation",  "desc": "不服、愤愤不平、觉得被冤枉、带点委屈的抗议" }
+    { "name": "joy", "desc": "开心、明亮、轻快、愉悦地说话" },
+    { "name": "angry", "desc": "生气、火大、不服、烦躁上头的语气" },
+    { "name": "embarrased", "desc": "害羞、尴尬、腼腆、不好意思的语气" },
+    { "name": "disgust", "desc": "嫌弃、反感、无语、厌恶的语气" },
+    { "name": "neutral", "desc": "平静、柔和、自然、放松的中性语气" },
+    { "name": "sad", "desc": "难过、低落、委屈、失落的语气" },
+    { "name": "surprised", "desc": "惊讶、意外、被吓到、情绪骤然变化的语气" },
+    { "name": "wonder", "desc": "好奇、期待、想继续追问、眼前一亮的语气" }
   ],
 
   "motions": [

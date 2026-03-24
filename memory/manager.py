@@ -54,6 +54,28 @@ class MemoryManager:
     r"[👍👏🔥❤️💯😂🤣😭😍]+)$",
     re.IGNORECASE,
   )
+  _GUARD_TERMS = (
+    "舰长", "提督", "总督", "大航海会员",
+    "舰长徽章", "提督徽章", "总督徽章", "徽章",
+  )
+  _GUARD_FACT_MARKERS = (
+    "已经成为", "成为舰长", "成为提督", "成为总督",
+    "是舰长", "是提督", "是总督",
+    "拥有舰长徽章", "拥有提督徽章", "拥有总督徽章",
+    "已挂舰长徽章", "已挂提督徽章", "已挂总督徽章",
+    "开通了舰长", "开通了提督", "开通了总督",
+    "开了舰长", "开了提督", "开了总督",
+    "买了舰长", "买了提督", "买了总督",
+    "确认了他的舰长身份", "确认了她的舰长身份", "确认了其舰长身份",
+    "确认了他的提督身份", "确认了她的提督身份", "确认了其提督身份",
+    "确认了他的总督身份", "确认了她的总督身份", "确认了其总督身份",
+    "开通了大航海会员", "是大航海会员",
+  )
+  _GUARD_JOKE_MARKERS = (
+    "嘴上", "玩笑", "梗", "调侃", "如果", "假设",
+    "验证", "测试", "记得", "注意到", "问", "是不是",
+    "会用", "话题", "互动",
+  )
 
   def __init__(
     self,
@@ -202,6 +224,125 @@ class MemoryManager:
       self._summary_model = ModelProvider.remote_small()
     return self._summary_model
 
+  @classmethod
+  def _contains_guard_claim(cls, text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+      return False
+    if any(marker in normalized for marker in cls._GUARD_FACT_MARKERS):
+      return True
+    if any(term in normalized for term in cls._GUARD_TERMS):
+      if "身份" in normalized or "待遇" in normalized:
+        return True
+      if normalized.startswith(("是", "已是", "已挂", "拥有", "确认")):
+        return True
+    return False
+
+  @classmethod
+  def _mentions_guard_topic(cls, text: str) -> bool:
+    normalized = str(text or "").strip()
+    return bool(normalized) and any(term in normalized for term in cls._GUARD_TERMS)
+
+  @classmethod
+  def _sanitize_guard_fact_entries(
+    cls,
+    items: list[dict],
+    text_key: str,
+  ) -> list[dict]:
+    result: list[dict] = []
+    for item in items:
+      if not isinstance(item, dict):
+        continue
+      text = str(item.get(text_key, "")).strip()
+      if not text or cls._contains_guard_claim(text):
+        continue
+      result.append(item)
+    return result
+
+  @classmethod
+  def _sanitize_guard_topic_entries(
+    cls,
+    items: list[dict],
+    source_mentions_guard_topic: bool = False,
+  ) -> list[dict]:
+    result: list[dict] = []
+    for item in items:
+      if not isinstance(item, dict):
+        continue
+      topic = str(item.get("topic", "")).strip()
+      if topic and (
+        any(term in topic for term in cls._GUARD_TERMS) or
+        (source_mentions_guard_topic and "待遇" in topic)
+      ):
+        continue
+      result.append(item)
+    return result
+
+  @classmethod
+  def _sanitize_guard_callback_entries(cls, items: list[dict]) -> list[dict]:
+    result: list[dict] = []
+    for item in items:
+      if not isinstance(item, dict):
+        continue
+      hook = str(item.get("hook", "")).strip()
+      if not hook:
+        continue
+      normalized_hook = hook
+      if cls._mentions_guard_topic(hook):
+        if any(marker in hook for marker in cls._GUARD_JOKE_MARKERS):
+          if "如果" in hook or "假设" in hook:
+            normalized_hook = "会用“开舰长”这类假设性提问"
+          elif any(marker in hook for marker in ("验证", "测试", "记得", "注意到", "徽章确认")):
+            normalized_hook = "会拿舰长/徽章话题来验证主播记忆"
+          else:
+            normalized_hook = hook
+        elif cls._contains_guard_claim(hook):
+          continue
+        else:
+          normalized_hook = "会拿舰长/徽章话题和主播互动"
+      cleaned = dict(item)
+      cleaned["hook"] = normalized_hook.strip()
+      if cleaned["hook"]:
+        result.append(cleaned)
+    return result
+
+  @classmethod
+  def _sanitize_guard_thread_entries(
+    cls,
+    items: list[dict],
+    source_mentions_guard_topic: bool = False,
+  ) -> list[dict]:
+    result: list[dict] = []
+    for item in items:
+      if not isinstance(item, dict):
+        continue
+      thread = str(item.get("thread", "")).strip()
+      if not thread:
+        continue
+      if cls._contains_guard_claim(thread):
+        continue
+      if source_mentions_guard_topic and any(marker in thread for marker in ("待遇", "徽章", "身份")):
+        continue
+      result.append(item)
+    return result
+
+  @classmethod
+  def _sanitize_guard_relationship_state(
+    cls,
+    relationship_state: Optional[dict],
+    source_mentions_guard_topic: bool = False,
+  ) -> Optional[dict]:
+    if not isinstance(relationship_state, dict):
+      return relationship_state
+    cleaned = dict(relationship_state)
+    last_dialogue_stop = str(cleaned.get("last_dialogue_stop", "")).strip()
+    if cls._contains_guard_claim(last_dialogue_stop):
+      cleaned.pop("last_dialogue_stop", None)
+      return cleaned
+    if source_mentions_guard_topic and any(marker in last_dialogue_stop for marker in ("待遇", "徽章", "身份")):
+      cleaned.pop("last_dialogue_stop", None)
+    return cleaned
+
   def list_persona_sections(self) -> list[str]:
     if self._persona_spec_store is None:
       return []
@@ -229,7 +370,8 @@ class MemoryManager:
     if not items:
       return ""
     lines = []
-    for item in items:
+    limit = max(1, int(self._config.structured.persona_top_k or 4))
+    for item in items[:limit]:
       section = str(item.get("section", "")).strip()
       text = str(item.get("text", "")).strip()
       if text:
@@ -246,10 +388,88 @@ class MemoryManager:
     for entry in entries:
       head = entry.topic or entry.category
       text = f"【{head}】{entry.summary}"
+      stance = str(entry.streamer_stance or "").strip()
+      if stance:
+        text += f"\n【主播立场】{stance}"
+      usage_rules = [
+        str(rule).strip()
+        for rule in (entry.usage_rules or [])
+        if str(rule).strip()
+      ]
+      if usage_rules:
+        text += "\n【使用原则】\n" + "\n".join(
+          f"- {rule}" for rule in usage_rules[:5]
+        )
       if entry.facts:
-        text += "\n" + "\n".join(f"- {fact}" for fact in entry.facts[:5])
+        fact_lines: list[str] = []
+        for fact in entry.facts[:5]:
+          if not isinstance(fact, dict):
+            fact_text = str(fact).strip()
+            if fact_text:
+              fact_lines.append(f"- {fact_text}")
+            continue
+          aspect = str(fact.get("aspect", "")).strip()
+          content = str(fact.get("content", "")).strip()
+          if aspect and content:
+            fact_lines.append(f"- {aspect}：{content}")
+          elif content:
+            fact_lines.append(f"- {content}")
+        if fact_lines:
+          text += "\n【参考事实】\n" + "\n".join(fact_lines)
       parts.append(text)
     return "\n\n".join(parts)
+
+  @staticmethod
+  def _truncate_debug_snippet(value, max_chars: int = 240) -> str:
+    try:
+      if isinstance(value, str):
+        text = value
+      else:
+        text = json.dumps(value, ensure_ascii=False)
+    except Exception:
+      text = repr(value)
+    text = str(text or "").replace("\n", "\\n").strip()
+    if len(text) <= max_chars:
+      return text
+    return text[:max_chars] + "..."
+
+  @classmethod
+  def _normalize_viewer_memory_items(
+    cls,
+    memories: list,
+    raw_snippet: str = "",
+  ) -> list[dict]:
+    normalized: list[dict] = []
+    skipped: list[str] = []
+    for idx, item in enumerate(memories):
+      if isinstance(item, dict):
+        normalized.append(item)
+        continue
+      if isinstance(item, list):
+        expanded = 0
+        for nested_idx, nested in enumerate(item):
+          if isinstance(nested, dict):
+            normalized.append(nested)
+            expanded += 1
+          else:
+            skipped.append(
+              f"{idx}[{nested_idx}]={type(nested).__name__}:{cls._truncate_debug_snippet(nested, 80)}"
+            )
+        if expanded == 0:
+          skipped.append(
+            f"{idx}=list:{cls._truncate_debug_snippet(item, 80)}"
+          )
+        continue
+      skipped.append(
+        f"{idx}={type(item).__name__}:{cls._truncate_debug_snippet(item, 80)}"
+      )
+    if skipped:
+      logger.warning(
+        "观众记忆 JSON 列表内存在非 dict 项，已跳过/浅展开: %s | raw=%s",
+        "; ".join(skipped[:5]),
+        cls._truncate_debug_snippet(raw_snippet),
+      )
+    return normalized
 
   def retrieve_active_only(self) -> tuple[str, str, str]:
     active_memories = self._active.get_all()
@@ -266,16 +486,20 @@ class MemoryManager:
     self,
     query: Union[str, list[str]] = "",
     viewer_ids: Optional[list[str]] = None,
+    include_persona: bool = True,
     include_corpus: bool = False,
     include_external_knowledge: bool = False,
+    recall_profile: str = "deep_recall",
   ) -> str:
     if self._structured_retriever is None:
       return ""
     return self._structured_retriever.compile_prompt_context(
       query=query,
       viewer_ids=viewer_ids,
+      include_persona=include_persona,
       include_corpus=include_corpus,
       include_external_knowledge=include_external_knowledge,
+      recall_profile=recall_profile,
     )
 
   def _refresh_user_structured_indexes(self, viewer_ids: set[str]) -> None:
@@ -357,28 +581,46 @@ class MemoryManager:
       f"{idx}. {item['nickname']}：{item['content']}"
       for idx, item in enumerate(candidates)
     )
-    prompt = VIEWER_SUMMARY_PROMPT.format(
-      comments=comments_text,
-      ai_response=ai_response_summary[:200] if ai_response_summary else "（无）",
-    )
-
     try:
+      prompt = VIEWER_SUMMARY_PROMPT.format(
+        comments=comments_text,
+        ai_response=ai_response_summary[:200] if ai_response_summary else "（无）",
+      )
       model = self._get_summary_model()
       result = await model.ainvoke(prompt)
       text = result.content if hasattr(result, "content") else str(result)
       text = text.strip()
 
-      json_match = re.search(r"\[.*\]", text, re.DOTALL)
-      if not json_match:
-        logger.debug("观众记忆 LLM 返回无有效 JSON: %s", text[:100])
-        return
-      memories = json_repair.loads(json_match.group())
+      if text.startswith(("[", "{")):
+        raw_json = text
+      else:
+        json_match = re.search(r"\[.*\]", text, re.DOTALL)
+        object_match = re.search(r"\{.*\}", text, re.DOTALL) if not json_match else None
+        if json_match:
+          raw_json = json_match.group()
+        elif object_match:
+          raw_json = object_match.group()
+        else:
+          logger.debug("观众记忆 LLM 返回无有效 JSON: %s", text[:100])
+          return
+      memories = json_repair.loads(raw_json)
       if not isinstance(memories, list):
-        logger.debug("观众记忆 JSON 解析结果非 list: %s", type(memories).__name__)
+        logger.debug(
+          "观众记忆 JSON 解析结果非 list: %s | raw=%s",
+          type(memories).__name__,
+          self._truncate_debug_snippet(raw_json),
+        )
+        return
+      memory_items = self._normalize_viewer_memory_items(memories, raw_json)
+      if not memory_items:
+        logger.debug(
+          "观众记忆 JSON 没有可用 dict 项: raw=%s",
+          self._truncate_debug_snippet(raw_json),
+        )
         return
 
       touched_viewers: set[str] = set()
-      for item in memories:
+      for item in memory_items:
         idx = item.get("index")
         if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
           continue
@@ -428,6 +670,23 @@ class MemoryManager:
         ]
         normalized_identity = identity if isinstance(identity, dict) else None
         normalized_relationship_state = relationship_state if isinstance(relationship_state, dict) else None
+        source_mentions_guard_topic = self._mentions_guard_topic(src["content"])
+
+        normalized_facts = self._sanitize_guard_fact_entries(normalized_facts, "fact")
+        normalized_recent_state = self._sanitize_guard_fact_entries(normalized_recent_state, "fact")
+        normalized_topic_profile = self._sanitize_guard_topic_entries(
+          normalized_topic_profile,
+          source_mentions_guard_topic=source_mentions_guard_topic,
+        )
+        normalized_callbacks = self._sanitize_guard_callback_entries(normalized_callbacks)
+        normalized_open_threads = self._sanitize_guard_thread_entries(
+          normalized_open_threads,
+          source_mentions_guard_topic=source_mentions_guard_topic,
+        )
+        normalized_relationship_state = self._sanitize_guard_relationship_state(
+          normalized_relationship_state,
+          source_mentions_guard_topic=source_mentions_guard_topic,
+        )
 
         has_meaningful_update = any((
           normalized_identity,
@@ -460,7 +719,11 @@ class MemoryManager:
 
       self._refresh_user_structured_indexes(touched_viewers)
     except Exception as e:
-      logger.error("观众记忆提取失败: %s", e)
+      logger.error(
+        "观众记忆提取失败: %s | raw=%s",
+        e,
+        self._truncate_debug_snippet(text if "text" in locals() else ""),
+      )
 
   async def extract_stances(
     self,

@@ -4,26 +4,34 @@
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import Optional
 
+from langchain_wrapper.contracts import ModelInvocation, RetrievedContextBundle
 from prompts import PromptLoader
 
-from .models import Comment, EventType, GUARD_LEVEL_NAMES
+from .models import Comment
 
 
 @dataclass(frozen=True)
 class RoutePromptBundle:
-  """单轮回复所需的 prompt 组合结果"""
+  """Route 侧用户消息 prompt 结果。"""
 
   prompt: str
   reply_images: Optional[list[str]]
-  rag_query: str = ""
-  memory_input: str = ""
+
+
+@dataclass(frozen=True)
+class ComposedPrompt:
+  """完整组合结果：用户 prompt + system 侧上下文载荷。"""
+
+  route_bundle: RoutePromptBundle
+  invocation: ModelInvocation
 
 
 class RoutePromptComposer:
-  """按 route_kind 组合用户消息 prompt"""
+  """按 route_kind 组合用户消息 prompt。"""
 
   def __init__(self, prompt_loader: Optional[PromptLoader] = None):
     self._loader = prompt_loader or PromptLoader()
@@ -51,7 +59,7 @@ class RoutePromptComposer:
     session_mode: str = "none",
     fake_gift_ids: tuple[str, ...] = (),
   ) -> RoutePromptBundle:
-    """按路由组合 prompt、图像和记忆查询文本"""
+    """只负责 route 侧用户消息，不再混入检索/写回种子。"""
     route = route_kind if route_kind in self._route_prompts else "chat"
     allow_visual = bool(images) and route in ("vlm", "proactive")
     if session_mode == "video_focus" and images:
@@ -79,20 +87,8 @@ class RoutePromptComposer:
     if formatted_comments.strip():
       parts.append(formatted_comments.strip())
 
-    rag_query = self._build_rag_query(route, old_comments, new_comments)
-    memory_input = self._build_memory_input(
-      route,
-      old_comments,
-      new_comments,
-      scene_context=scene_context,
-    )
     prompt = "\n\n".join(part for part in parts if part).strip()
-    return RoutePromptBundle(
-      prompt=prompt,
-      reply_images=reply_images,
-      rag_query=rag_query,
-      memory_input=memory_input,
-    )
+    return RoutePromptBundle(prompt=prompt, reply_images=reply_images)
 
   @staticmethod
   def _build_fake_gift_block(
@@ -112,75 +108,128 @@ class RoutePromptComposer:
       lines.append(f"- {comment.nickname}: {text}")
     return "\n".join(lines) if len(lines) > 1 else ""
 
-  def _build_rag_query(
-    self,
-    route_kind: str,
-    old_comments: list[Comment],
-    new_comments: list[Comment],
-  ) -> str:
-    if route_kind not in ("chat", "super_chat"):
-      return ""
-    focus = new_comments or old_comments[-3:]
-    lines = [
-      self._comment_summary(comment)
-      for comment in focus[-5:]
-      if self._is_meaningful(comment)
-    ]
-    return " ".join(lines)
 
-  def _build_memory_input(
+class PromptComposer:
+  """负责把 route prompt + 上下文 bundle 渲染成最终模型调用。"""
+
+  def __init__(
     self,
-    route_kind: str,
+    route_composer: RoutePromptComposer,
+    *,
+    style_instructions: Optional[dict[str, str]] = None,
+    engaging_question_probability: float = 0.0,
+    engaging_question_hint: str = "",
+    guard_thanks_reference: str = "",
+    gift_thanks_reference: str = "",
+    super_chat_reference: str = "",
+  ) -> None:
+    self._route_composer = route_composer
+    self._style_instructions = dict(style_instructions or {})
+    self._engaging_question_probability = engaging_question_probability
+    self._engaging_question_hint = engaging_question_hint
+    self._guard_thanks_reference = guard_thanks_reference
+    self._gift_thanks_reference = gift_thanks_reference
+    self._super_chat_reference = super_chat_reference
+
+  def compose(
+    self,
+    *,
+    plan,
+    formatted_comments: str,
     old_comments: list[Comment],
     new_comments: list[Comment],
+    time_tag: str,
+    conversation_mode: bool,
     scene_context: str = "",
+    stream_timestamp: str = "",
+    images: Optional[list[str]] = None,
+    topic_context: str = "",
+    max_chars: int = 0,
+    retrieved_context: Optional[RetrievedContextBundle] = None,
+  ) -> ComposedPrompt:
+    route_bundle = self._route_composer.compose(
+      route_kind=getattr(plan, "route_kind", "chat"),
+      formatted_comments=formatted_comments,
+      old_comments=old_comments,
+      new_comments=new_comments,
+      time_tag=time_tag,
+      conversation_mode=conversation_mode,
+      scene_context=scene_context,
+      stream_timestamp=stream_timestamp,
+      images=images,
+      session_mode=getattr(plan, "session_mode", "none"),
+      fake_gift_ids=getattr(plan, "fake_gift_ids", ()),
+    )
+    prompt = route_bundle.prompt
+
+    style_hint = self._build_style_hint(
+      getattr(plan, "route_kind", "chat"),
+      getattr(plan, "response_style", "normal"),
+      getattr(plan, "sentences", 2),
+      max_chars=max_chars,
+      extra_instructions=getattr(plan, "extra_instructions", ()),
+    )
+    if style_hint:
+      prompt = style_hint + prompt
+
+    retrieved = retrieved_context or RetrievedContextBundle()
+    untrusted_parts = []
+    if topic_context.strip():
+      untrusted_parts.append(topic_context.strip())
+    retrieved_untrusted = retrieved.render_untrusted_text()
+    if retrieved_untrusted:
+      untrusted_parts.append(retrieved_untrusted)
+    invocation = ModelInvocation(
+      user_prompt=prompt,
+      images=route_bundle.reply_images,
+      trusted_context=retrieved.render_trusted_text(),
+      untrusted_context="\n\n".join(untrusted_parts),
+      response_style=getattr(plan, "response_style", "normal"),
+      route_kind=getattr(plan, "route_kind", "chat"),
+    )
+    return ComposedPrompt(route_bundle=route_bundle, invocation=invocation)
+
+  def _build_style_hint(
+    self,
+    route_kind: str,
+    response_style: str,
+    sentences: int,
+    max_chars: int = 0,
+    extra_instructions: tuple[str, ...] = (),
   ) -> str:
-    if route_kind in ("gift", "guard_buy", "entry"):
-      return ""
+    hint = self._style_instructions.get(response_style, "")
+    if sentences > 0:
+      brevity = f"，{max_chars}个字以内" if max_chars > 0 else ""
+      count_hint = f"[本轮句数] 回复{sentences}句话{brevity}。"
+      hint = f"{count_hint}\n{hint}" if hint else f"{count_hint}\n\n"
+    route_reference = self._build_route_reference(route_kind)
+    if route_reference:
+      hint = hint + route_reference
+    force_engaging_question = any(
+      any(keyword in str(instruction or "") for keyword in ("追问", "继续聊", "互动引导", "顺势往下聊"))
+      for instruction in extra_instructions
+    )
+    if (
+      force_engaging_question
+      and self._engaging_question_hint
+      and route_kind not in ("guard_buy", "gift", "super_chat")
+    ):
+      hint = self._engaging_question_hint + hint
+      return hint
+    if (
+      response_style not in ("reaction", "guard_thanks", "existential")
+      and route_kind not in ("guard_buy", "gift", "super_chat")
+      and self._engaging_question_probability > 0
+      and random.random() < self._engaging_question_probability
+    ):
+      hint = self._engaging_question_hint + hint
+    return hint
 
-    parts: list[str] = []
-    focus = new_comments or old_comments[-3:]
-    comment_lines = [
-      f"观众「{comment.nickname}」：{self._comment_payload(comment)}"
-      for comment in focus[-5:]
-      if self._is_meaningful(comment)
-    ]
-    if comment_lines:
-      parts.append("；".join(comment_lines))
-
-    if route_kind in ("vlm", "proactive"):
-      scene_summary = self._compact_scene_context(scene_context)
-      if scene_summary:
-        parts.insert(0, scene_summary)
-
-    return "\n".join(part for part in parts if part).strip()
-
-  @staticmethod
-  def _compact_scene_context(scene_context: str) -> str:
-    if not scene_context.strip():
-      return ""
-    lines = [line.strip() for line in scene_context.splitlines() if line.strip()]
-    return " ".join(lines[:6])
-
-  @staticmethod
-  def _is_meaningful(comment: Comment) -> bool:
-    payload = RoutePromptComposer._comment_payload(comment)
-    return bool(payload.strip()) and len(payload.strip()) > 2
-
-  @staticmethod
-  def _comment_summary(comment: Comment) -> str:
-    return f"{comment.nickname}：{RoutePromptComposer._comment_payload(comment)}"
-
-  @staticmethod
-  def _comment_payload(comment: Comment) -> str:
-    if comment.event_type == EventType.GUARD_BUY:
-      level = GUARD_LEVEL_NAMES.get(comment.guard_level, "舰长")
-      return f"开通了{level}"
-    if comment.event_type == EventType.SUPER_CHAT:
-      return f"SC ¥{comment.price:.0f}：{comment.content.strip()}"
-    if comment.event_type == EventType.GIFT:
-      gift_name = comment.gift_name or "礼物"
-      return f"赠送 {gift_name} x{comment.gift_num}"
-    if comment.event_type == EventType.ENTRY:
-      return "进入直播间"
-    return comment.content.strip()
+  def _build_route_reference(self, route_kind: str) -> str:
+    if route_kind == "guard_buy" and self._guard_thanks_reference:
+      return f"[上舰感谢参考]\n{self._guard_thanks_reference}\n\n"
+    if route_kind == "gift" and self._gift_thanks_reference:
+      return f"[礼物感谢参考]\n{self._gift_thanks_reference}\n\n"
+    if route_kind == "super_chat" and self._super_chat_reference:
+      return f"[SC 回复参考]\n{self._super_chat_reference}\n\n"
+    return ""

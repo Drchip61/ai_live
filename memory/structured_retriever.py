@@ -7,6 +7,7 @@ structured 主检索器
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from typing import Optional, Union
 
 from .config import EmbeddingConfig, StructuredContextConfig
@@ -17,6 +18,7 @@ from .context_schema import (
   PersonaSpecRecord,
   SelfMemoryRecord,
   UserMemoryRecord,
+  resolve_preferred_address,
 )
 from .context_store import (
   CorpusStore,
@@ -63,6 +65,23 @@ def _stability_score(text: str) -> float:
   return score
 
 
+@dataclass(frozen=True)
+class RecallProfile:
+  """结构化检索画像，决定 normal / deep_recall 的召回深度。"""
+
+  max_viewers: int
+  user_fact_top_k: int
+  user_recent_state_top_k: int
+  user_topic_top_k: int
+  user_callback_top_k: int
+  user_open_thread_top_k: int
+  user_sensitive_top_k: int
+  self_said_top_k: int
+  self_commitment_top_k: int
+  self_thread_top_k: int
+  stable_preference_top_k: int
+
+
 class StructuredMemoryRetriever:
   """基于 structured store 的主检索器"""
 
@@ -103,117 +122,175 @@ class StructuredMemoryRetriever:
     self.rebuild_knowledge_index()
 
   def rebuild_user_indexes(self) -> None:
-    self._user_fact_index.clear()
-    self._user_callback_index.clear()
-    if self._user_memory_store is None:
-      return
-    for record in self._user_memory_store.all().values():
-      self._upsert_user_record(record)
+    fact_ids: list[str] = []
+    fact_contents: list[str] = []
+    fact_metadatas: list[dict] = []
+    callback_ids: list[str] = []
+    callback_contents: list[str] = []
+    callback_metadatas: list[dict] = []
+    if self._user_memory_store is not None:
+      for record in self._user_memory_store.all().values():
+        fact_docs, callback_docs = self._build_user_record_docs(record)
+        fact_ids.extend(fact_docs[0])
+        fact_contents.extend(fact_docs[1])
+        fact_metadatas.extend(fact_docs[2])
+        callback_ids.extend(callback_docs[0])
+        callback_contents.extend(callback_docs[1])
+        callback_metadatas.extend(callback_docs[2])
+    self._user_fact_index.replace_all(fact_ids, fact_contents, fact_metadatas)
+    self._user_callback_index.replace_all(callback_ids, callback_contents, callback_metadatas)
 
   def rebuild_user_record(self, viewer_id: str) -> None:
-    self._user_fact_index.delete_where({"viewer_id": viewer_id})
-    self._user_callback_index.delete_where({"viewer_id": viewer_id})
-    if self._user_memory_store is None:
-      return
-    record = self._user_memory_store.get(viewer_id)
-    if record is not None:
-      self._upsert_user_record(record)
+    fact_ids: list[str] = []
+    fact_contents: list[str] = []
+    fact_metadatas: list[dict] = []
+    callback_ids: list[str] = []
+    callback_contents: list[str] = []
+    callback_metadatas: list[dict] = []
+    if self._user_memory_store is not None:
+      record = self._user_memory_store.get(viewer_id)
+      if record is not None:
+        fact_docs, callback_docs = self._build_user_record_docs(record)
+        fact_ids, fact_contents, fact_metadatas = fact_docs
+        callback_ids, callback_contents, callback_metadatas = callback_docs
+    self._user_fact_index.replace_where(
+      {"viewer_id": viewer_id},
+      fact_ids,
+      fact_contents,
+      fact_metadatas,
+    )
+    self._user_callback_index.replace_where(
+      {"viewer_id": viewer_id},
+      callback_ids,
+      callback_contents,
+      callback_metadatas,
+    )
 
   def rebuild_self_said_indexes(self) -> None:
-    self._self_said_index.clear()
-    self._self_commitment_index.clear()
-    if self._self_memory_store is None:
-      return
-    self_record = self._self_memory_store.get()
-    self._upsert_self_said(self_record)
-    self._upsert_commitments(self_record)
+    said_ids: list[str] = []
+    said_contents: list[str] = []
+    said_metadatas: list[dict] = []
+    commitment_ids: list[str] = []
+    commitment_contents: list[str] = []
+    commitment_metadatas: list[dict] = []
+    if self._self_memory_store is not None:
+      self_record = self._self_memory_store.get()
+      said_ids, said_contents, said_metadatas = self._build_self_said_docs(self_record)
+      commitment_ids, commitment_contents, commitment_metadatas = self._build_commitment_docs(self_record)
+    self._self_said_index.replace_all(said_ids, said_contents, said_metadatas)
+    self._self_commitment_index.replace_all(
+      commitment_ids,
+      commitment_contents,
+      commitment_metadatas,
+    )
 
   def rebuild_self_thread_index(self) -> None:
-    self._self_thread_index.clear()
-    if self._self_memory_store is None:
-      return
-    self_record = self._self_memory_store.get()
-    self._upsert_self_threads(self_record)
+    doc_ids: list[str] = []
+    contents: list[str] = []
+    metadatas: list[dict] = []
+    if self._self_memory_store is not None:
+      self_record = self._self_memory_store.get()
+      doc_ids, contents, metadatas = self._build_self_thread_docs(self_record)
+    self._self_thread_index.replace_all(doc_ids, contents, metadatas)
 
   def rebuild_persona_index(self) -> None:
-    self._persona_index.clear()
-    if self._persona_spec_store is None:
-      return
-    record = self._persona_spec_store.get()
     doc_ids: list[str] = []
     contents: list[str] = []
     metadatas: list[dict] = []
-    for item in record.items:
-      text = str(item.get("text", "")).strip()
-      if not text:
-        continue
-      section = str(item.get("section", "")).strip()
-      doc_ids.append(_stable_id("persona", section, text))
-      contents.append(f"{section}：{text}" if section else text)
-      metadatas.append({
-        "section": section,
-        "display_text": f"{section}：{text}" if section else text,
-      })
-    self._upsert_docs(self._persona_index, doc_ids, contents, metadatas)
+    if self._persona_spec_store is not None:
+      record = self._persona_spec_store.get()
+      for item in record.items:
+        text = str(item.get("text", "")).strip()
+        if not text:
+          continue
+        section = str(item.get("section", "")).strip()
+        doc_ids.append(_stable_id("persona", section, text))
+        contents.append(f"{section}：{text}" if section else text)
+        metadatas.append({
+          "section": section,
+          "display_text": f"{section}：{text}" if section else text,
+        })
+    self._persona_index.replace_all(doc_ids, contents, metadatas)
 
   def rebuild_corpus_index(self) -> None:
-    self._corpus_index.clear()
-    if self._corpus_store is None:
-      return
-    entries = self._corpus_store.list_enabled()
     doc_ids: list[str] = []
     contents: list[str] = []
     metadatas: list[dict] = []
-    for entry in entries:
-      tags = " ".join(entry.style_tags + entry.scene_tags)
-      contents.append(f"{entry.kind} {tags} {entry.text}".strip())
-      doc_ids.append(_stable_id("corpus", entry.corpus_id, entry.text))
-      metadatas.append({
-        "kind": entry.kind,
-        "display_text": entry.text,
-        "style_tags": ",".join(entry.style_tags),
-        "scene_tags": ",".join(entry.scene_tags),
-        "quality_score": entry.quality_score,
-      })
-    self._upsert_docs(self._corpus_index, doc_ids, contents, metadatas)
+    if self._corpus_store is not None:
+      entries = self._corpus_store.list_enabled()
+      for entry in entries:
+        tags = " ".join(entry.style_tags + entry.scene_tags)
+        contents.append(f"{entry.kind} {tags} {entry.text}".strip())
+        doc_ids.append(_stable_id("corpus", entry.corpus_id, entry.text))
+        metadatas.append({
+          "kind": entry.kind,
+          "display_text": entry.text,
+          "style_tags": ",".join(entry.style_tags),
+          "scene_tags": ",".join(entry.scene_tags),
+          "quality_score": entry.quality_score,
+        })
+    self._corpus_index.replace_all(doc_ids, contents, metadatas)
 
   def rebuild_knowledge_index(self) -> None:
-    self._knowledge_index.clear()
-    if self._external_knowledge_store is None:
-      return
-    entries = self._external_knowledge_store.list_enabled()
     doc_ids: list[str] = []
     contents: list[str] = []
     metadatas: list[dict] = []
-    for entry in entries:
-      head = entry.topic or entry.category
-      content = f"{head} {entry.summary}".strip()
-      if not content:
-        continue
-      doc_ids.append(_stable_id("knowledge", entry.knowledge_id, content))
-      contents.append(content)
-      metadatas.append({
-        "topic": entry.topic,
-        "category": entry.category,
-        "display_text": f"{head}：{entry.summary}" if head and entry.summary else content,
-        "reliability": entry.reliability,
-      })
-    self._upsert_docs(self._knowledge_index, doc_ids, contents, metadatas)
+    if self._external_knowledge_store is not None:
+      entries = self._external_knowledge_store.list_enabled()
+      for entry in entries:
+        head = entry.topic or entry.category
+        stance = str(entry.streamer_stance or "").strip()
+        content = f"{head} {entry.summary} {stance}".strip()
+        if not content:
+          continue
+        display_text = f"{head}：{entry.summary}" if head and entry.summary else content
+        if stance:
+          display_text = f"{display_text}\n主播立场：{stance}"
+        doc_ids.append(_stable_id("knowledge", entry.knowledge_id, content))
+        contents.append(content)
+        metadatas.append({
+          "topic": entry.topic,
+          "category": entry.category,
+          "display_text": display_text,
+          "reliability": entry.reliability,
+        })
+    self._knowledge_index.replace_all(doc_ids, contents, metadatas)
+
+  def build_compiled_context(
+    self,
+    query: Union[str, list[str]],
+    viewer_ids: Optional[list[str]] = None,
+    include_persona: bool = True,
+    include_corpus: bool = False,
+    include_external_knowledge: bool = False,
+    recall_profile: str = "deep_recall",
+  ) -> CompiledMemoryContext:
+    query_text = self._normalize_query(query)
+    profile = self._resolve_recall_profile(recall_profile)
+    return CompiledMemoryContext(
+      user_memory_lines=tuple(self._build_user_lines(query_text, viewer_ids, profile)),
+      self_memory_lines=tuple(self._build_self_lines(query_text, profile)),
+      persona_lines=tuple(self._build_persona_lines(query_text)) if include_persona else (),
+      corpus_lines=tuple(self._build_corpus_lines(query_text)) if include_corpus else (),
+      knowledge_lines=tuple(self._build_knowledge_lines(query_text)) if include_external_knowledge else (),
+    )
 
   def compile_prompt_context(
     self,
     query: Union[str, list[str]],
     viewer_ids: Optional[list[str]] = None,
+    include_persona: bool = True,
     include_corpus: bool = False,
     include_external_knowledge: bool = False,
+    recall_profile: str = "deep_recall",
   ) -> str:
-    query_text = self._normalize_query(query)
-    context = CompiledMemoryContext(
-      user_memory_lines=tuple(self._build_user_lines(query_text, viewer_ids)),
-      self_memory_lines=tuple(self._build_self_lines(query_text)),
-      persona_lines=tuple(self._build_persona_lines(query_text)),
-      corpus_lines=tuple(self._build_corpus_lines(query_text)) if include_corpus else (),
-      knowledge_lines=tuple(self._build_knowledge_lines(query_text)) if include_external_knowledge else (),
+    context = self.build_compiled_context(
+      query=query,
+      viewer_ids=viewer_ids,
+      include_persona=include_persona,
+      include_corpus=include_corpus,
+      include_external_knowledge=include_external_knowledge,
+      recall_profile=recall_profile,
     )
     return context.to_prompt_blocks()
 
@@ -242,10 +319,21 @@ class StructuredMemoryRetriever:
     ):
       index.ensure_healthy()
 
-  def _upsert_user_record(self, record: UserMemoryRecord) -> None:
+  def _build_user_record_docs(
+    self,
+    record: UserMemoryRecord,
+  ) -> tuple[
+    tuple[list[str], list[str], list[dict]],
+    tuple[list[str], list[str], list[dict]],
+  ]:
     identity = record.identity or {}
     nicknames = tuple(identity.get("nicknames", ()))
-    nickname = str(identity.get("preferred_address", "")).strip() or (nicknames[-1] if nicknames else record.viewer_id)
+    nickname = resolve_preferred_address(
+      identity,
+      fallback_nicknames=nicknames,
+      raw_aliases=(record.viewer_id,),
+      fallback=record.viewer_id,
+    )
 
     fact_ids: list[str] = []
     fact_contents: list[str] = []
@@ -283,10 +371,15 @@ class StructuredMemoryRetriever:
         "stability_score": _stability_score(hook),
       })
 
-    self._upsert_docs(self._user_fact_index, fact_ids, fact_contents, fact_metadatas)
-    self._upsert_docs(self._user_callback_index, callback_ids, callback_contents, callback_metadatas)
+    return (
+      (fact_ids, fact_contents, fact_metadatas),
+      (callback_ids, callback_contents, callback_metadatas),
+    )
 
-  def _upsert_self_said(self, self_record: SelfMemoryRecord) -> None:
+  def _build_self_said_docs(
+    self,
+    self_record: SelfMemoryRecord,
+  ) -> tuple[list[str], list[str], list[dict]]:
     doc_ids: list[str] = []
     contents: list[str] = []
     metadatas: list[dict] = []
@@ -302,9 +395,12 @@ class StructuredMemoryRetriever:
         "display_text": text,
         "confidence": _safe_float(item.get("confidence"), 0.0),
       })
-    self._upsert_docs(self._self_said_index, doc_ids, contents, metadatas)
+    return doc_ids, contents, metadatas
 
-  def _upsert_commitments(self, self_record: SelfMemoryRecord) -> None:
+  def _build_commitment_docs(
+    self,
+    self_record: SelfMemoryRecord,
+  ) -> tuple[list[str], list[str], list[dict]]:
     doc_ids: list[str] = []
     contents: list[str] = []
     metadatas: list[dict] = []
@@ -321,9 +417,12 @@ class StructuredMemoryRetriever:
         "status": status,
         "display_text": text,
       })
-    self._upsert_docs(self._self_commitment_index, doc_ids, contents, metadatas)
+    return doc_ids, contents, metadatas
 
-  def _upsert_self_threads(self, self_record: SelfMemoryRecord) -> None:
+  def _build_self_thread_docs(
+    self,
+    self_record: SelfMemoryRecord,
+  ) -> tuple[list[str], list[str], list[dict]]:
     doc_ids: list[str] = []
     contents: list[str] = []
     metadatas: list[dict] = []
@@ -338,12 +437,7 @@ class StructuredMemoryRetriever:
         "source_layer": source_layer,
         "display_text": text,
       })
-    self._upsert_docs(self._self_thread_index, doc_ids, contents, metadatas)
-
-  @staticmethod
-  def _upsert_docs(index: VectorStore, doc_ids: list[str], contents: list[str], metadatas: list[dict]) -> None:
-    if doc_ids:
-      index.add_batch(doc_ids, contents, metadatas)
+    return doc_ids, contents, metadatas
 
   @staticmethod
   def _normalize_query(query: Union[str, list[str]]) -> str:
@@ -352,7 +446,41 @@ class StructuredMemoryRetriever:
       return " ".join(parts)
     return str(query or "").strip()
 
-  def _build_user_lines(self, query_text: str, viewer_ids: Optional[list[str]]) -> list[str]:
+  def _resolve_recall_profile(self, recall_profile: str) -> RecallProfile:
+    if recall_profile == "normal":
+      return RecallProfile(
+        max_viewers=1 if self._config.max_viewers > 0 else 0,
+        user_fact_top_k=min(2, self._config.user_fact_top_k),
+        user_recent_state_top_k=min(1, self._config.user_recent_state_top_k),
+        user_topic_top_k=min(2, self._config.user_topic_top_k),
+        user_callback_top_k=min(1, self._config.user_callback_top_k),
+        user_open_thread_top_k=min(1, self._config.user_open_thread_top_k),
+        user_sensitive_top_k=min(1, self._config.user_sensitive_top_k),
+        self_said_top_k=min(1, self._config.self_said_top_k),
+        self_commitment_top_k=min(1, self._config.self_commitment_top_k),
+        self_thread_top_k=min(1, self._config.self_thread_top_k),
+        stable_preference_top_k=1,
+      )
+    return RecallProfile(
+      max_viewers=self._config.max_viewers,
+      user_fact_top_k=self._config.user_fact_top_k,
+      user_recent_state_top_k=self._config.user_recent_state_top_k,
+      user_topic_top_k=self._config.user_topic_top_k,
+      user_callback_top_k=self._config.user_callback_top_k,
+      user_open_thread_top_k=self._config.user_open_thread_top_k,
+      user_sensitive_top_k=self._config.user_sensitive_top_k,
+      self_said_top_k=self._config.self_said_top_k,
+      self_commitment_top_k=self._config.self_commitment_top_k,
+      self_thread_top_k=self._config.self_thread_top_k,
+      stable_preference_top_k=2,
+    )
+
+  def _build_user_lines(
+    self,
+    query_text: str,
+    viewer_ids: Optional[list[str]],
+    profile: RecallProfile,
+  ) -> list[str]:
     if self._user_memory_store is None:
       return []
     picked_viewers: list[str] = []
@@ -360,26 +488,33 @@ class StructuredMemoryRetriever:
       normalized = str(viewer_id).strip()
       if normalized and normalized not in picked_viewers:
         picked_viewers.append(normalized)
-      if len(picked_viewers) >= self._config.max_viewers:
+      if len(picked_viewers) >= profile.max_viewers:
         break
     if not picked_viewers:
       return []
 
-    lines = ["使用原则：最多只轻轻打一张关系牌，不要背档案式复述历史。"]
+    lines: list[str] = []
     for viewer_id in picked_viewers:
       record = self._user_memory_store.get(viewer_id)
       if record is None:
         continue
+      if not lines:
+        lines.append("使用原则：最多只轻轻打一张关系牌，不要背档案式复述历史。")
       identity = record.identity or {}
       nicknames = tuple(identity.get("nicknames", ()))
       names = tuple(identity.get("names", ()))
-      preferred_address = str(identity.get("preferred_address", "")).strip()
-      nickname = preferred_address or (nicknames[-1] if nicknames else record.viewer_id)
+      preferred_address = resolve_preferred_address(
+        identity,
+        fallback_nicknames=nicknames,
+        raw_aliases=(record.viewer_id,),
+        fallback=record.viewer_id,
+      )
+      nickname = preferred_address
       lines.append(f"当前关注对象：{nickname}")
 
       sensitive_topics = self._pick_sensitive_entries(
         record.sensitive_topics,
-        limit=self._config.user_sensitive_top_k,
+        limit=profile.user_sensitive_top_k,
       )
       if sensitive_topics:
         lines.append(f"{nickname} 的边界提醒：" + "；".join(sensitive_topics))
@@ -429,7 +564,7 @@ class StructuredMemoryRetriever:
         self._user_fact_index,
         record,
         query_text=query_text,
-        top_k=self._config.user_fact_top_k,
+        top_k=profile.user_fact_top_k,
         fallback_items=record.stable_facts,
         text_key="fact",
       )
@@ -439,13 +574,13 @@ class StructuredMemoryRetriever:
       recent_state = self._fallback_texts(
         record.recent_state,
         "fact",
-        self._config.user_recent_state_top_k,
+        profile.user_recent_state_top_k,
         prefer_recent=True,
       )
       if recent_state:
         lines.append(f"{nickname} 最近在忙/最近状态：" + "；".join(recent_state))
 
-      topic_lines = self._pick_topic_entries(record.topic_profile, self._config.user_topic_top_k)
+      topic_lines = self._pick_topic_entries(record.topic_profile, profile.user_topic_top_k)
       if topic_lines:
         lines.append(f"{nickname} 常聊话题：" + "，".join(topic_lines))
 
@@ -453,7 +588,7 @@ class StructuredMemoryRetriever:
         self._user_callback_index,
         record,
         query_text=query_text,
-        top_k=self._config.user_callback_top_k,
+        top_k=profile.user_callback_top_k,
         fallback_items=record.callbacks,
         text_key="hook",
       )
@@ -463,14 +598,14 @@ class StructuredMemoryRetriever:
       open_threads = self._fallback_texts(
         record.open_threads,
         "thread",
-        self._config.user_open_thread_top_k,
+        profile.user_open_thread_top_k,
         prefer_recent=True,
       )
       if open_threads:
         lines.append(f"{nickname} 上次对话停在：" + "；".join(open_threads))
     return lines
 
-  def _build_self_lines(self, query_text: str) -> list[str]:
+  def _build_self_lines(self, query_text: str, profile: RecallProfile) -> list[str]:
     if self._self_memory_store is None:
       return []
     record = self._self_memory_store.get()
@@ -479,7 +614,7 @@ class StructuredMemoryRetriever:
     self_said = self._search_or_fallback(
       self._self_said_index,
       query_text=query_text,
-      top_k=self._config.self_said_top_k,
+      top_k=profile.self_said_top_k,
       fallback_items=record.self_said,
       text_key="text",
     )
@@ -489,7 +624,7 @@ class StructuredMemoryRetriever:
     commitments = self._search_or_fallback(
       self._self_commitment_index,
       query_text=query_text,
-      top_k=self._config.self_commitment_top_k,
+      top_k=profile.self_commitment_top_k,
       fallback_items=record.commitments,
       text_key="text",
     )
@@ -499,14 +634,14 @@ class StructuredMemoryRetriever:
     threads = self._search_or_fallback(
       self._self_thread_index,
       query_text=query_text,
-      top_k=self._config.self_thread_top_k,
+      top_k=profile.self_thread_top_k,
       fallback_items=record.self_threads,
       text_key="text",
     )
     if threads:
       lines.append("可续接的旧线头：" + "；".join(threads))
 
-    preferences = self._sort_items(record.stable_preferences, "text")[:2]
+    preferences = self._sort_items(record.stable_preferences, "text")[:profile.stable_preference_top_k]
     preference_texts = [str(item.get("text", "")).strip() for item in preferences if str(item.get("text", "")).strip()]
     if preference_texts:
       lines.append("较稳定的表达偏好：" + "；".join(preference_texts))
@@ -548,8 +683,12 @@ class StructuredMemoryRetriever:
     result: list[str] = []
     for entry in self._external_knowledge_store.list_enabled()[:self._config.knowledge_top_k]:
       head = entry.topic or entry.category
+      stance = str(entry.streamer_stance or "").strip()
       if entry.summary:
-        result.append(f"{head}：{entry.summary}" if head else entry.summary)
+        line = f"{head}：{entry.summary}" if head else entry.summary
+        if stance:
+          line = f"{line}\n主播立场：{stance}"
+        result.append(line)
     return result
 
   def _search_user_memories(
@@ -561,6 +700,8 @@ class StructuredMemoryRetriever:
     fallback_items: tuple[dict, ...],
     text_key: str,
   ) -> list[str]:
+    if top_k <= 0:
+      return []
     if query_text:
       lines = self._search_texts(
         index,
@@ -580,6 +721,8 @@ class StructuredMemoryRetriever:
     fallback_items: tuple[dict, ...],
     text_key: str,
   ) -> list[str]:
+    if top_k <= 0:
+      return []
     if query_text:
       lines = self._search_texts(index, query_text, top_k=top_k)
       if lines:
@@ -593,11 +736,13 @@ class StructuredMemoryRetriever:
     top_k: int,
     where: Optional[dict] = None,
   ) -> list[str]:
-    if not query_text:
+    if not query_text or top_k <= 0:
       return []
     picked: list[str] = []
     seen: set[str] = set()
-    for doc, _score in index.search(query_text, top_k=top_k, where=where):
+    for doc, score in index.search(query_text, top_k=top_k, where=where):
+      if self._score_too_far(score):
+        continue
       meta = doc.metadata or {}
       text = str(meta.get("display_text", "")).strip() or str(doc.page_content or "").strip()
       if not text or text in seen:
@@ -607,6 +752,15 @@ class StructuredMemoryRetriever:
       if len(picked) >= top_k:
         break
     return picked
+
+  def _score_too_far(self, score: Optional[float]) -> bool:
+    threshold = getattr(self._config, "semantic_max_distance", None)
+    if score is None or threshold in (None, ""):
+      return False
+    try:
+      return float(score) > float(threshold)
+    except (TypeError, ValueError):
+      return False
 
   def _fallback_texts(
     self,

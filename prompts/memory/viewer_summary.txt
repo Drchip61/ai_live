@@ -28,6 +28,23 @@ AI当时的回复摘要：{ai_response}
 - `stable_facts` 不要塞“今天/刚刚/这周”这类短期状态
 - `topic_profile` 只写明确主题，不要写抽象情绪
 - `sensitive_topics` 只有在用户明确表达边界时才写
+- 如果用户明确要求“以后叫我 X / 改称呼为 X / 你可以叫我 X”，优先把 `identity.preferred_address` 直接写成这个最终称呼
+- 如果称呼还没定下来或你拿不准，不要写 `待定` / `未定` / `未知` 这类占位词；此时让 `preferred_address` 留空，把“还在商量称呼”写进 `callbacks` 或 `open_threads`
+- 普通对话里提到 `舰长/提督/总督/大航海会员/徽章` 时，除非输入本身就是明确的真实付费事件，否则不得写成 `stable_facts` / `recent_state` / `relationship_state` 里的身份事实
+- 这类内容优先写成 `callbacks` 或 `open_threads`，例如“拿舰长梗验记忆”“嘴上送舰长”“问我是不是舰长”
+
+关系记忆示例倾向：
+- 观众说「你认识我不」「还记得我吗」「还记得我姓啥吗」这类关系试探时，优先写进 `callbacks`，必要时补 `relationship_state.last_dialogue_stop`，不要只写成 `stable_facts`
+- 观众说「下次告诉你」「回头再来汇报」「之后再说」这类话时，优先写进 `open_threads`
+- 观众说「嘴上送舰长」「又拿徽章来验记忆」这类反复玩的梗时，优先写进 `callbacks`
+
+简短示例：
+- 输入：「你认识我不」
+  输出片段：`"callbacks":[{{"hook":"会用“你认识我不”测试主播记忆","freshness":0.90,"expires_in_days":30}}]`
+- 输入：「下次我再告诉你结果」
+  输出片段：`"open_threads":[{{"thread":"他说下次再告诉主播结果","freshness":0.92,"status":"open"}}]`
+- 输入：「今天嘴上送舰长，实际没有」
+  输出片段：`"callbacks":[{{"hook":"嘴上送舰长的玩笑梗","freshness":0.88,"expires_in_days":30}}]`
 
 以下不值得记：
 - 纯感叹词、反应词、问候
@@ -106,7 +123,8 @@ AI当时的回复摘要：{ai_response}
 要求：
 - `index` 必须对应弹幕序号
 - 没有内容时用空数组 `[]`
-- `relationship_state` 没把握时返回空对象 `{}`
-- `identity` 没信息时返回空对象 `{}`
+- JSON 数组里的每个元素都必须是对象；不要输出嵌套数组、字符串、数字或 `null`
+- `relationship_state` 没把握时返回空对象 `{{}}`
+- `identity` 没信息时返回空对象 `{{}}`
 - 不要输出“该观众……”
 - 不要把昵称机械重复写进 `fact` / `thread` / `hook`

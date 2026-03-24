@@ -4,14 +4,17 @@ LLM 包装器
 """
 
 import asyncio
+import inspect
 import re
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING, Union
 
+from .contracts import ModelInvocation, RetrievedContextBundle
 from .model_provider import ModelType, ModelProvider
 from .pipeline import StreamingPipeline
+from .retriever import RetrieverResolver
 
 # 将项目根目录添加到路径
 project_root = Path(__file__).parent.parent
@@ -123,6 +126,8 @@ class LLMWrapper:
 
     # 最近一次使用的记忆上下文（供调试监控）
     self._last_extra_context: str = ""
+    self._last_trusted_context: str = ""
+    self._last_untrusted_context: str = ""
 
     # 后台任务引用集合（防止被 GC 回收）
     self._background_tasks: set[asyncio.Task] = set()
@@ -142,14 +147,33 @@ class LLMWrapper:
     """最近一次使用的记忆上下文（供调试监控）"""
     return self._last_extra_context
 
+  @property
+  def last_trusted_context(self) -> str:
+    return self._last_trusted_context
+
+  @property
+  def last_untrusted_context(self) -> str:
+    return self._last_untrusted_context
+
   async def start_memory(self) -> None:
     """启动记忆系统定时任务（需在 asyncio 上下文中调用）"""
     if self._memory is not None:
       await self._memory.start()
 
+  async def _drain_background_tasks(self) -> None:
+    """停机前等待已发出的记忆写回任务收敛，避免索引重建被半途打断。"""
+    pending = tuple(
+      task for task in self._background_tasks
+      if not task.done()
+    )
+    if not pending:
+      return
+    await asyncio.gather(*pending, return_exceptions=True)
+
   async def stop_memory(self) -> None:
     """停止记忆系统定时任务"""
     if self._memory is not None:
+      await self._drain_background_tasks()
       await self._memory.stop()
 
   @property
@@ -161,6 +185,103 @@ class LLMWrapper:
     """清空对话历史"""
     self._history = []
 
+  def _get_retriever(self) -> RetrieverResolver:
+    return RetrieverResolver(
+      memory_manager=self._memory,
+      emotion_machine=self._emotion,
+      affection_bank=self._affection,
+      meme_manager=self._meme_manager,
+      style_bank=self._style_bank,
+      state_card=self._state_card,
+    )
+
+  @staticmethod
+  def _combine_context_text(bundle: RetrievedContextBundle) -> str:
+    return "\n\n".join(
+      part for part in (
+        bundle.render_trusted_text(),
+        bundle.render_untrusted_text(),
+      ) if part
+    )
+
+  def _remember_context_bundle(self, bundle: RetrievedContextBundle) -> None:
+    self._last_trusted_context = bundle.render_trusted_text()
+    self._last_untrusted_context = bundle.render_untrusted_text()
+    self._last_extra_context = self._combine_context_text(bundle)
+
+  def _remember_invocation_context(
+    self,
+    invocation: ModelInvocation,
+    bundle: Optional[RetrievedContextBundle] = None,
+  ) -> None:
+    if bundle is not None:
+      self._last_trusted_context = str(
+        invocation.trusted_context or bundle.render_trusted_text()
+      ).strip()
+      self._last_untrusted_context = str(
+        invocation.untrusted_context or bundle.render_untrusted_text()
+      ).strip()
+      self._last_extra_context = "\n\n".join(
+        part for part in (
+          self._last_trusted_context,
+          self._last_untrusted_context,
+        ) if part
+      )
+      return
+    self._last_trusted_context = str(invocation.trusted_context or "").strip()
+    self._last_untrusted_context = str(invocation.untrusted_context or "").strip()
+    self._last_extra_context = "\n\n".join(
+      part for part in (
+        self._last_trusted_context,
+        self._last_untrusted_context,
+      ) if part
+    )
+
+  async def _retrieve_context_from_plan(
+    self,
+    plan: "PromptPlan",
+    *,
+    old_comments: Optional[list] = None,
+    new_comments: Optional[list] = None,
+    scene_context: str = "",
+    rag_query: str = "",
+    memory_input: str = "",
+    viewer_ids: Optional[list[str]] = None,
+  ) -> RetrievedContextBundle:
+    resolver = self._get_retriever()
+    bundle = await resolver.resolve(
+      plan,
+      old_comments=old_comments or [],
+      new_comments=new_comments or [],
+      scene_context=scene_context,
+      viewer_ids=viewer_ids,
+      retrieval_query=rag_query,
+      writeback_input=memory_input,
+    )
+    self._remember_context_bundle(bundle)
+    return bundle
+
+  async def resolve_context_from_plan(
+    self,
+    plan: "PromptPlan",
+    *,
+    old_comments: Optional[list] = None,
+    new_comments: Optional[list] = None,
+    scene_context: str = "",
+    rag_query: str = "",
+    memory_input: str = "",
+    viewer_ids: Optional[list[str]] = None,
+  ) -> RetrievedContextBundle:
+    return await self._retrieve_context_from_plan(
+      plan,
+      old_comments=old_comments,
+      new_comments=new_comments,
+      scene_context=scene_context,
+      rag_query=rag_query,
+      memory_input=memory_input,
+      viewer_ids=viewer_ids,
+    )
+
   async def _build_extra_context_from_plan(
     self,
     plan: "PromptPlan",
@@ -168,70 +289,14 @@ class LLMWrapper:
     viewer_ids: Optional[list[str]] = None,
   ) -> str:
     """
-    按 Controller 的 PromptPlan 条件组装 extra_context
-
-    根据 plan 精确选择记忆、知识和语料，避免无差别全量注入。
+    兼容旧测试/脚本接口：返回合并后的 context 文本。
     """
-    parts: list[str] = []
-    focus_ids = list(plan.viewer_focus_ids) or viewer_ids or []
-    structured_query = rag_query.strip()
-
-    if self._state_card is not None:
-      parts.append(self._state_card.to_prompt())
-
-    if self._emotion is not None:
-      parts.append(self._emotion.state.to_prompt())
-    if self._affection is not None:
-      hint = self._affection.to_prompt()
-      if hint:
-        parts.append(hint)
-
-    if self._memory is not None:
-      if plan.memory_strategy in ("normal", "deep_recall"):
-        active_text, _, _ = await asyncio.to_thread(
-          self._memory.retrieve_active_only,
-        )
-        if active_text:
-          parts.append(active_text)
-        structured_text = await asyncio.to_thread(
-          self._memory.compile_structured_context,
-          structured_query,
-          focus_ids,
-          False,
-          False,
-        )
-        if structured_text:
-          parts.append(structured_text)
-
-      if plan.persona_sections:
-        persona_text = self._memory.get_persona_by_sections(list(plan.persona_sections))
-        if persona_text:
-          parts.append(f"【角色设定补充】\n{persona_text}")
-
-    if plan.knowledge_topics and self._memory is not None:
-      knowledge_text = self._memory.get_knowledge_by_topics(list(plan.knowledge_topics))
-      if knowledge_text:
-        parts.append(f"【参考知识】\n{knowledge_text}")
-
-    if (plan.corpus_style or plan.corpus_scene) and self._style_bank is not None:
-      style_text = await asyncio.to_thread(
-        self._style_bank.retrieve_targeted,
-        query=structured_query or "general",
-        style_tag=plan.corpus_style,
-        scene_tag=plan.corpus_scene,
-      )
-      if style_text:
-        parts.append(style_text)
-
-    if self._meme_manager is not None:
-      meme_text = self._meme_manager.to_prompt()
-      if meme_text:
-        parts.append(meme_text)
-
-    if plan.extra_instructions:
-      parts.append("【本轮提示】\n" + "\n".join(f"- {i}" for i in plan.extra_instructions))
-
-    return "\n\n".join(parts)
+    bundle = await self._retrieve_context_from_plan(
+      plan,
+      rag_query=rag_query,
+      viewer_ids=viewer_ids,
+    )
+    return self._combine_context_text(bundle)
 
   @staticmethod
   def _normalize_untrusted_text(text: str) -> str:
@@ -269,99 +334,216 @@ class LLMWrapper:
       "[END_USER_INPUT]"
     )
 
+  @staticmethod
+  def _viewer_ids_from_comments(comments: Optional[list]) -> list[str]:
+    result: list[str] = []
+    for comment in comments or []:
+      viewer_id = str(getattr(comment, "user_id", "") or "").strip()
+      if viewer_id and viewer_id not in result:
+        result.append(viewer_id)
+    return result
+
+  def _make_invocation_from_prompt(
+    self,
+    prompt: str,
+    plan: "PromptPlan",
+    bundle: RetrievedContextBundle,
+    *,
+    images: Optional[list[str]] = None,
+  ) -> ModelInvocation:
+    return ModelInvocation(
+      user_prompt=self._guard_user_input(prompt),
+      images=images,
+      trusted_context=bundle.render_trusted_text(),
+      untrusted_context=bundle.render_untrusted_text(),
+      response_style=plan.response_style,
+      route_kind=plan.route_kind,
+    )
+
+  @classmethod
+  def _guard_invocation(cls, invocation: ModelInvocation) -> ModelInvocation:
+    return ModelInvocation(
+      user_prompt=cls._guard_user_input(invocation.user_prompt),
+      images=invocation.images,
+      trusted_context=invocation.trusted_context,
+      untrusted_context=invocation.untrusted_context,
+      response_style=invocation.response_style,
+      route_kind=invocation.route_kind,
+    )
+
+  async def _pipeline_ainvoke(self, invocation: ModelInvocation) -> str:
+    method = getattr(self.pipeline, "ainvoke_invocation", None)
+    if callable(method):
+      maybe_result = method(
+        invocation,
+        history=self._history,
+      )
+      if inspect.isawaitable(maybe_result):
+        return await maybe_result
+    return await self.pipeline.ainvoke(
+      invocation.user_prompt,
+      self._history,
+      trusted_context=invocation.trusted_context,
+      untrusted_context=invocation.untrusted_context,
+      images=invocation.images,
+    )
+
+  async def _pipeline_astream(self, invocation: ModelInvocation) -> AsyncIterator[str]:
+    method = getattr(self.pipeline, "astream_invocation", None)
+    if callable(method):
+      maybe_stream = method(
+        invocation,
+        history=self._history,
+      )
+      if hasattr(maybe_stream, "__aiter__"):
+        async for chunk in maybe_stream:
+          yield chunk
+        return
+    async for chunk in self.pipeline.astream(
+      invocation.user_prompt,
+      self._history,
+      trusted_context=invocation.trusted_context,
+      untrusted_context=invocation.untrusted_context,
+      images=invocation.images,
+    ):
+      yield chunk
+
+  def _schedule_memory_writeback(
+    self,
+    plan: "PromptPlan",
+    *,
+    writeback_input: str,
+    response_text: str,
+    comments: Optional[list] = None,
+  ) -> None:
+    if self._memory is None:
+      return
+
+    mem_text = self._normalize_untrusted_text(writeback_input)
+    clean_response = _strip_bilingual_for_memory(response_text)
+    should_record_interaction = bool(mem_text) and plan.route_kind in (
+      "chat", "super_chat", "vlm", "proactive",
+    )
+    should_record_viewer = bool(comments) and plan.route_kind in (
+      "chat", "super_chat",
+    )
+    if should_record_interaction:
+      task = asyncio.create_task(
+        self._memory.record_interaction(mem_text, clean_response)
+      )
+      self._background_tasks.add(task)
+      task.add_done_callback(self._background_tasks.discard)
+      if should_record_viewer:
+        viewer_task = asyncio.create_task(
+          self._memory.record_viewer_memories(comments, ai_response_summary=clean_response[:100])
+        )
+        self._background_tasks.add(viewer_task)
+        viewer_task.add_done_callback(self._background_tasks.discard)
+
+    stance_task = asyncio.create_task(
+      self._memory.extract_stances(
+        clean_response,
+        context=mem_text if should_record_interaction else "",
+      )
+    )
+    self._background_tasks.add(stance_task)
+    stance_task.add_done_callback(self._background_tasks.discard)
+
   async def achat_with_plan(
     self,
-    user_input: str,
+    user_input: Union[str, ModelInvocation],
     plan: "PromptPlan",
     rag_query: str = "",
     images: Optional[list[str]] = None,
     memory_input: Optional[str] = None,
     comments: Optional[list] = None,
+    retrieved_context: Optional[RetrievedContextBundle] = None,
   ) -> str:
     """
     Controller 驱动的异步聊天：按 PromptPlan 组装上下文。
     """
-    viewer_ids = None
-    if comments:
-      viewer_ids = list({
-        c.user_id for c in comments
-        if getattr(c, "user_id", None)
-      })
-
-    guarded_input = self._guard_user_input(user_input)
-    extra_context = await self._build_extra_context_from_plan(
-      plan, rag_query=rag_query, viewer_ids=viewer_ids,
-    )
-    self._last_extra_context = extra_context
-    response = await self.pipeline.ainvoke(
-      guarded_input, self._history, extra_context=extra_context,
-      images=images,
-    )
-
-    self._history.append((user_input, response))
-
-    if self._memory is not None:
-      mem_text = self._normalize_untrusted_text(memory_input or user_input)
-      clean_response = _strip_bilingual_for_memory(response)
-      should_record_interaction = bool(memory_input) and plan.route_kind in (
-        "chat", "super_chat", "vlm", "proactive",
-      )
-      should_record_viewer = bool(comments) and plan.route_kind in (
-        "chat", "super_chat",
-      )
-      if should_record_interaction:
-        task = asyncio.create_task(
-          self._memory.record_interaction(mem_text, clean_response)
+    viewer_ids = self._viewer_ids_from_comments(comments)
+    bundle = retrieved_context
+    if isinstance(user_input, ModelInvocation):
+      raw_invocation = user_input
+      history_input = raw_invocation.user_prompt
+      invocation = self._guard_invocation(raw_invocation)
+      self._remember_invocation_context(raw_invocation, bundle)
+    else:
+      if bundle is None:
+        bundle = await self._retrieve_context_from_plan(
+          plan,
+          new_comments=comments or [],
+          rag_query=rag_query,
+          memory_input=memory_input or "",
+          viewer_ids=viewer_ids,
         )
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        if should_record_viewer:
-          viewer_task = asyncio.create_task(
-            self._memory.record_viewer_memories(comments, ai_response_summary=clean_response[:100])
-          )
-          self._background_tasks.add(viewer_task)
-          viewer_task.add_done_callback(self._background_tasks.discard)
-      stance_task = asyncio.create_task(
-        self._memory.extract_stances(
-          clean_response,
-          context=mem_text if should_record_interaction else "",
-        )
+      invocation = self._make_invocation_from_prompt(
+        user_input,
+        plan,
+        bundle,
+        images=images,
       )
-      self._background_tasks.add(stance_task)
-      stance_task.add_done_callback(self._background_tasks.discard)
+      self._remember_invocation_context(invocation, bundle)
+      history_input = user_input
 
+    response = await self._pipeline_ainvoke(invocation)
+    self._history.append((history_input, response))
+
+    writeback_input = (
+      (bundle.writeback_input if bundle is not None else "") or
+      str(memory_input or "") or
+      history_input
+    )
+    self._schedule_memory_writeback(
+      plan,
+      writeback_input=writeback_input,
+      response_text=response,
+      comments=comments,
+    )
     return response
 
   async def achat_stream_with_plan(
     self,
-    user_input: str,
+    user_input: Union[str, ModelInvocation],
     plan: "PromptPlan",
     rag_query: str = "",
     images: Optional[list[str]] = None,
     memory_input: Optional[str] = None,
     comments: Optional[list] = None,
+    retrieved_context: Optional[RetrievedContextBundle] = None,
   ) -> AsyncIterator[str]:
     """Controller 驱动的异步流式聊天"""
-    viewer_ids = None
-    if comments:
-      viewer_ids = list({
-        c.user_id for c in comments
-        if getattr(c, "user_id", None)
-      })
+    viewer_ids = self._viewer_ids_from_comments(comments)
+    bundle = retrieved_context
+    if isinstance(user_input, ModelInvocation):
+      raw_invocation = user_input
+      history_input = raw_invocation.user_prompt
+      invocation = self._guard_invocation(raw_invocation)
+      self._remember_invocation_context(raw_invocation, bundle)
+    else:
+      if bundle is None:
+        bundle = await self._retrieve_context_from_plan(
+          plan,
+          new_comments=comments or [],
+          rag_query=rag_query,
+          memory_input=memory_input or "",
+          viewer_ids=viewer_ids,
+        )
+      invocation = self._make_invocation_from_prompt(
+        user_input,
+        plan,
+        bundle,
+        images=images,
+      )
+      self._remember_invocation_context(invocation, bundle)
+      history_input = user_input
 
-    guarded_input = self._guard_user_input(user_input)
-    extra_context = await self._build_extra_context_from_plan(
-      plan, rag_query=rag_query, viewer_ids=viewer_ids,
-    )
-    self._last_extra_context = extra_context
     full_response = ""
     completed = False
 
     try:
-      async for chunk in self.pipeline.astream(
-        guarded_input, self._history, extra_context=extra_context,
-        images=images,
-      ):
+      async for chunk in self._pipeline_astream(invocation):
         full_response += chunk
         yield chunk
       completed = True
@@ -376,36 +558,18 @@ class LLMWrapper:
             full_response = result.fixed_response
         if self._emotion is not None:
           self._emotion.tick()
-        self._history.append((user_input, full_response))
-        if self._memory is not None:
-          mem_text = self._normalize_untrusted_text(memory_input or user_input)
-          clean_response = _strip_bilingual_for_memory(full_response)
-          should_record_interaction = bool(memory_input) and plan.route_kind in (
-            "chat", "super_chat", "vlm", "proactive",
-          )
-          should_record_viewer = bool(comments) and plan.route_kind in (
-            "chat", "super_chat",
-          )
-          if should_record_interaction:
-            task = asyncio.create_task(
-              self._memory.record_interaction(mem_text, clean_response)
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
-            if should_record_viewer:
-              viewer_task = asyncio.create_task(
-                self._memory.record_viewer_memories(comments, ai_response_summary=clean_response[:100])
-              )
-              self._background_tasks.add(viewer_task)
-              viewer_task.add_done_callback(self._background_tasks.discard)
-          stance_task = asyncio.create_task(
-            self._memory.extract_stances(
-              clean_response,
-              context=mem_text if should_record_interaction else "",
-            )
-          )
-          self._background_tasks.add(stance_task)
-          stance_task.add_done_callback(self._background_tasks.discard)
+        self._history.append((history_input, full_response))
+        writeback_input = (
+          (bundle.writeback_input if bundle is not None else "") or
+          str(memory_input or "") or
+          history_input
+        )
+        self._schedule_memory_writeback(
+          plan,
+          writeback_input=writeback_input,
+          response_text=full_response,
+          comments=comments,
+        )
 
   def debug_state(self) -> dict:
     """
@@ -422,6 +586,8 @@ class LLMWrapper:
       "has_memory": self.has_memory,
       "background_tasks": len(self._background_tasks),
       "system_prompt_preview": self.pipeline.system_prompt[:200],
+      "last_trusted_context": self._last_trusted_context,
+      "last_untrusted_context": self._last_untrusted_context,
     }
     if self._state_card is not None:
       state["state_card"] = self._state_card.to_dict()

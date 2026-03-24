@@ -50,6 +50,8 @@ class Comment:
   content: str
   id: str = field(default_factory=lambda: str(uuid.uuid4()))
   timestamp: datetime = field(default_factory=datetime.now)
+  received_at: datetime = field(default_factory=datetime.now)
+  receive_seq: int = 0
   priority: bool = False
   event_type: EventType = EventType.DANMAKU
   gift_name: str = ""
@@ -69,6 +71,8 @@ class Comment:
       "nickname": self.nickname,
       "content": self.content,
       "timestamp": self.timestamp.isoformat(),
+      "received_at": self.received_at.isoformat(),
+      "receive_seq": self.receive_seq,
       "event_type": self.event_type.value,
     }
     if self.gift_name:
@@ -89,6 +93,11 @@ class Comment:
       timestamp = datetime.fromisoformat(timestamp)
     elif timestamp is None:
       timestamp = datetime.now()
+    received_at = data.get("received_at")
+    if isinstance(received_at, str):
+      received_at = datetime.fromisoformat(received_at)
+    elif received_at is None:
+      received_at = timestamp
 
     event_type_str = data.get("event_type", "danmaku")
     try:
@@ -102,6 +111,8 @@ class Comment:
       nickname=data["nickname"],
       content=data.get("content", ""),
       timestamp=timestamp,
+      received_at=received_at,
+      receive_seq=int(data.get("receive_seq", 0) or 0),
       event_type=event_type,
       gift_name=data.get("gift_name", ""),
       gift_num=data.get("gift_num", 0),
@@ -138,11 +149,15 @@ class StreamerResponse:
   """
   content: str
   reply_to: tuple[str, ...] = field(default_factory=tuple)
+  reply_target_text: str = ""
+  nickname: str = ""
   id: str = field(default_factory=lambda: str(uuid.uuid4()))
   timestamp: datetime = field(default_factory=datetime.now)
   mapped_content: Optional[str] = None
   expression_motion_tags: tuple[Any, ...] = field(default_factory=tuple)
   response_style: str = "normal"
+  controller_trace: Optional[dict[str, Any]] = None
+  timing_trace: Optional[dict[str, Any]] = None
 
   def to_dict(self) -> dict:
     """转换为字典"""
@@ -150,7 +165,10 @@ class StreamerResponse:
       "id": self.id,
       "content": self.content,
       "reply_to": list(self.reply_to),
+      "reply_target_text": self.reply_target_text,
+      "nickname": self.nickname,
       "timestamp": self.timestamp.isoformat(),
+      "response_style": self.response_style,
     }
     if self.mapped_content is not None:
       d["mapped_content"] = self.mapped_content
@@ -168,6 +186,10 @@ class StreamerResponse:
         }
         for t in self.expression_motion_tags
       ]
+    if self.controller_trace is not None:
+      d["controller_trace"] = self.controller_trace
+    if self.timing_trace is not None:
+      d["timing_trace"] = self.timing_trace
     return d
 
   @classmethod
@@ -187,7 +209,16 @@ class StreamerResponse:
       id=data.get("id", str(uuid.uuid4())),
       content=data["content"],
       reply_to=reply_to,
-      timestamp=timestamp
+      reply_target_text=str(data.get("reply_target_text", "") or ""),
+      nickname=str(
+        data.get("nickname", data.get("reply_target_nickname", ""))
+        or ""
+      ),
+      timestamp=timestamp,
+      mapped_content=data.get("mapped_content"),
+      response_style=str(data.get("response_style", "normal") or "normal"),
+      controller_trace=data.get("controller_trace") if isinstance(data.get("controller_trace"), dict) else None,
+      timing_trace=data.get("timing_trace") if isinstance(data.get("timing_trace"), dict) else None,
     )
 
 

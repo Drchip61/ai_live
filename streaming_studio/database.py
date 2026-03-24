@@ -94,9 +94,26 @@ class CommentDatabase:
           id TEXT PRIMARY KEY,
           content TEXT NOT NULL,
           reply_to TEXT NOT NULL,
-          timestamp TEXT NOT NULL
+          reply_target_text TEXT DEFAULT '',
+          nickname TEXT DEFAULT '',
+          timestamp TEXT NOT NULL,
+          response_style TEXT NOT NULL DEFAULT 'normal',
+          controller_trace_json TEXT DEFAULT '',
+          timing_trace_json TEXT DEFAULT ''
         )
       """)
+
+      for col, typedef in [
+        ("reply_target_text", "TEXT DEFAULT ''"),
+        ("nickname", "TEXT DEFAULT ''"),
+        ("response_style", "TEXT NOT NULL DEFAULT 'normal'"),
+        ("controller_trace_json", "TEXT DEFAULT ''"),
+        ("timing_trace_json", "TEXT DEFAULT ''"),
+      ]:
+        try:
+          cursor.execute(f"ALTER TABLE responses ADD COLUMN {col} {typedef}")
+        except sqlite3.OperationalError:
+          pass
 
       # 创建直播会话表
       cursor.execute("""
@@ -162,14 +179,21 @@ class CommentDatabase:
       cursor = conn.cursor()
       cursor.execute(
         """
-        INSERT OR REPLACE INTO responses (id, content, reply_to, timestamp)
-        VALUES (?, ?, ?, ?)
+        INSERT OR REPLACE INTO responses
+          (id, content, reply_to, reply_target_text, nickname, timestamp,
+           response_style, controller_trace_json, timing_trace_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
           response.id,
           response.content,
           json.dumps(list(response.reply_to)),
-          response.timestamp.isoformat()
+          response.reply_target_text,
+          response.nickname,
+          response.timestamp.isoformat(),
+          response.response_style,
+          json.dumps(response.controller_trace, ensure_ascii=False) if response.controller_trace is not None else "",
+          json.dumps(response.timing_trace, ensure_ascii=False) if response.timing_trace is not None else "",
         )
       )
       conn.commit()
@@ -275,7 +299,8 @@ class CommentDatabase:
       cursor = conn.cursor()
       cursor.execute(
         """
-        SELECT id, content, reply_to, timestamp
+        SELECT id, content, reply_to, reply_target_text, nickname, timestamp,
+               response_style, controller_trace_json, timing_trace_json
         FROM responses
         ORDER BY timestamp DESC
         LIMIT ?
@@ -284,12 +309,26 @@ class CommentDatabase:
       )
       rows = cursor.fetchall()
 
+      def _loads_optional_json(text: str) -> Optional[dict]:
+        if not text:
+          return None
+        try:
+          data = json.loads(text)
+        except json.JSONDecodeError:
+          return None
+        return data if isinstance(data, dict) else None
+
       return [
         StreamerResponse(
           id=row[0],
           content=row[1],
           reply_to=tuple(json.loads(row[2])),
-          timestamp=datetime.fromisoformat(row[3])
+          reply_target_text=row[3] or "",
+          nickname=row[4] or "",
+          timestamp=datetime.fromisoformat(row[5]),
+          response_style=row[6] or "normal",
+          controller_trace=_loads_optional_json(row[7]),
+          timing_trace=_loads_optional_json(row[8]),
         )
         for row in rows
       ]

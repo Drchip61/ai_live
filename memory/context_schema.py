@@ -26,6 +26,98 @@ def _to_tuple_str(items: Optional[list[str] | tuple[str, ...]]) -> tuple[str, ..
   return tuple(str(item) for item in items if str(item).strip())
 
 
+_ADDRESS_WRAPPER_CHARS = "\"'“”‘’「」『』【】[]()（）<>《》"
+_PLACEHOLDER_PREFERRED_ADDRESSES = frozenset((
+  "待定",
+  "未定",
+  "未确定",
+  "待确认",
+  "暂未确定",
+  "暂无",
+  "未知",
+  "none",
+  "null",
+  "n/a",
+))
+_REQUESTED_ADDRESS_PATTERNS = (
+  re.compile(
+    r"(?:改称呼为|改叫我|叫我|喊我|称呼我为|以后(?:就)?(?:叫|喊)我|之后(?:就)?(?:叫|喊)我)"
+    r"\s*(?:[:：])?\s*(?:[\"'“”‘’「」『』])?([^\"'“”‘’「」『』，。！？、\s]{1,16})(?:[\"'“”‘’「」『』])?"
+  ),
+  re.compile(
+    r"(?:要求|希望|想让你|请)(?:你)?(?:之后|以后)?(?:叫|喊|称呼)(?:我)?(?:为)?"
+    r"\s*(?:[:：])?\s*(?:[\"'“”‘’「」『』])?([^\"'“”‘’「」『』，。！？、\s]{1,16})(?:[\"'“”‘’「」『』])?"
+  ),
+)
+
+
+def normalize_preferred_address(value: Any) -> str:
+  text = str(value or "").strip().strip(_ADDRESS_WRAPPER_CHARS)
+  text = re.sub(r"\s+", "", text)
+  if not text:
+    return ""
+  if text in _PLACEHOLDER_PREFERRED_ADDRESSES or text.lower() in _PLACEHOLDER_PREFERRED_ADDRESSES:
+    return ""
+  return text
+
+
+def extract_requested_address(*texts: str) -> str:
+  for text in reversed(texts):
+    payload = str(text or "").strip()
+    if not payload:
+      continue
+    for pattern in _REQUESTED_ADDRESS_PATTERNS:
+      match = pattern.search(payload)
+      if not match:
+        continue
+      candidate = normalize_preferred_address(match.group(1))
+      if candidate:
+        return candidate
+  return ""
+
+
+def resolve_preferred_address(
+  identity: Optional[dict[str, Any]],
+  *,
+  fallback_nicknames: tuple[str, ...] = (),
+  raw_aliases: tuple[str, ...] = (),
+  requested_address: str = "",
+  fallback: str = "",
+) -> str:
+  source = dict(identity or {})
+  nicknames = _to_tuple_str(source.get("nicknames")) or fallback_nicknames
+  preferred_address = normalize_preferred_address(source.get("preferred_address", ""))
+  requested = normalize_preferred_address(requested_address)
+
+  raw_alias_set: set[str] = set()
+  for alias in raw_aliases:
+    normalized = normalize_preferred_address(alias)
+    if normalized:
+      raw_alias_set.add(normalized)
+
+  valid_nicknames = [
+    normalized
+    for normalized in (normalize_preferred_address(item) for item in nicknames)
+    if normalized
+  ]
+  alias_nickname = next(
+    (item for item in reversed(valid_nicknames) if item not in raw_alias_set),
+    "",
+  )
+
+  if requested:
+    return requested
+  if preferred_address and preferred_address not in raw_alias_set:
+    return preferred_address
+  if alias_nickname:
+    return alias_nickname
+  if preferred_address:
+    return preferred_address
+  if valid_nicknames:
+    return valid_nicknames[-1]
+  return normalize_preferred_address(fallback)
+
+
 _USER_RECENT_HINTS = re.compile(
   r"最近|近两天|近几天|当前|今天|明天|这周|本周|刚刚|现在|正在|"
   r"忙着|准备|打算|计划|周报|面试|考试|考研|搬家|加班|下班|"
@@ -44,9 +136,10 @@ def _normalize_identity(
   source = dict(identity or {})
   names = _to_tuple_str(source.get("names"))
   nicknames = _to_tuple_str(source.get("nicknames")) or fallback_nicknames
-  preferred_address = str(source.get("preferred_address", "")).strip()
-  if not preferred_address and nicknames:
-    preferred_address = nicknames[-1]
+  preferred_address = resolve_preferred_address(
+    source,
+    fallback_nicknames=nicknames,
+  )
 
   occupation = source.get("occupation")
   if isinstance(occupation, dict):
@@ -85,8 +178,14 @@ def _upgrade_legacy_relationship_state(
     state["tease_threshold"] = tease_ok
   if care_ok not in (None, "") and state.get("care_threshold") in (None, ""):
     state["care_threshold"] = care_ok
-  if preferred_address and state.get("preferred_address") in (None, ""):
-    state["preferred_address"] = preferred_address
+  state_preferred = normalize_preferred_address(state.get("preferred_address", ""))
+  normalized_preferred_address = normalize_preferred_address(preferred_address)
+  if normalized_preferred_address:
+    state["preferred_address"] = normalized_preferred_address
+  elif state_preferred:
+    state["preferred_address"] = state_preferred
+  else:
+    state.pop("preferred_address", None)
   if state.get("public_ack_count") not in (None, "") and state.get("publicly_acknowledged") in (None, ""):
     state["publicly_acknowledged"] = bool(state.get("public_ack_count"))
 
@@ -153,10 +252,6 @@ class UserMemoryRecord:
   def from_dict(cls, data: dict[str, Any]) -> "UserMemoryRecord":
     legacy_nicknames = _to_tuple_str(data.get("nicknames"))
     identity = _normalize_identity(data.get("identity"), fallback_nicknames=legacy_nicknames)
-    relationship_state = _upgrade_legacy_relationship_state(
-      data.get("relationship_state"),
-      preferred_address=str(identity.get("preferred_address", "")),
-    )
 
     if (
       "stable_facts" in data
@@ -181,6 +276,30 @@ class UserMemoryRecord:
       callbacks = _to_tuple_dicts(data.get("callbacks"))
       open_threads = ()
       sensitive_topics = ()
+
+    requested_address = extract_requested_address(
+      *(str(item.get("hook", "")) for item in callbacks),
+      *(str(item.get("thread", "")) for item in open_threads),
+      str((data.get("relationship_state") or {}).get("last_dialogue_stop", "")),
+    )
+    resolved_address = resolve_preferred_address(
+      identity,
+      fallback_nicknames=legacy_nicknames,
+      raw_aliases=(str(data.get("viewer_id", "")),),
+      requested_address=requested_address,
+      fallback=str(data.get("viewer_id", "")),
+    )
+    if resolved_address:
+      identity = dict(identity)
+      nicknames = _to_tuple_str(identity.get("nicknames"))
+      if requested_address and requested_address not in nicknames:
+        identity["nicknames"] = nicknames + (requested_address,)
+      identity["preferred_address"] = resolved_address
+
+    relationship_state = _upgrade_legacy_relationship_state(
+      data.get("relationship_state"),
+      preferred_address=resolved_address,
+    )
 
     return cls(
       viewer_id=str(data.get("viewer_id", "")),
@@ -291,6 +410,7 @@ class ExternalKnowledgeEntry:
   sources: tuple[str, ...] = field(default_factory=tuple)
   tags: tuple[str, ...] = field(default_factory=tuple)
   usage_rules: tuple[str, ...] = field(default_factory=tuple)
+  streamer_stance: str = ""
   reliability: float = 0.5
   enabled: bool = True
   updated_at: str = field(default_factory=_now_iso)
@@ -310,6 +430,7 @@ class ExternalKnowledgeEntry:
       sources=_to_tuple_str(data.get("sources")),
       tags=_to_tuple_str(data.get("tags")),
       usage_rules=_to_tuple_str(data.get("usage_rules")),
+      streamer_stance=str(data.get("streamer_stance", "") or ""),
       reliability=float(data.get("reliability", 0.5) or 0.5),
       enabled=bool(data.get("enabled", True)),
       updated_at=str(data.get("updated_at", _now_iso())),

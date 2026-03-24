@@ -4,6 +4,7 @@
 """
 
 import logging
+import re
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
@@ -21,6 +22,16 @@ _loader = PromptLoader()
 _STALE_INSTRUCTION = _loader.load("topic/stale_instruction.txt")
 _FOLLOWUP_INSTRUCTION = _loader.load("topic/followup_instruction.txt")
 _PROACTIVE_CONTINUATION = _loader.load("topic/proactive_continuation.txt")
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _sanitize_topic_text(text: str, max_len: int = 160) -> str:
+  """归一化 topic 侧文本，避免异常字符破坏 prompt 结构。"""
+  normalized = _CONTROL_CHARS_RE.sub("", str(text or ""))
+  normalized = normalized.replace("```", "'''").strip()
+  normalized = _WHITESPACE_RE.sub(" ", normalized)
+  return normalized[:max_len]
 
 
 def _significance_label(sig: float) -> str:
@@ -48,8 +59,11 @@ def get_annotations(table: TopicTable) -> dict[str, str]:
   """
   annotations: dict[str, str] = {}
   for topic in table.get_all():
+    safe_title = _sanitize_topic_text(topic.title, max_len=60)
+    if not safe_title:
+      continue
     for cid in topic.comment_ids:
-      annotations[cid] = topic.title
+      annotations[cid] = safe_title
   return annotations
 
 
@@ -142,12 +156,15 @@ def _format_topic_summary(
   lines = ["【当前话题】"]
 
   for topic in topics:
+    safe_title = _sanitize_topic_text(topic.title, max_len=60) or "未命名话题"
+    safe_progress = _sanitize_topic_text(topic.topic_progress, max_len=200) or "（暂无）"
+    safe_suggestion = _sanitize_topic_text(topic.suggestion, max_len=200)
     label = _significance_label(topic.significance)
-    lines.append(f"\n--- {topic.title} (重要性: {label}) ---")
-    lines.append(f"进度: {topic.topic_progress}")
+    lines.append(f"\n--- {safe_title} (重要性: {label}) ---")
+    lines.append(f"进度: {safe_progress}")
 
-    if topic.suggestion:
-      lines.append(f"建议: {topic.suggestion}")
+    if safe_suggestion:
+      lines.append(f"建议: {safe_suggestion}")
 
     if topic.stale:
       lines.append("(!) 这个话题已经聊了很久")
@@ -167,9 +184,12 @@ def _format_topic_summary(
       for cid in recent_cids:
         comment = database.get_comment(cid)
         if comment:
-          comment_lines.append(
-            f"  - {comment.nickname}: {comment.content}"
-          )
+          safe_nickname = _sanitize_topic_text(comment.nickname, max_len=40) or "观众"
+          safe_content = _sanitize_topic_text(comment.content, max_len=160)
+          if safe_content:
+            comment_lines.append(
+              f"  - {safe_nickname}: {safe_content}"
+            )
       if comment_lines:
         lines.append("最近相关弹幕:")
         lines.extend(comment_lines)
@@ -183,7 +203,9 @@ def _format_topic_summary(
         for cid in reversed(topic.comment_ids):
           comment = database.get_comment(cid)
           if comment and comment.user_id == uid:
-            nicknames.append(comment.nickname)
+            safe_nickname = _sanitize_topic_text(comment.nickname, max_len=40)
+            if safe_nickname:
+              nicknames.append(safe_nickname)
             break
       if nicknames:
         lines.append(f"参与用户: {', '.join(nicknames)}")
@@ -203,8 +225,14 @@ def _format_instructions(
   # 过期话题指令
   stale_topics = [t for t in topics if t.stale]
   if stale_topics:
-    names = "、".join(f"「{t.title}」" for t in stale_topics)
-    instructions.append(_STALE_INSTRUCTION.format(names=names))
+    names = "、".join(
+      f"「{_sanitize_topic_text(t.title, max_len=40) or '未命名话题'}」"
+      for t in stale_topics
+    )
+    instructions.append(_sanitize_topic_text(
+      _STALE_INSTRUCTION.format(names=names),
+      max_len=220,
+    ))
 
   # 冷场 / 弹幕稀疏时的话题跟进建议
   comment_count = len(new_comment_ids)
@@ -212,16 +240,20 @@ def _format_instructions(
     followup_topics = [t for t in topics if t.suggestion and not t.stale]
     if followup_topics:
       best = max(followup_topics, key=lambda t: t.significance)
+      safe_title = _sanitize_topic_text(best.title, max_len=40) or "未命名话题"
+      safe_suggestion = _sanitize_topic_text(best.suggestion, max_len=160)
       if comment_count == 0:
         # 完全没弹幕：用现有冷场跟进指令
-        instructions.append(
-          _FOLLOWUP_INSTRUCTION.format(title=best.title, suggestion=best.suggestion)
-        )
+        instructions.append(_sanitize_topic_text(
+          _FOLLOWUP_INSTRUCTION.format(title=safe_title, suggestion=safe_suggestion),
+          max_len=220,
+        ))
       else:
         # 有少量弹幕但很稀疏：用更温和的推进引导
-        instructions.append(
-          _PROACTIVE_CONTINUATION.format(title=best.title, suggestion=best.suggestion)
-        )
+        instructions.append(_sanitize_topic_text(
+          _PROACTIVE_CONTINUATION.format(title=safe_title, suggestion=safe_suggestion),
+          max_len=220,
+        ))
 
   if not instructions:
     return ""

@@ -7,8 +7,8 @@
   1. 固定 system prompt（base + security + persona）
   2. Controller 产出的 PromptPlan
   3. RoutePromptComposer 生成的 user prompt
-  4. LLMWrapper._build_extra_context_from_plan 生成的 extra_context
-  5. wrap_untrusted_context 后的 system 侧上下文
+  4. RetrieverResolver 生成的 RetrievedContextBundle
+  5. trusted / untrusted context 原文与 wrap 后结果
   6. 一段“满配 PromptPlan”示例，专门展示记忆 / 人设 / 知识 / 风格 / 状态卡如何组合
 
 说明：
@@ -26,7 +26,6 @@ import os
 import shutil
 import sys
 import tempfile
-from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -37,7 +36,7 @@ if str(ROOT) not in sys.path:
 
 from broadcaster_state.state_card import StateCard
 from langchain_wrapper import ModelType
-from langchain_wrapper.pipeline import wrap_untrusted_context
+from langchain_wrapper.pipeline import build_system_prompt, wrap_untrusted_context
 from llm_controller.controller import LLMController
 from llm_controller.schema import PromptPlan
 from memory import EmbeddingConfig, MemoryConfig, MemoryManager
@@ -69,7 +68,7 @@ def _comment(
 
 
 def _plan_summary(plan: PromptPlan) -> dict:
-  return asdict(plan)
+  return plan.to_dict()
 
 
 def _separator(title: str) -> str:
@@ -181,22 +180,30 @@ async def _render_prompt_parts(
   old_comments: list[Comment],
   new_comments: list[Comment],
   images: list[str] | None = None,
-) -> tuple[str, object, str, str, str]:
-  prompt, bundle, response_style = studio._compose_prompt_with_plan(
+) -> tuple[object, object, str, str, str, str]:
+  composed_prompt, retrieved_context = await studio._resolve_prompt_invocation_with_plan(
     old_comments,
     new_comments,
     plan,
     images=images,
     max_chars=0,
   )
-  viewer_ids = list(dict.fromkeys(c.user_id for c in new_comments if c.user_id))
-  extra_context = await studio.llm_wrapper._build_extra_context_from_plan(
-    plan,
-    rag_query=bundle.rag_query,
-    viewer_ids=viewer_ids,
+  trusted_context = retrieved_context.render_trusted_text()
+  untrusted_context = retrieved_context.render_untrusted_text()
+  wrapped_context = wrap_untrusted_context(untrusted_context)
+  final_system_prompt = build_system_prompt(
+    studio.llm_wrapper.pipeline.system_prompt,
+    trusted_context=trusted_context,
+    untrusted_context=untrusted_context,
   )
-  wrapped_context = wrap_untrusted_context(extra_context)
-  return prompt, bundle, response_style, extra_context, wrapped_context
+  return (
+    composed_prompt,
+    retrieved_context,
+    trusted_context,
+    untrusted_context,
+    wrapped_context,
+    final_system_prompt,
+  )
 
 
 async def run_scenarios(
@@ -244,7 +251,9 @@ async def run_scenarios(
   knowledge_topics = tuple(memory_manager.list_knowledge_topics())
   corpus_styles = tuple(memory_manager.list_corpus_style_tags())
   corpus_scenes = tuple(memory_manager.list_corpus_scene_tags())
-  style_bank_categories, style_bank_situations = _load_style_bank_catalog(persona)
+  style_bank = getattr(studio.llm_wrapper, "_style_bank", None)
+  style_bank_categories = tuple(style_bank.list_categories()) if style_bank is not None else ()
+  style_bank_situations = tuple(style_bank.list_situations()) if style_bank is not None else ()
 
   lines: list[str] = []
   lines.append("AI Live — Prompt 组合模拟导出")
@@ -533,7 +542,7 @@ async def run_scenarios(
     ),
   ]
 
-  lines.append(_separator("第一部分：模拟输入 → Controller → user prompt + extra_context"))
+  lines.append(_separator("第一部分：模拟输入 → Controller → RetrievedContextBundle → user prompt"))
   for title, ctx in scenarios:
     old = ctx["old"]
     new = ctx["new"]
@@ -565,13 +574,16 @@ async def run_scenarios(
     studio._current_frame_b64 = "FAKE_BASE64_FRAME_FOR_SIMULATION" if need_frame else None
     images = [studio._current_frame_b64] if studio._current_frame_b64 else None
 
-    prompt, bundle, response_style, extra_context, wrapped_context = await _render_prompt_parts(
+    composed_prompt, retrieved_context, trusted_context, untrusted_context, wrapped_context, final_system_message = await _render_prompt_parts(
       studio,
       plan,
       old,
       new,
       images=images,
     )
+    prompt = composed_prompt.invocation.user_prompt
+    route_bundle = composed_prompt.route_bundle
+    response_style = composed_prompt.invocation.response_style
 
     lines.append(f"\n>>> {title}\n")
     lines.append("--- 输入摘要 ---")
@@ -582,18 +594,29 @@ async def run_scenarios(
       lines.append(f"  scene_description: {ctx['scene']}")
     lines.append("--- PromptPlan (JSON) ---")
     lines.append(json.dumps(_plan_summary(plan), ensure_ascii=False, indent=2))
-    lines.append("--- RoutePromptComposer 侧袋 ---")
+    lines.append("--- RetrievedContextBundle ---")
+    lines.append(json.dumps(retrieved_context.debug_view(), ensure_ascii=False, indent=2))
+    if retrieved_context.blocks:
+      lines.append("--- Context blocks ---")
+      lines.extend(
+        f"  - [{block.trust}] {block.source}: {block.render().splitlines()[0][:80]}"
+        for block in retrieved_context.blocks
+      )
+    lines.append("--- Composer 结果 ---")
     lines.append(f"  response_style(compose 后): {response_style}")
-    lines.append(f"  rag_query: {bundle.rag_query!r}")
-    lines.append(f"  memory_input: {bundle.memory_input!r}")
-    lines.append(f"  reply_images: {'有' if bundle.reply_images else '无'}")
+    lines.append(f"  retrieval_query: {retrieved_context.retrieval_query!r}")
+    lines.append(f"  writeback_input: {retrieved_context.writeback_input!r}")
+    lines.append(f"  reply_images: {'有' if route_bundle.reply_images else '无'}")
     lines.append("--- 最终送入主模型的 user prompt（含风格前缀 + 路由模板） ---\n")
     lines.append(prompt or "(空)")
-    lines.append("\n--- extra_context 原文（由 _build_extra_context_from_plan 产出） ---\n")
-    lines.append(extra_context or "(空)")
-    lines.append("\n--- wrap_untrusted_context(extra_context) ---\n")
+    lines.append("\n--- trusted_context 原文 ---\n")
+    lines.append(trusted_context or "(空)")
+    lines.append("\n--- untrusted_context 原文 ---\n")
+    lines.append(untrusted_context or "(空)")
+    lines.append("\n--- wrap_untrusted_context(untrusted_context) ---\n")
     lines.append(wrapped_context or "(空)")
-    lines.append("\n[说明] 实际 SystemMessage = 上方固定 System Prompt + 此处 wrapped extra_context")
+    lines.append("\n--- 完整 SystemMessage（固定 System Prompt + trusted/untrusted 注入） ---\n")
+    lines.append(final_system_message)
     lines.append("\n" + "-" * 72)
 
   lines.append(_separator("第二部分：固定一条弹幕，遍历 route_kind（看 user prompt 差异）"))
@@ -622,17 +645,19 @@ async def run_scenarios(
       "FAKE_BASE64_FRAME_FOR_SIMULATION" if route_kind in ("vlm", "proactive") else None
     )
     images = [studio._current_frame_b64] if studio._current_frame_b64 else None
-    prompt, bundle, _, _, _ = await _render_prompt_parts(
+    composed_prompt, retrieved_context, _, _, _, _ = await _render_prompt_parts(
       studio,
       plan,
       [],
       demo_new,
       images=images,
     )
+    prompt = composed_prompt.invocation.user_prompt
+    route_bundle = composed_prompt.route_bundle
     lines.append(f"\n>>> 路由 = {route_kind}\n")
-    lines.append(f"rag_query: {bundle.rag_query!r}")
-    lines.append(f"memory_input: {bundle.memory_input!r}")
-    lines.append(f"reply_images: {'有' if bundle.reply_images else '无'}\n")
+    lines.append(f"retrieval_query: {retrieved_context.retrieval_query!r}")
+    lines.append(f"writeback_input: {retrieved_context.writeback_input!r}")
+    lines.append(f"reply_images: {'有' if route_bundle.reply_images else '无'}\n")
     lines.append(prompt or "(空)")
     lines.append("\n" + "-" * 72)
 
@@ -661,29 +686,27 @@ async def run_scenarios(
     extra_instructions=("先接住问题，再自然带一点主播式吐槽。",),
   )
   studio._current_frame_b64 = None
-  full_prompt, full_bundle, _, full_extra_context, full_wrapped_context = await _render_prompt_parts(
+  full_composed_prompt, full_retrieved_context, full_trusted_context, full_untrusted_context, full_wrapped_context, final_system_message = await _render_prompt_parts(
     studio,
     full_plan,
     full_old,
     full_new,
     images=None,
   )
-  final_system_message = studio.llm_wrapper.pipeline.system_prompt
-  if full_wrapped_context:
-    final_system_message += "\n\n" + full_wrapped_context
 
   lines.append("--- 满配 PromptPlan (JSON) ---")
   lines.append(json.dumps(_plan_summary(full_plan), ensure_ascii=False, indent=2))
-  lines.append("--- RoutePromptComposer 侧袋 ---")
-  lines.append(f"rag_query: {full_bundle.rag_query!r}")
-  lines.append(f"memory_input: {full_bundle.memory_input!r}")
+  lines.append("--- RetrievedContextBundle ---")
+  lines.append(json.dumps(full_retrieved_context.debug_view(), ensure_ascii=False, indent=2))
   lines.append("--- 完整 user prompt ---\n")
-  lines.append(full_prompt or "(空)")
-  lines.append("\n--- 满配 extra_context 原文 ---\n")
-  lines.append(full_extra_context or "(空)")
-  lines.append("\n--- 满配 wrapped extra_context ---\n")
+  lines.append(full_composed_prompt.invocation.user_prompt or "(空)")
+  lines.append("\n--- 满配 trusted_context 原文 ---\n")
+  lines.append(full_trusted_context or "(空)")
+  lines.append("\n--- 满配 untrusted_context 原文 ---\n")
+  lines.append(full_untrusted_context or "(空)")
+  lines.append("\n--- 满配 wrapped untrusted_context ---\n")
   lines.append(full_wrapped_context or "(空)")
-  lines.append("\n--- 完整 SystemMessage（固定 System Prompt + wrapped extra_context） ---\n")
+  lines.append("\n--- 完整 SystemMessage（固定 System Prompt + trusted/untrusted 注入） ---\n")
   lines.append(final_system_message)
 
   output_path.parent.mkdir(parents=True, exist_ok=True)

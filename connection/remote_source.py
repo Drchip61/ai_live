@@ -1,13 +1,12 @@
 """
 远程数据源
-以 Pull 模式定时从上游服务器拉取截图和弹幕，替代 VideoPlayer 的角色。
+以 Pull 模式定时从上游服务器拉取截图；弹幕轮询仅保留兼容路径。
 实现与 VideoPlayer 相同的回调接口，可直接传入 StreamingStudio(video_player=...)。
 """
 
 import asyncio
 import base64
 import logging
-from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -17,36 +16,15 @@ import numpy as np
 
 from video_source.frame_extractor import VideoFrame
 from video_source.danmaku_parser import Danmaku
-from streaming_studio.models import Comment, EventType
+from streaming_studio.models import Comment
+from .danmaku_push_host import (
+  RemoteDanmakuItem,
+  item_fingerprint,
+  parse_snapshot_payload,
+  remote_item_to_comment,
+)
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class RemoteDanmakuItem:
-  """
-  上游 JSON 事件条目的中间表示
-
-  Attributes:
-    content: 弹幕/SC 文本（礼物/入场事件为空字符串）
-    user_id: 用户标识
-    nickname: 用户昵称
-    timestamp: UNIX 时间戳
-    event_type: 事件类型 (danmaku/gift/super_chat/guard_buy/entry)
-    gift_name: 礼物名称
-    gift_num: 礼物数量或月数
-    price: SC 金额
-    guard_level: 舰长等级 (0=无, 1=舰长, 2=提督, 3=总督)
-  """
-  content: str
-  user_id: str = ""
-  nickname: str = ""
-  timestamp: float = 0.0
-  event_type: str = "danmaku"
-  gift_name: str = ""
-  gift_num: int = 0
-  price: float = 0.0
-  guard_level: int = 0
 
 
 class RemoteSource:
@@ -313,27 +291,7 @@ class RemoteSource:
 
   def _item_to_comment(self, item: RemoteDanmakuItem) -> Comment:
     """将中间表示转换为 Comment（含事件类型元数据）"""
-    try:
-      event_type = EventType(item.event_type)
-    except ValueError:
-      event_type = EventType.DANMAKU
-
-    ts = datetime.fromtimestamp(item.timestamp) if item.timestamp > 0 else datetime.now()
-    raw_uid = item.user_id
-    uid = raw_uid if raw_uid and raw_uid != "0" else (item.nickname or "anonymous")
-
-    return Comment(
-      user_id=uid,
-      nickname=item.nickname or uid,
-      content=item.content,
-      timestamp=ts,
-      event_type=event_type,
-      gift_name=item.gift_name,
-      gift_num=item.gift_num,
-      price=item.price,
-      guard_level=item.guard_level,
-      priority=event_type in (EventType.SUPER_CHAT, EventType.GUARD_BUY),
-    )
+    return remote_item_to_comment(item)
 
   async def _danmaku_loop(self) -> None:
     backoff = self._danmaku_interval
@@ -353,7 +311,7 @@ class RemoteSource:
             self._danmaku_error_logged = False
 
           for item in items:
-            fingerprint = (item.user_id, item.content, item.timestamp)
+            fingerprint = item_fingerprint(item)
             if fingerprint in self._seen_danmaku:
               continue
 
@@ -434,64 +392,11 @@ class RemoteSource:
       logger.warning("弹幕响应解析错误: %s", e)
       return None
 
-    server_time = data.get("server_time", 0.0)
+    server_time = float(data.get("server_time", 0.0) or 0.0)
     if server_time > 0:
       self._danmaku_cursor = server_time
 
-    items: list[RemoteDanmakuItem] = []
-
-    for e in data.get("danmakus", []):
-      items.append(RemoteDanmakuItem(
-        content=e.get("content", ""),
-        user_id=e.get("user_id", ""),
-        nickname=e.get("nickname", ""),
-        timestamp=e.get("timestamp", 0.0),
-        event_type="danmaku",
-      ))
-
-    for e in data.get("notifications", []):
-      items.append(RemoteDanmakuItem(
-        content="",
-        user_id=str(e.get("uid", "")),
-        nickname=e.get("nickname", ""),
-        timestamp=e.get("timestamp", 0.0),
-        event_type="entry",
-      ))
-
-    for e in data.get("gifts", []):
-      items.append(RemoteDanmakuItem(
-        content="",
-        user_id=str(e.get("uid", "")),
-        nickname=e.get("nickname", ""),
-        timestamp=e.get("timestamp", 0.0),
-        event_type="gift",
-        gift_name=e.get("gift_name", ""),
-        gift_num=e.get("num", 1),
-        price=e.get("price", 0.0),
-      ))
-
-    for e in data.get("super_chats", []):
-      items.append(RemoteDanmakuItem(
-        content=e.get("message", ""),
-        user_id=str(e.get("uid", "")),
-        nickname=e.get("nickname", ""),
-        timestamp=e.get("timestamp", 0.0),
-        event_type="super_chat",
-        price=e.get("price", 0.0),
-      ))
-
-    for e in data.get("guard_buys", []):
-      items.append(RemoteDanmakuItem(
-        content="",
-        user_id=str(e.get("uid", "")),
-        nickname=e.get("nickname", ""),
-        timestamp=e.get("timestamp", 0.0),
-        event_type="guard_buy",
-        gift_name=e.get("gift_name", ""),
-        gift_num=e.get("num", 1),
-        guard_level=e.get("guard_level", 1),
-      ))
-
+    items, _ = parse_snapshot_payload(data)
     return items
 
   # ── 调试 ──
