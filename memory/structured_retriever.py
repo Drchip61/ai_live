@@ -7,6 +7,7 @@ structured 主检索器
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -522,8 +523,16 @@ class StructuredMemoryRetriever:
       identity_parts: list[str] = []
       if preferred_address:
         identity_parts.append(f"建议称呼={preferred_address}")
-      if names:
-        identity_parts.append("名字线索=" + "/".join(names[:2]))
+      clean_nicknames = self._clean_alias_list(nicknames)
+      clean_names = self._clean_alias_list(names)
+      all_aliases = list(dict.fromkeys(
+        alias for alias in (clean_nicknames + clean_names)
+        if alias != preferred_address and alias != record.viewer_id
+      ))
+      if all_aliases:
+        identity_parts.append("曾用名/别名=" + "/".join(all_aliases[:5]))
+      elif clean_names:
+        identity_parts.append("名字线索=" + "/".join(clean_names[:2]))
       occupation = identity.get("occupation", {}) or {}
       occupation_value = str(occupation.get("value", "")).strip() if isinstance(occupation, dict) else ""
       if occupation_value:
@@ -555,7 +564,7 @@ class StructuredMemoryRetriever:
         state_parts.append(f"被公开接住次数={public_ack_count}")
       elif publicly_acknowledged:
         state_parts.append("被公开接住过=是")
-      if last_dialogue_stop and not record.open_threads:
+      if last_dialogue_stop:
         state_parts.append(f"上次停在={last_dialogue_stop}")
       if state_parts:
         lines.append(f"{nickname} 的关系状态：" + "，".join(state_parts))
@@ -672,6 +681,124 @@ class StructuredMemoryRetriever:
       if lines:
         return lines
     return [entry.text for entry in self._corpus_store.list_enabled()[:self._config.corpus_top_k]]
+
+  @staticmethod
+  def _split_corpus_tags(value: object) -> tuple[str, ...]:
+    text = str(value or "").strip()
+    if not text:
+      return ()
+    return tuple(part.strip() for part in text.split(",") if part.strip())
+
+  def retrieve_corpus_lines(
+    self,
+    query: Union[str, list[str]] = "",
+    style_tag: str = "",
+    scene_tag: str = "",
+    top_k: Optional[int] = None,
+  ) -> list[str]:
+    if self._corpus_store is None:
+      return []
+
+    limit = max(1, int(top_k or self._config.corpus_top_k or 1))
+    query_text = self._normalize_query(query)
+    search_query = query_text or " ".join(
+      part for part in (style_tag, scene_tag) if str(part or "").strip()
+    ).strip() or "语料参考"
+    candidate_k = max(limit * 4, limit)
+
+    ranked: list[tuple[int, int, float, float, str]] = []
+    seen: set[str] = set()
+    for doc, score in self._corpus_index.search(search_query, top_k=candidate_k):
+      if self._score_too_far(score):
+        continue
+      meta = doc.metadata or {}
+      text = str(meta.get("display_text", "")).strip() or str(doc.page_content or "").strip()
+      if not text or text in seen:
+        continue
+      style_tags = self._split_corpus_tags(meta.get("style_tags", ""))
+      scene_tags = self._split_corpus_tags(meta.get("scene_tags", ""))
+      style_hit = int(bool(style_tag) and style_tag in style_tags)
+      scene_hit = int(bool(scene_tag) and scene_tag in scene_tags)
+      if style_tag and scene_tag:
+        if not (style_hit or scene_hit):
+          continue
+      elif style_tag and not style_hit:
+        continue
+      elif scene_tag and not scene_hit:
+        continue
+      seen.add(text)
+      ranked.append((
+        style_hit + scene_hit,
+        1 if (style_hit and scene_hit) else 0,
+        _safe_float(meta.get("quality_score"), default=0.5),
+        float(score or 0.0),
+        text,
+      ))
+
+    if len(ranked) < limit:
+      fallback_entries: list[CorpusEntry] = []
+      if style_tag or scene_tag:
+        fallback_entries.extend(
+          self._corpus_store.get_by_tags(
+            style_tag=style_tag,
+            scene_tag=scene_tag,
+            limit=limit,
+          )
+        )
+        if not fallback_entries and style_tag and scene_tag:
+          fallback_entries.extend(
+            self._corpus_store.get_by_tags(style_tag=style_tag, limit=limit)
+          )
+          fallback_entries.extend(
+            self._corpus_store.get_by_tags(scene_tag=scene_tag, limit=limit)
+          )
+      elif not query_text:
+        fallback_entries.extend(self._corpus_store.list_enabled()[:limit])
+
+      for entry in fallback_entries:
+        text = str(entry.text or "").strip()
+        if not text or text in seen:
+          continue
+        style_hit = int(bool(style_tag) and style_tag in entry.style_tags)
+        scene_hit = int(bool(scene_tag) and scene_tag in entry.scene_tags)
+        seen.add(text)
+        ranked.append((
+          style_hit + scene_hit,
+          1 if (style_hit and scene_hit) else 0,
+          float(entry.quality_score or 0.5),
+          0.0,
+          text,
+        ))
+
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], item[3], item[4]))
+    return [text for *_ignored, text in ranked[:limit]]
+
+  def retrieve_corpus_context(
+    self,
+    query: Union[str, list[str]] = "",
+    style_tag: str = "",
+    scene_tag: str = "",
+    top_k: Optional[int] = None,
+  ) -> str:
+    lines = self.retrieve_corpus_lines(
+      query=query,
+      style_tag=style_tag,
+      scene_tag=scene_tag,
+      top_k=top_k,
+    )
+    if not lines:
+      return ""
+    hints = []
+    if style_tag:
+      hints.append(f"风格={style_tag}")
+    if scene_tag:
+      hints.append(f"场景={scene_tag}")
+    guidance = "借鉴以下语料的表达方式、节奏或梗感，用你自己的语气自然表达，不要直接照抄。"
+    if hints:
+      guidance += f"（{' | '.join(hints)}）"
+    return guidance + "\n" + "\n".join(
+      f"{idx}. {line}" for idx, line in enumerate(lines, 1)
+    )
 
   def _build_knowledge_lines(self, query_text: str) -> list[str]:
     if self._external_knowledge_store is None:
@@ -850,6 +977,30 @@ class StructuredMemoryRetriever:
         result.append(f"{topic}（{severity}）")
       else:
         result.append(topic)
+    return result
+
+  _QUESTION_FRAGMENT_RE = re.compile(
+    r"^(什么来着|叫啥|谁来着|啥来着|哪个来着|怎么称呼|叫什么|你叫啥|咋称呼|谁啊|是谁)$"
+  )
+  _SERIALIZED_DICT_RE = re.compile(r"^\{.*\}$")
+
+  @classmethod
+  def _clean_alias_list(cls, raw: tuple[str, ...]) -> list[str]:
+    """过滤脏数据和问句片段，只保留有效的名字/昵称。"""
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+      text = str(item or "").strip()
+      if not text or text in seen:
+        continue
+      if cls._SERIALIZED_DICT_RE.match(text):
+        continue
+      if cls._QUESTION_FRAGMENT_RE.match(text):
+        continue
+      if len(text) > 30:
+        continue
+      seen.add(text)
+      result.append(text)
     return result
 
   @staticmethod

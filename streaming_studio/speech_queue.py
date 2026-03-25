@@ -51,7 +51,9 @@ class SpeechItem:
 
   @property
   def is_last_segment(self) -> bool:
-    return self.segment_index >= max(self.segment_total - 1, 0)
+    if self.segment_total <= 0:
+      return False
+    return self.segment_index >= (self.segment_total - 1)
 
 
 class SpeechQueue:
@@ -105,7 +107,7 @@ class SpeechQueue:
           queued for queued in self._items
           if queued.response_id != item.response_id
         ] or list(self._items)
-        worst = max(candidate_pool, key=lambda i: (i.priority, i.generated_at))
+        worst = max(candidate_pool, key=lambda i: (i.priority, -i.generated_at))
         if worst.priority >= item.priority:
           self._items.remove(worst)
           evicted.append(worst)
@@ -135,11 +137,37 @@ class SpeechQueue:
           self._total_played += 1
           self._space_available.set()
           return item
+        print(
+          f"[SpeechQueue] 过期丢弃: {item.source} "
+          f"«{str(item.segment.get('text_zh', ''))[:20]}» "
+          f"age={item.age:.1f}s ttl={item.ttl}s"
+        )
         self._total_expired += 1
 
       self._new_item.clear()
       self._space_available.set()
       return None
+
+  async def touch_response(self, response_id: str) -> int:
+    """刷新同一回复中剩余句子的 generated_at，防止排队等兄弟句播放期间 TTL 过期。"""
+    if not response_id:
+      return 0
+    async with self._lock:
+      count = 0
+      now = time.monotonic()
+      for item in self._items:
+        if item.response_id == response_id:
+          item.generated_at = now
+          count += 1
+      return count
+
+  async def touch_all_pending(self) -> int:
+    """刷新所有待播项的 generated_at，防止连续播放期间后续项因排队超时被丢弃。"""
+    async with self._lock:
+      now = time.monotonic()
+      for item in self._items:
+        item.generated_at = now
+      return len(self._items)
 
   async def flush_source(self, source: str) -> list[SpeechItem]:
     """清空指定 source 的所有待播条目。"""
@@ -165,6 +193,17 @@ class SpeechQueue:
         if not item.expired:
           return item
       return None
+
+  async def has_response(self, response_id: str) -> bool:
+    """检查队列中是否还有指定 response_id 的待播条目。"""
+    normalized = str(response_id or "").strip()
+    if not normalized:
+      return False
+    async with self._lock:
+      return any(
+        item.response_id == normalized and not item.expired
+        for item in self._items
+      )
 
   async def wait_for_item(self) -> None:
     """阻塞等待直到有新条目入队。"""

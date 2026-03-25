@@ -251,8 +251,12 @@ class SpeechBroadcaster:
     except RuntimeError:
       self._playback_done.set()
 
+  def cancel_current_playback(self) -> None:
+    """强制解除 wait_for_playback 阻塞（高优先级弹幕抢占低优先级播放时使用）。"""
+    self._playback_done.set()
+
   async def _handle_speech_done(self, request: web.Request) -> web.Response:
-    """处理 TTS 完播回调（任何合法请求都解除阻塞）"""
+    """处理 TTS 完播回调。严格匹配 batch_id，忽略已被抢占的过期回调。"""
     try:
       data = await request.json()
     except Exception as e:
@@ -264,10 +268,15 @@ class SpeechBroadcaster:
     batch_id = data.get("batch_id")
     status = data.get("status", "done")
 
+    if batch_id and self._pending_batch_id and batch_id != self._pending_batch_id:
+      print(
+        f"[语音广播] 忽略过期回调 batch={batch_id[:8]}… "
+        f"(当前等待 {self._pending_batch_id[:8]}…)"
+      )
+      return web.Response(text="ok")
+
     if batch_id and batch_id == self._pending_batch_id:
       print(f"[语音广播] 收到完播回调 batch={batch_id[:8]}… status={status}")
-    elif self._pending_batch_id:
-      print(f"[语音广播] 收到完播回调 (batch_id 不匹配，仍放行) status={status}")
     else:
       print(f"[语音广播] 收到就绪信号 status={status}")
 

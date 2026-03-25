@@ -118,17 +118,20 @@ class StreamingPipeline:
     self,
     model: BaseChatModel,
     system_prompt: str,
-    max_history: int = 20
+    max_history: int = 20,
+    vlm_model: Optional[BaseChatModel] = None,
   ):
     """
     初始化管道
 
     Args:
-      model: LangChain 模型实例
+      model: LangChain 模型实例（纯文本对话）
       system_prompt: 系统提示词
       max_history: 保留的最大历史消息数（对话轮数 * 2）
+      vlm_model: 多模态模型实例（有图片时使用，为 None 则复用 model）
     """
     self.model = model
+    self._vlm_model = vlm_model or model
     self.system_prompt = system_prompt
     self.max_history = max_history
 
@@ -372,7 +375,7 @@ class StreamingPipeline:
         "untrusted_context": untrusted_context,
         "images": images,
       })
-      result = self.model.invoke(messages)
+      result = self._vlm_model.invoke(messages)
       output = self._output_parser.invoke(result)
       for processor in self._postprocessors:
         output = processor(output)
@@ -416,7 +419,7 @@ class StreamingPipeline:
         "untrusted_context": untrusted_context,
         "images": images,
       })
-      result = await self.model.ainvoke(messages)
+      result = await self._vlm_model.ainvoke(messages)
       output = self._output_parser.invoke(result)
       for processor in self._postprocessors:
         output = processor(output)
@@ -462,7 +465,7 @@ class StreamingPipeline:
         "untrusted_context": untrusted_context,
         "images": images,
       })
-      async for chunk in self.model.astream(messages):
+      async for chunk in self._vlm_model.astream(messages):
         yield self._output_parser.invoke(chunk)
       return
 

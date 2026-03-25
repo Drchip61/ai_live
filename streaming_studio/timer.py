@@ -17,8 +17,19 @@
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+@dataclass
+class StageTiming:
+  """单个阶段的详细耗时记录"""
+  name: str
+  duration_ms: float
+  started_at: datetime
+  ended_at: datetime
 
 
 @dataclass
@@ -29,6 +40,9 @@ class RoundTimings:
   total_ms: float
   timestamp: datetime
   skipped: bool = False
+  started_at: Optional[datetime] = None
+  ended_at: Optional[datetime] = None
+  stage_details: list[StageTiming] = field(default_factory=list)
 
   def format_summary(self) -> str:
     """格式化为单行摘要"""
@@ -54,10 +68,14 @@ class PipelineTimer:
 
   def __init__(self, history_maxlen: int = 100):
     self._round_id: int = 0
+    self._last_finished_round_id: int = 0
     self._start: float = 0
     self._stage_start: float = 0
+    self._round_started_at: Optional[datetime] = None
+    self._stage_started_at: Optional[datetime] = None
     self._current_stage: str = ""
     self._stages: list[tuple[str, float]] = []
+    self._stage_details: list[StageTiming] = []
     self._history: deque[RoundTimings] = deque(maxlen=history_maxlen)
 
   def start_round(self) -> None:
@@ -65,35 +83,68 @@ class PipelineTimer:
     self._round_id += 1
     self._start = time.monotonic()
     self._stage_start = self._start
+    now = datetime.now(_BEIJING_TZ)
+    self._round_started_at = now
+    self._stage_started_at = now
     self._current_stage = ""
     self._stages = []
+    self._stage_details = []
 
   def mark(self, stage_name: str) -> None:
     """结束当前阶段并开始新阶段"""
     now = time.monotonic()
+    now_wall = datetime.now(_BEIJING_TZ)
     if self._current_stage:
       duration_ms = (now - self._stage_start) * 1000
       self._stages.append((self._current_stage, duration_ms))
+      self._stage_details.append(StageTiming(
+        name=self._current_stage,
+        duration_ms=duration_ms,
+        started_at=self._stage_started_at or now_wall,
+        ended_at=now_wall,
+      ))
     self._stage_start = now
+    self._stage_started_at = now_wall
     self._current_stage = stage_name
 
   def finish(self, skipped: bool = False) -> RoundTimings:
     """结束本轮计时，返回完整耗时记录"""
+    if (
+      self._last_finished_round_id == self._round_id
+      and self._current_stage == ""
+      and not self._stages
+      and self.last is not None
+    ):
+      return self.last
+
     now = time.monotonic()
+    now_wall = datetime.now(_BEIJING_TZ)
     if self._current_stage:
       duration_ms = (now - self._stage_start) * 1000
       self._stages.append((self._current_stage, duration_ms))
+      self._stage_details.append(StageTiming(
+        name=self._current_stage,
+        duration_ms=duration_ms,
+        started_at=self._stage_started_at or now_wall,
+        ended_at=now_wall,
+      ))
     total_ms = (now - self._start) * 1000
     timings = RoundTimings(
       round_id=self._round_id,
       stages=list(self._stages),
       total_ms=total_ms,
-      timestamp=datetime.now(),
+      timestamp=now_wall,
       skipped=skipped,
+      started_at=self._round_started_at,
+      ended_at=now_wall,
+      stage_details=list(self._stage_details),
     )
     self._history.append(timings)
+    self._last_finished_round_id = self._round_id
     self._current_stage = ""
     self._stages = []
+    self._stage_details = []
+    self._stage_started_at = None
     return timings
 
   @property

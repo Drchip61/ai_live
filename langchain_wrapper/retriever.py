@@ -37,11 +37,11 @@ _QUERY_NOISE_PATTERNS = (
   re.compile(r"^(你好|hello|hi|嗨|晚上好|早上好|下午好|主播好)$", re.I),
 )
 _QUERY_CONTINUATION_PATTERNS = (
-  re.compile(r"(上次|之前|刚才|继续|后来|后面|还记得|记不记得|你说过|你提过|你答应|聊到哪|说到哪|上次说到哪|上次聊到哪|认得这个号|认出我)"),
+  re.compile(r"(上次|之前|刚才|继续|后来|后面|还记得|记不记得|不记得|你忘了|你不记得|我说了|我说过|我跟你说过|聊到哪|说到哪|上次说到哪|上次聊到哪|认得这个号|认出我|你说过|你提过|你答应)"),
   re.compile(r"^(那个|这个|那首|那部|那段|那局|那把|那位|那条)(呢|啊|呀|来着|怎么样|咋样|怎么说|后来呢)?$"),
 )
 _QUERY_RELATION_PATTERNS = (
-  re.compile(r"(还记得我|记得我吗|我是谁|老粉|回来了|好久不见|上次聊|你说过|你答应|还记得这事|认识我不|你认识我不|认得我吗|还认得这个号吗|认出我没|还认得我吗|还记得我姓|记得我姓)"),
+  re.compile(r"(还记得我|记得我吗|我是谁|老粉|回来了|好久不见|上次聊|你说过|你答应|还记得这事|认识我不|你认识我不|认得我吗|还认得这个号吗|认出我没|还认得我吗|还记得我姓|记得我姓|不记得我|忘了我|你忘了吧)"),
 )
 _ALNUM_QUERY_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+#-]{1,20}")
 _CJK_QUERY_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]{2,4}")
@@ -222,20 +222,39 @@ class RetrieverResolver:
           title="【参考知识】",
         ))
 
-    if (plan.corpus_style or plan.corpus_scene) and self._style_bank is not None:
-      style_text = await asyncio.to_thread(
-        self._style_bank.retrieve_targeted,
-        query=resolved_query or "general",
-        style_tag=plan.corpus_style,
-        scene_tag=plan.corpus_scene,
-      )
-      if style_text:
+    if plan.corpus_style or plan.corpus_scene:
+      query_used = resolved_query or "general"
+      corpus_text = ""
+      corpus_getter = getattr(self._memory, "get_corpus_context", None)
+      if callable(corpus_getter):
+        corpus_text = await asyncio.to_thread(
+          corpus_getter,
+          query_used,
+          plan.corpus_style,
+          plan.corpus_scene,
+        )
+      if corpus_text:
         add_block(ContextBlock(
-          source="style_bank",
+          source="corpus_store",
           trust="trusted",
-          text=style_text,
-          query_used=resolved_query or "general",
+          title="【风格灵感】",
+          text=corpus_text,
+          query_used=query_used,
         ))
+      elif self._style_bank is not None:
+        style_text = await asyncio.to_thread(
+          self._style_bank.retrieve_targeted,
+          query=query_used,
+          style_tag=plan.corpus_style,
+          scene_tag=plan.corpus_scene,
+        )
+        if style_text:
+          add_block(ContextBlock(
+            source="style_bank",
+            trust="trusted",
+            text=style_text,
+            query_used=query_used,
+          ))
 
     if self._meme_manager is not None:
       meme_text = self._meme_manager.to_prompt()

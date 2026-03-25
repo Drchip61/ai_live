@@ -71,7 +71,7 @@ class SpeechQueueConfig:
   paid_event_ttl: float = 120.0
   """付费事件（SC / 上舰 / >=5元礼物）的生存时间（秒）"""
 
-  danmaku_ttl: float = 15.0
+  danmaku_ttl: float = 25.0
   """普通弹幕回复的生存时间（秒）"""
 
   event_low_ttl: float = 20.0

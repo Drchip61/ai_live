@@ -12,6 +12,7 @@ from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime
 import logging
+import time
 from typing import Any, Optional
 
 from aiohttp import web
@@ -250,6 +251,7 @@ class DanmakuPushHost:
       self._seen.discard(stale)
 
   async def _handle_push(self, request: web.Request) -> web.Response:
+    started = time.monotonic()
     self._request_count += 1
     request_index = self._request_count
     try:
@@ -294,17 +296,20 @@ class DanmakuPushHost:
     if raw_total == 0 and accepted_total == 0 and duplicate_total == 0:
       self._empty_request_count += 1
     else:
+      handle_ms = round((time.monotonic() - started) * 1000, 1)
       print(
-        "[弹幕Push] req#%d raw=%s parsed=%s accepted=%s dup=%s"
+        "[弹幕Push] req#%d raw=%s parsed=%s accepted=%s dup=%s handle=%.1fms"
         % (
           request_index,
           raw_counts,
           dict(parsed_counts),
           dict(accepted_counts),
           dict(duplicate_counts),
+          handle_ms,
         )
       )
 
+    handle_ms = round((time.monotonic() - started) * 1000, 1)
     ack = {
       "ok": True,
       "request_index": request_index,
@@ -316,6 +321,7 @@ class DanmakuPushHost:
       "parsed_counts": dict(parsed_counts),
       "accepted_counts": dict(accepted_counts),
       "duplicate_counts": dict(duplicate_counts),
+      "handle_ms": handle_ms,
       "totals": {
         "requests": self._request_count,
         "accepted": self._accepted_count,

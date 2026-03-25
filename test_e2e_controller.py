@@ -1816,16 +1816,21 @@ def test_render_prompt_trims_noncritical_lists():
 
 
 # ================================================================
-# 7. 风格语料与上下文注入（4 项）
+# 7. 风格语料与上下文注入（5 项）
 # ================================================================
 
-def test_style_bank_targeted_retrieval():
-  """STY-1: plan.corpus_style 触发 retrieve_targeted"""
+def test_corpus_store_targeted_retrieval_preferred_over_style_bank():
+  """STY-1: plan.corpus_style 优先命中 corpus_store trusted block"""
+  mock_memory = MagicMock()
+  mock_memory.get_corpus_context.return_value = (
+    "借鉴以下语料的表达方式、节奏或梗感，用你自己的语气自然表达，不要直接照抄。\n"
+    "1. 这句梗就很适合接在后面。"
+  )
   mock_style_bank = MagicMock()
-  mock_style_bank.retrieve_targeted.return_value = "【语料示例】嘻嘻~才不告诉你呢"
+  mock_style_bank.retrieve_targeted.return_value = "【语料示例】fallback"
 
   wrapper = LLMWrapper.__new__(LLMWrapper)
-  wrapper._memory = None
+  wrapper._memory = mock_memory
   wrapper._emotion = None
   wrapper._affection = None
   wrapper._meme_manager = None
@@ -1834,15 +1839,50 @@ def test_style_bank_targeted_retrieval():
 
   plan = PromptPlan(
     memory_strategy="minimal",
-    corpus_style="tsundere",
-    corpus_scene="gaming",
+    corpus_style="搞笑",
+    corpus_scene="互动",
   )
-  ctx = asyncio.run(wrapper._build_extra_context_from_plan(plan, rag_query="测试"))
+  bundle = asyncio.run(wrapper._retrieve_context_from_plan(plan, rag_query="测试"))
+  debug_view = bundle.debug_view()
+  ctx = bundle.render_trusted_text()
   trace("plan", f"corpus_style={plan.corpus_style}, corpus_scene={plan.corpus_scene}")
   trace("extra_context", ctx)
-  check("语料注入含内容", "嘻嘻" in ctx)
+  check("语料注入含 corpus_store 内容", "这句梗" in ctx)
+  check("trusted source 标记为 corpus_store", "corpus_store" in debug_view["trusted_sources"], f"debug={debug_view}")
+  mock_memory.get_corpus_context.assert_called_once_with(
+    "测试", "搞笑", "互动",
+  )
+  check("style_bank 未被调用", mock_style_bank.retrieve_targeted.call_count == 0, str(mock_style_bank.retrieve_targeted.call_count))
+
+
+def test_style_bank_fallback_when_corpus_store_empty():
+  """STY-1B: corpus_store 空结果时回退到 StyleBank"""
+  mock_memory = MagicMock()
+  mock_memory.get_corpus_context.return_value = ""
+  mock_style_bank = MagicMock()
+  mock_style_bank.retrieve_targeted.return_value = "【语料示例】嘻嘻~才不告诉你呢"
+
+  wrapper = LLMWrapper.__new__(LLMWrapper)
+  wrapper._memory = mock_memory
+  wrapper._emotion = None
+  wrapper._affection = None
+  wrapper._meme_manager = None
+  wrapper._style_bank = mock_style_bank
+  wrapper._state_card = None
+
+  plan = PromptPlan(
+    memory_strategy="minimal",
+    corpus_style="搞笑",
+    corpus_scene="互动",
+  )
+  bundle = asyncio.run(wrapper._retrieve_context_from_plan(plan, rag_query="测试"))
+  debug_view = bundle.debug_view()
+  ctx = bundle.render_trusted_text()
+  trace("extra_context", ctx)
+  check("fallback 时仍有 StyleBank 内容", "嘻嘻" in ctx)
+  check("trusted source 回退到 style_bank", "style_bank" in debug_view["trusted_sources"], f"debug={debug_view}")
   mock_style_bank.retrieve_targeted.assert_called_once_with(
-    query="测试", style_tag="tsundere", scene_tag="gaming",
+    query="测试", style_tag="搞笑", scene_tag="互动",
   )
 
 
@@ -3266,15 +3306,15 @@ def test_event_route_context_stays_lightweight():
   check("gift 路由不读取 structured", mock_memory.compile_structured_context.call_count == 0)
 
 
-def test_runtime_catalog_prefers_style_bank_truth():
-  """MEMORY-5: controller runtime catalog 优先对齐 StyleBank 真源"""
+def test_runtime_catalog_prefers_corpus_store_truth():
+  """MEMORY-5: controller runtime catalog 优先对齐 corpus_store 真源"""
   from streaming_studio import StreamingStudio
 
   mock_memory = MagicMock()
   mock_memory.list_persona_sections.return_value = ["gaming_hardcore"]
   mock_memory.list_knowledge_topics.return_value = ["Neuro-sama"]
-  mock_memory.list_corpus_style_tags.return_value = ["legacy_style"]
-  mock_memory.list_corpus_scene_tags.return_value = ["legacy_scene"]
+  mock_memory.list_corpus_style_tags.return_value = ["搞笑", "感性"]
+  mock_memory.list_corpus_scene_tags.return_value = ["互动", "冷场"]
 
   mock_style_bank = MagicMock()
   mock_style_bank.list_categories.return_value = ["comment_reaction", "ice_breaker"]
@@ -3287,8 +3327,8 @@ def test_runtime_catalog_prefers_style_bank_truth():
 
   StreamingStudio._init_controller_catalog(studio)
   catalog = studio._controller_resource_catalog
-  check("catalog 使用 StyleBank categories", catalog.corpus_styles == ("comment_reaction", "ice_breaker"))
-  check("catalog 使用 StyleBank situations", catalog.corpus_scenes == ("react_comment", "any"))
+  check("catalog 使用 corpus_store styles", catalog.corpus_styles == ("搞笑", "感性"))
+  check("catalog 使用 corpus_store scenes", catalog.corpus_scenes == ("互动", "冷场"))
   check("catalog 仍保留 persona", catalog.persona_sections == ("gaming_hardcore",))
   check("catalog 仍保留 knowledge", catalog.knowledge_topics == ("Neuro-sama",))
 
@@ -3432,7 +3472,7 @@ if __name__ == "__main__":
       test_persona_sections_retrieval,
       test_knowledge_topics_retrieval,
       test_event_route_context_stays_lightweight,
-      test_runtime_catalog_prefers_style_bank_truth,
+      test_runtime_catalog_prefers_corpus_store_truth,
       test_model_invocation_thin_integration,
       test_model_invocation_path_preserves_injection_guard,
     ]),
@@ -3481,7 +3521,8 @@ if __name__ == "__main__":
       test_render_prompt_trims_noncritical_lists,
     ]),
     ("7. 风格语料与上下文注入", [
-      test_style_bank_targeted_retrieval,
+      test_corpus_store_targeted_retrieval_preferred_over_style_bank,
+      test_style_bank_fallback_when_corpus_store_empty,
       test_state_card_always_injected,
       test_extra_instructions_passthrough,
       test_prompt_composer_forces_engaging_question_from_extra_instructions,

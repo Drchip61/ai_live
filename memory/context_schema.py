@@ -39,6 +39,24 @@ _PLACEHOLDER_PREFERRED_ADDRESSES = frozenset((
   "null",
   "n/a",
 ))
+_QUESTION_FRAGMENT_ADDRESSES = frozenset((
+  "什么来着",
+  "叫啥",
+  "谁来着",
+  "啥来着",
+  "哪个来着",
+  "怎么称呼",
+  "叫什么",
+  "你叫啥",
+  "咋称呼",
+  "谁啊",
+  "是谁",
+  "什么名字",
+  "啥名字",
+  "什么名",
+  "叫啥来着",
+  "叫什么来着",
+))
 _REQUESTED_ADDRESS_PATTERNS = (
   re.compile(
     r"(?:改称呼为|改叫我|叫我|喊我|称呼我为|以后(?:就)?(?:叫|喊)我|之后(?:就)?(?:叫|喊)我)"
@@ -57,6 +75,8 @@ def normalize_preferred_address(value: Any) -> str:
   if not text:
     return ""
   if text in _PLACEHOLDER_PREFERRED_ADDRESSES or text.lower() in _PLACEHOLDER_PREFERRED_ADDRESSES:
+    return ""
+  if text in _QUESTION_FRAGMENT_ADDRESSES:
     return ""
   return text
 

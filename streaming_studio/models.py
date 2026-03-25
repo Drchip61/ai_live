@@ -10,6 +10,26 @@ from enum import Enum
 from typing import Any, Optional
 
 
+def shorten_nickname(nickname: str, max_len: int = 8) -> str:
+  """
+  缩短过长昵称，避免主播朗读一长串字母或字符。
+
+  规则：
+  - 纯中文/日文/韩文：超过 max_len 个字符截断加"…"
+  - 含字母/数字为主：取前 4 个可读字符加"同学"作为代称
+  - 短昵称原样返回
+  """
+  name = (nickname or "").strip()
+  if not name:
+    return "观众"
+  if len(name) <= max_len:
+    return name
+  cjk_count = sum(1 for ch in name if '\u4e00' <= ch <= '\u9fff' or '\u3040' <= ch <= '\u30ff' or '\uac00' <= ch <= '\ud7af')
+  if cjk_count > len(name) * 0.5:
+    return name[:max_len] + "…"
+  return name[:4] + "同学"
+
+
 class EventType(str, Enum):
   """弹幕/事件类型"""
   DANMAKU = "danmaku"

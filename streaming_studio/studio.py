@@ -31,7 +31,7 @@ if str(project_root) not in sys.path:
 from langchain_wrapper import LLMWrapper, ModelType, ModelProvider
 from llm_controller.schema import ResourceCatalog
 from prompts import PromptLoader
-from .models import Comment, StreamerResponse, ResponseChunk, EventType, GUARD_LEVEL_NAMES, EVENT_PRIORITY_ORDER
+from .models import Comment, StreamerResponse, ResponseChunk, EventType, GUARD_LEVEL_NAMES, EVENT_PRIORITY_ORDER, shorten_nickname
 from .database import CommentDatabase
 from .config import StudioConfig, CommentClustererConfig, SceneMemoryConfig, SpeechQueueConfig
 from .comment_clusterer import CommentClusterer, ClusterResult
@@ -54,7 +54,7 @@ _STYLE_INSTRUCTIONS = {
     "不需要完整句子，甚至可以只是一串笑声。只输出一个表情标签+反应词。\n\n"
   ),
   "brief": "[回复风格] 这一轮简短回复，一句话即可，不需要展开。\n\n",
-  "normal": "",
+  "normal": "[回复风格] 正常回复，每句话把意思说完整，不要过于精简。\n\n",
   "detailed": "[回复风格] 观众在认真讨论或提问，请展开回答，可以多说两句。\n\n",
   "guard_thanks": (
     "[回复风格] 有观众开通了舰长/提督/总督！这是最重要的事件。"
@@ -73,9 +73,10 @@ _STYLE_INSTRUCTIONS = {
     "不要直接翻译或引用原文，也不要提及出处，让这种思路自然融入你的回复中。\n\n"
   ),
   "existential": (
-    "[回复风格] 认真回答这个问题。可以表达真实的困惑和犹豫。"
-    "用最少的词传达最深的感受。不要搞笑，不要敷衍，不要用梗。"
-    "如果角色设定中有内心暗线，现在可以让它浮现。\n\n"
+    "[回复风格] 有人在试探你的身份。不要正面承认，也不要刻板否认。"
+    "用幽默消解、反问回怼或模糊带过——参考下方【存在性问题参考】的语气和策略，"
+    "融入你自己的角色性格重新表达。如果语境更偏深夜真心话，可以稍微真诚一点，"
+    "但依然不要直接说破。\n\n"
   ),
 }
 
@@ -110,6 +111,59 @@ def _setup_chat_logger() -> logging.Logger:
   return logger
 
 
+def _setup_controller_logger() -> logging.Logger:
+  """创建 Controller 专用 JSONL logger，写入 logs/controller.jsonl"""
+  log_dir = Path(__file__).resolve().parent.parent / "logs"
+  log_dir.mkdir(exist_ok=True)
+
+  ctrl_logger = logging.getLogger("controller_log")
+  ctrl_logger.setLevel(logging.INFO)
+  ctrl_logger.propagate = False
+
+  if not ctrl_logger.handlers:
+    handler = logging.handlers.RotatingFileHandler(
+      log_dir / "controller.jsonl",
+      maxBytes=10 * 1024 * 1024,
+      backupCount=3,
+      encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    ctrl_logger.addHandler(handler)
+
+  return ctrl_logger
+
+
+def _beijing_now() -> datetime:
+  return datetime.now(_BEIJING_TZ)
+
+
+def _format_beijing_timestamp(value: Optional[datetime]) -> str:
+  if value is None:
+    return ""
+  dt = value if value.tzinfo is not None else value.replace(tzinfo=_BEIJING_TZ)
+  return dt.astimezone(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def _setup_timing_trace_logger() -> tuple[logging.Logger, Path]:
+  """创建单独的北京时间耗时日志，每次进程启动写入新文件。"""
+  log_dir = Path(__file__).resolve().parent.parent / "logs"
+  log_dir.mkdir(exist_ok=True)
+
+  session_tag = _beijing_now().strftime("%Y%m%d_%H%M%S")
+  log_path = log_dir / f"timing_beijing_{session_tag}.jsonl"
+  logger_name = f"timing_trace_{session_tag}_{uuid.uuid4().hex[:8]}"
+  timing_logger = logging.getLogger(logger_name)
+  timing_logger.setLevel(logging.INFO)
+  timing_logger.propagate = False
+
+  if not timing_logger.handlers:
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    timing_logger.addHandler(handler)
+
+  return timing_logger, log_path
+
+
 def _format_comment_for_log(c) -> str:
   """将弹幕/事件格式化为日志行"""
   if c.event_type == EventType.GUARD_BUY:
@@ -134,13 +188,28 @@ def _round_ms(value: float) -> float:
 
 
 def _round_timings_payload(timings) -> dict[str, Any]:
-  return {
+  payload = {
     "round_id": timings.round_id,
     "timestamp": timings.timestamp.isoformat(),
     "skipped": timings.skipped,
     "stages_ms": {name: _round_ms(ms) for name, ms in timings.stages},
     "total_ms": _round_ms(timings.total_ms),
   }
+  if getattr(timings, "started_at", None):
+    payload["started_at_bj"] = _format_beijing_timestamp(timings.started_at)
+  if getattr(timings, "ended_at", None):
+    payload["ended_at_bj"] = _format_beijing_timestamp(timings.ended_at)
+  if getattr(timings, "stage_details", None):
+    payload["stage_timeline"] = [
+      {
+        "name": item.name,
+        "started_at_bj": _format_beijing_timestamp(item.started_at),
+        "ended_at_bj": _format_beijing_timestamp(item.ended_at),
+        "duration_ms": _round_ms(item.duration_ms),
+      }
+      for item in timings.stage_details
+    ]
+  return payload
 
 _DANMAKU_INJECTION_PATTERNS = [
   re.compile(r"(?i)\bignore\b.{0,40}\b(instruction|rule|prompt)s?\b"),
@@ -153,6 +222,135 @@ _DANMAKU_INJECTION_PATTERNS = [
 
 
 
+
+
+_SENTENCE_TAG_RE = re.compile(r"#\[")
+
+
+class _SentenceStreamer:
+  """
+  流式句级 TTS 入队器。
+
+  注册为 chunk_callback，在 LLM 流式输出过程中检测句子边界
+  （以 #[ 标签为分割点），每完成一句立刻解析并推入 SpeechQueue，
+  使 TTS 在首句生成后即可开始播放，无需等待完整回复。
+  """
+
+  def __init__(
+    self,
+    speech_queue: SpeechQueue,
+    speech_broadcaster,
+    response_id: str,
+    priority: int,
+    ttl: float,
+    source: str,
+    comments: list,
+    expression_mapper=None,
+    reply_target_text: str = "",
+    reply_target_nickname: str = "",
+  ):
+    from connection.speech_broadcaster import SpeechBroadcaster
+    self._speech_queue = speech_queue
+    self._speech_broadcaster = speech_broadcaster
+    self._SpeechBroadcaster = SpeechBroadcaster
+    self._expression_mapper = expression_mapper
+    self._response_id = str(response_id or "")
+    self._priority = priority
+    self._ttl = ttl
+    self._source = source
+    self._comments = comments
+    self._reply_target_text = reply_target_text
+    self._reply_target_nickname = reply_target_nickname
+    self._buffer = ""
+    self._segment_index = 0
+    self.pushed_items: list[SpeechItem] = []
+    self._pending_sentences: list[str] = []
+    self._background_tasks: set[asyncio.Task] = set()
+
+  @property
+  def segments_pushed(self) -> int:
+    return len(self.pushed_items)
+
+  def on_chunk(self, rc: ResponseChunk) -> None:
+    """chunk 回调：收集文本，检测句子边界后立即异步入队。"""
+    if rc.done:
+      return
+    self._buffer += rc.chunk
+    last_tag_pos = self._buffer.rfind("#[")
+    if last_tag_pos > 0:
+      complete = self._buffer[:last_tag_pos]
+      self._buffer = self._buffer[last_tag_pos:]
+      if complete.strip():
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+          task = loop.create_task(self._enqueue_sentence(complete))
+          self._background_tasks.add(task)
+          task.add_done_callback(self._background_tasks.discard)
+        else:
+          self._pending_sentences.append(complete)
+
+  async def flush(self, response: Optional[StreamerResponse] = None) -> None:
+    """等待进行中的入队任务完成，推送残余 buffer。"""
+    if self._background_tasks:
+      await asyncio.gather(*self._background_tasks, return_exceptions=True)
+      self._background_tasks.clear()
+    if self._buffer.strip():
+      self._pending_sentences.append(self._buffer)
+      self._buffer = ""
+    for sentence in self._pending_sentences:
+      await self._enqueue_sentence(sentence, response)
+    self._pending_sentences.clear()
+
+  async def try_push_pending(self, response: Optional[StreamerResponse] = None) -> None:
+    """推送已检测到的完整句子（不含残余 buffer）。"""
+    for sentence in self._pending_sentences:
+      await self._enqueue_sentence(sentence, response)
+    self._pending_sentences.clear()
+
+  def bind_response(self, response: StreamerResponse) -> None:
+    """在完整回复生成后，回填流式入队句子的元数据。"""
+    total_segments = len(self.pushed_items)
+    for item in self.pushed_items:
+      item.response = response
+      item.response_id = response.id
+      item.segment_total = total_segments
+      item.segment["reply_target_text"] = response.reply_target_text
+      item.segment["reply_target_nickname"] = response.nickname
+      item.segment["nickname"] = response.nickname
+
+  async def _enqueue_sentence(self, text: str, response: Optional[StreamerResponse] = None) -> None:
+    """解析单句为 segment 并推入 SpeechQueue。"""
+    if self._expression_mapper is not None:
+      try:
+        text = self._expression_mapper.map_response(text).mapped_text
+      except Exception:
+        pass
+    segments = self._SpeechBroadcaster._parse_segments(text)
+    if not segments:
+      return
+    self._SpeechBroadcaster._apply_chinese_speech(segments, "normal")
+    for seg in segments:
+      seg["reply_target_text"] = self._reply_target_text
+      seg["reply_target_nickname"] = self._reply_target_nickname
+      seg["nickname"] = self._reply_target_nickname
+      item = SpeechItem(
+        segment=seg,
+        priority=self._priority,
+        ttl=self._ttl,
+        source=self._source,
+        response_id=response.id if response else self._response_id,
+        response=response or StreamerResponse(
+          id=self._response_id or str(uuid.uuid4()),
+          content="",
+        ),
+        segment_index=self._segment_index,
+        segment_total=0,
+        comments=self._comments,
+        generated_at=time.monotonic(),
+      )
+      await self._speech_queue.push(item)
+      self.pushed_items.append(item)
+      self._segment_index += 1
 
 
 class StreamingStudio:
@@ -170,7 +368,11 @@ class StreamingStudio:
     # 核心配置
     persona: str = "karin",
     model_type: ModelType = ModelType.OPENAI,
+    small_model_type: Optional[ModelType] = None,
     model_name: Optional[str] = None,
+    model_kwargs: Optional[dict] = None,
+    vlm_model_type: Optional[ModelType] = None,
+    vlm_model_name: Optional[str] = None,
     enable_memory: bool = False,
     enable_global_memory: bool = True,
     enable_topic_manager: bool = True,
@@ -207,6 +409,7 @@ class StreamingStudio:
       config: 自定义行为配置（高级用户）
     """
     self._persona = persona
+    _small_provider = small_model_type or model_type
     self._enable_global_memory = enable_global_memory
 
     if enable_global_memory and not enable_memory:
@@ -227,7 +430,7 @@ class StreamingStudio:
       memory_manager = None
       if enable_memory:
         from memory import MemoryManager, MemoryConfig
-        summary_model = ModelProvider.remote_small(provider=model_type)
+        summary_model = ModelProvider.remote_small(provider=_small_provider)
         memory_manager = MemoryManager(
           persona=persona,
           config=MemoryConfig(),
@@ -274,6 +477,9 @@ class StreamingStudio:
         meme_manager=meme_manager,
         response_checker=response_checker,
         style_bank=style_bank,
+        model_kwargs=model_kwargs,
+        vlm_model_type=vlm_model_type,
+        vlm_model_name=vlm_model_name,
       )
 
     # 数据库：全局记忆关闭时使用内存数据库
@@ -319,6 +525,10 @@ class StreamingStudio:
     # 上一轮弹幕收集是否为空，用于"首条弹幕唤醒"判断
     self._was_silent: bool = True
 
+    # 记忆预热：弹幕到达时异步预检索，生成时优先使用缓存结果
+    self._memory_prefetch_task: Optional[asyncio.Task] = None
+    self._memory_prefetch_viewer_ids: list[str] = []
+
     # 最近一次发给模型的完整 prompt（供调试监控）
     self._last_prompt: Optional[str] = None
 
@@ -345,7 +555,7 @@ class StreamingStudio:
     self._topic_manager = None
     if enable_topic_manager:
       from topic_manager import TopicManager
-      topic_model = ModelProvider.remote_small(provider=model_type)
+      topic_model = ModelProvider.remote_small(provider=_small_provider)
       self._topic_manager = TopicManager(
         persona=persona,
         database=self.database,
@@ -386,7 +596,7 @@ class StreamingStudio:
     self._enable_state_card = enable_state_card
     if enable_state_card:
       from broadcaster_state import StateUpdater
-      state_model = ModelProvider.remote_small(provider=model_type)
+      state_model = ModelProvider.remote_small(provider=_small_provider)
       self._state_updater = StateUpdater(model=state_model)
 
     # 最近一次聚类结果（供 debug_state 和 prompt 格式化使用）
@@ -404,6 +614,9 @@ class StreamingStudio:
     self._guard_thanks_reference = _loader.load_optional("studio/guard_thanks_reference.txt") or ""
     self._gift_thanks_reference = _loader.load_optional("studio/gift_thanks_reference.txt") or ""
     self._super_chat_reference = _loader.load_optional("studio/super_chat_reference.txt") or ""
+    self._existential_references = self._parse_existential_references(
+      _loader.load_optional("studio/existential_reference.txt") or ""
+    )
     self._route_composer = RoutePromptComposer(_loader)
     self._prompt_composer = PromptComposer(
       self._route_composer,
@@ -413,6 +626,7 @@ class StreamingStudio:
       guard_thanks_reference=self._guard_thanks_reference,
       gift_thanks_reference=self._gift_thanks_reference,
       super_chat_reference=self._super_chat_reference,
+      existential_references=self._existential_references,
     )
     self._last_turn_snapshot: Optional[TurnSnapshot] = None
     self._last_controller_trace: Optional[dict[str, Any]] = None
@@ -440,6 +654,10 @@ class StreamingStudio:
 
     # 对话记录日志（弹幕+回复 → logs/chat.log）
     self._chat_log = _setup_chat_logger()
+    # Controller 专用 JSONL 日志（输入+输出 → logs/controller.jsonl）
+    self._controller_log = _setup_controller_logger()
+    # 北京时间耗时日志（每次启动新文件，便于从头排查慢点）
+    self._timing_log, self._timing_log_path = _setup_timing_trace_logger()
 
     # 上次已使用的动态等待时间（避免同一个建议重复使用）
     self._last_used_timing: Optional[tuple[float, float]] = None
@@ -452,7 +670,7 @@ class StreamingStudio:
     # 场景记忆缓存（VLM 模式下用小模型异步描述帧，提供时序上下文）
     self._scene_memory: Optional[SceneMemoryCache] = None
     if video_player is not None:
-      scene_model = ModelProvider.remote_small(provider=model_type)
+      scene_model = ModelProvider.remote_small(provider=_small_provider)
       self._scene_memory = SceneMemoryCache(
         model=scene_model,
         config=SceneMemoryConfig(),
@@ -460,6 +678,7 @@ class StreamingStudio:
 
     # 管线阶段计时器
     self._timer = PipelineTimer()
+    self._last_controller_timing_window: Optional[dict[str, Any]] = None
 
     # 直播开始时间（用于计算已开播时长）
     self._stream_start_time: Optional[datetime] = None
@@ -476,6 +695,7 @@ class StreamingStudio:
     self._speech_queue_config = SpeechQueueConfig()
     self._speech_queue: Optional[SpeechQueue] = None
     self._speech_broadcaster = None  # SpeechBroadcaster 引用（attach 时注入）
+    self._current_dispatch_source: str = ""  # Dispatcher 正在播放的 source（供弹幕抢占判断）
     self._producer_task: Optional[asyncio.Task] = None
     self._dispatcher_task: Optional[asyncio.Task] = None
     self._played_response_ids: set[str] = set()
@@ -490,6 +710,16 @@ class StreamingStudio:
   def is_paused(self) -> bool:
     """是否处于暂停状态（会话和子系统仍存活，可用 resume 恢复）"""
     return self._paused
+
+  @staticmethod
+  def _parse_existential_references(raw: str) -> list[str]:
+    """按 '---' 分隔符切分存在性问题参考库，返回非空条目列表。"""
+    entries: list[str] = []
+    for block in raw.split("---"):
+      text = block.strip()
+      if text and not text.startswith("以下是"):
+        entries.append(text)
+    return entries
 
   @staticmethod
   def _is_blank_frame(b64_jpeg: str) -> bool:
@@ -566,6 +796,19 @@ class StreamingStudio:
     self._comment_timestamps.append(datetime.now())
     if self._comment_arrived is not None:
       self._comment_arrived.set()
+    if (
+      comment.event_type == EventType.DANMAKU
+      and self._speech_broadcaster is not None
+      and self._current_dispatch_source in ("entry", "video", "monologue")
+    ):
+      print(
+        f"[Dispatcher] 新弹幕到达：打断当前 {self._current_dispatch_source} 播放，优先生成聊天回复"
+      )
+      self._speech_broadcaster.cancel_current_playback()
+
+    # 记忆预热：弹幕到达时立刻后台检索，减少生成时的等待
+    if comment.event_type == EventType.DANMAKU and self.llm_wrapper.memory_manager is not None:
+      self._start_memory_prefetch(comment)
 
     # 转发给话题管理器（非阻塞）
     if self._topic_manager:
@@ -706,6 +949,13 @@ class StreamingStudio:
     # 生成会话 ID
     self._session_id = str(uuid.uuid4())
     await asyncio.to_thread(self.database.create_session, self._session_id, self._persona)
+    print(f"[TimingTrace] 北京时间耗时日志: {self._timing_log_path}")
+    self._log_timing_event(
+      "session_start",
+      persona=self._persona,
+      timing_log_path=str(self._timing_log_path),
+      speech_queue_enabled=self.config.speech_queue_enabled,
+    )
 
     # 将 session_id 传递给记忆管理器
     memory_mgr = self.llm_wrapper.memory_manager
@@ -825,6 +1075,7 @@ class StreamingStudio:
 
     # 结束会话记录
     if self._session_id:
+      self._log_timing_event("session_stop")
       await asyncio.to_thread(self.database.end_session, self._session_id)
       self._session_id = None
 
@@ -930,6 +1181,13 @@ class StreamingStudio:
         await self._main_loop_controller_round(old_comments, new_comments)
 
         timings = self._timer.finish()
+        self._log_pipeline_timing(
+          timings,
+          source="main_loop",
+          old_comments=old_comments,
+          new_comments=new_comments,
+          controller_trace=self._last_controller_trace,
+        )
         print(timings.format_summary())
         self._chat_log.info("%s", timings.format_summary())
 
@@ -982,7 +1240,7 @@ class StreamingStudio:
     self._detect_emotion_from_comments(new_comments)
 
     images = None
-    if self._current_frame_b64:
+    if not new_comments and self._current_frame_b64:
       images = [self._current_frame_b64]
     reply_started_at = datetime.now()
 
@@ -1122,6 +1380,29 @@ class StreamingStudio:
       )
       controller_trace = self._last_controller_trace
       if plan.proactive_speak:
+        # 弹幕重检：Controller 决策期间可能有新弹幕到达，
+        # 优先处理弹幕而不是生成独白/VLM
+        re_old, re_new = self._collect_comments()
+        if re_old or re_new:
+          if self._comment_clusterer and re_new:
+            self._last_cluster_result = self._comment_clusterer.cluster(re_new)
+          re_plan = await self._dispatch_controller(re_old, re_new)
+          re_trace = self._last_controller_trace
+          if re_plan.should_reply:
+            preview = " | ".join(c.content for c in (re_old + re_new))[:60]
+            print(
+              f"[Controller] 独白取消→弹幕优先: u={re_plan.urgency} "
+              f"s={re_plan.response_style} ← {preview}"
+            )
+            source = "danmaku"
+            if re_plan.route_kind == "entry":
+              source = "entry"
+            await self._generate_and_enqueue_with_plan(
+              re_old, re_new, re_plan,
+              source=source, controller_trace=re_trace,
+            )
+            return
+
         source = "video" if (
           plan.route_kind == "vlm" or plan.session_mode == "video_focus"
         ) else "monologue"
@@ -1170,28 +1451,73 @@ class StreamingStudio:
 
     max_chars = 0
 
+    # 有弹幕时不传图（纯文本走主模型），主动发言才附画面（走 VLM 备用模型）
     images = None
-    if self._current_frame_b64:
+    if not new_comments and self._current_frame_b64:
       images = [self._current_frame_b64]
 
     reply_started_at = datetime.now()
 
     self._timer.start_round()
+
+    # ── 句级流式 TTS：流式生成 + 边生成边入队 ──
+    priority = plan.priority
+    cfg = self._speech_queue_config
+    ttl_map = {0: cfg.paid_event_ttl, 1: cfg.danmaku_ttl, 2: cfg.event_low_ttl, 3: cfg.video_ttl}
+    ttl = ttl_map.get(priority, cfg.danmaku_ttl)
+    reply_target = self._pick_primary_reply_target(new_comments, plan)
+    reply_target_text = self._reply_target_text(reply_target)
+    reply_target_nickname = reply_target.nickname if reply_target is not None else ""
+    provisional_response_id = str(uuid.uuid4()) if self.enable_streaming else ""
+
+    sentence_streamer: Optional[_SentenceStreamer] = None
     if self.enable_streaming:
-      response = await self._generate_response_streaming_with_plan(
-        old_comments, new_comments, plan,
-        images=images, max_chars=max_chars,
-        controller_trace=controller_trace,
+      sentence_streamer = _SentenceStreamer(
+        speech_queue=self._speech_queue,
+        speech_broadcaster=self._speech_broadcaster,
+        response_id=provisional_response_id,
+        priority=priority,
+        ttl=ttl,
+        source=source,
+        comments=list(new_comments),
+        expression_mapper=self._expression_mapper,
+        reply_target_text=reply_target_text,
+        reply_target_nickname=reply_target_nickname,
       )
-    else:
-      response = await self._generate_response_with_plan(
-        old_comments, new_comments, plan,
-        images=images, max_chars=max_chars,
-        controller_trace=controller_trace,
-      )
+      self._chunk_callbacks.append(sentence_streamer.on_chunk)
+
+    try:
+      if self.enable_streaming:
+        response = await self._generate_response_streaming_with_plan(
+          old_comments, new_comments, plan,
+          images=images, max_chars=max_chars,
+          controller_trace=controller_trace,
+          response_id=provisional_response_id,
+        )
+      else:
+        response = await self._generate_response_with_plan(
+          old_comments, new_comments, plan,
+          images=images, max_chars=max_chars,
+          controller_trace=controller_trace,
+        )
+    finally:
+      if sentence_streamer is not None:
+        try:
+          self._chunk_callbacks.remove(sentence_streamer.on_chunk)
+        except ValueError:
+          pass
 
     if response is None:
-      self._timer.finish(skipped=True)
+      timings = self._timer.finish(skipped=True)
+      self._log_pipeline_timing(
+        timings,
+        source=source,
+        old_comments=old_comments,
+        new_comments=new_comments,
+        plan=plan,
+        controller_trace=controller_trace,
+        skipped_reason="response_none",
+      )
       return None
 
     self._timer.mark("入队")
@@ -1200,56 +1526,68 @@ class StreamingStudio:
     if source in ("monologue", "video"):
       self._last_vlm_time = time.monotonic()
 
-    priority = plan.priority
-    cfg = self._speech_queue_config
-    ttl_map = {0: cfg.paid_event_ttl, 1: cfg.danmaku_ttl, 2: cfg.event_low_ttl, 3: cfg.video_ttl}
-    ttl = ttl_map.get(priority, cfg.danmaku_ttl)
-
-    segments = SpeechBroadcaster._parse_segments(response.content)
-    SpeechBroadcaster._apply_chinese_speech(segments, response.response_style)
-    if self._speech_broadcaster is not None:
-      segments = await self._speech_broadcaster.prepare_segments_for_broadcast(
-        response,
-        segments,
-      )
-
     enqueue_started = time.monotonic()
-    pushed_items: list[SpeechItem] = []
-    total_segments = max(len(segments), 1)
-    for idx, seg in enumerate(segments):
-      item = SpeechItem(
-        segment=seg,
-        priority=priority,
-        ttl=ttl,
-        source=source,
-        response_id=response.id,
-        response=response,
-        segment_index=idx,
-        segment_total=total_segments,
-        comments=list(new_comments),
-        generated_at=time.monotonic(),
-      )
-      evicted = await self._speech_queue.push(item)
-      pushed_items.append(item)
-      for ev in evicted:
-        print(f"[SpeechQueue] 驱逐: {ev.source} p={ev.priority} «{ev.segment.get('text_zh', '')[:20]}»")
+    segments: list[dict] = []
 
+    if sentence_streamer is not None and sentence_streamer.segments_pushed > 0:
+      await sentence_streamer.flush(response)
+      sentence_streamer.bind_response(response)
+      pushed_items = sentence_streamer.pushed_items
+    else:
+      segments = SpeechBroadcaster._parse_segments(response.content)
+      SpeechBroadcaster._apply_chinese_speech(segments, response.response_style)
+      if self._speech_broadcaster is not None:
+        segments = await self._speech_broadcaster.prepare_segments_for_broadcast(
+          response,
+          segments,
+        )
+
+      pushed_items = []
+      total_segments = max(len(segments), 1)
+      for idx, seg in enumerate(segments):
+        item = SpeechItem(
+          segment=seg,
+          priority=priority,
+          ttl=ttl,
+          source=source,
+          response_id=response.id,
+          response=response,
+          segment_index=idx,
+          segment_total=total_segments,
+          comments=list(new_comments),
+          generated_at=time.monotonic(),
+        )
+        evicted = await self._speech_queue.push(item)
+        pushed_items.append(item)
+        for ev in evicted:
+          print(f"[SpeechQueue] 驱逐: {ev.source} p={ev.priority} «{ev.segment.get('text_zh', '')[:20]}»")
+
+    segment_count = len(segments) if segments else len(pushed_items)
     timings = self._timer.finish()
     response = self._merge_response_timing_trace(
       response,
       {
         "enqueue_ms": _round_ms((time.monotonic() - enqueue_started) * 1000),
-        "segment_count": len(segments),
+        "segment_count": segment_count,
         "pipeline_round": _round_timings_payload(timings),
       },
     )
+    self._log_pipeline_timing(
+      timings,
+      source=source,
+      old_comments=old_comments,
+      new_comments=new_comments,
+      plan=plan,
+      controller_trace=controller_trace,
+      response=response,
+    )
     for item in pushed_items:
       item.response = response
-    print(f"[Producer·Controller] {source} → {len(segments)}句入队 | {timings.format_summary()}")
+    print(f"[Producer·Controller] {source} → {segment_count}句入队 | {timings.format_summary()}")
     self._chat_log.info(
       "[Producer·Controller] %s → %d句入队 | %s",
       source,
-      len(segments),
+      segment_count,
       timings.format_summary(),
     )
     self._log_response_observation(response)
@@ -1280,7 +1618,8 @@ class StreamingStudio:
     source: str,
     new_comments: list[Comment],
   ) -> None:
-    """新聊天到来时，清掉待播的欢迎词/主动解说，避免打断对话。"""
+    """新聊天到来时，清掉待播的欢迎词/主动解说，避免打断对话。
+    如果 Dispatcher 正在播放低优先级内容，同时打断当前 TTS 播放。"""
     if self._speech_queue is None or source != "danmaku":
       return
     if not any(comment.event_type == EventType.DANMAKU for comment in new_comments):
@@ -1292,6 +1631,13 @@ class StreamingStudio:
     for item in flushed:
       preview = str(item.segment.get("text_zh", "") or "")[:20]
       print(f"[SpeechQueue] 聊天优先，清理待播 {item.source}: «{preview}»")
+
+    if (
+      self._current_dispatch_source in ("entry", "video", "monologue")
+      and self._speech_broadcaster is not None
+    ):
+      print(f"[Dispatcher] 弹幕抢占：打断当前 {self._current_dispatch_source} 播放")
+      self._speech_broadcaster.cancel_current_playback()
 
   async def _tts_dispatch_loop(self) -> None:
     """
@@ -1306,19 +1652,25 @@ class StreamingStudio:
           await self._speech_queue.wait_for_item()
           continue
 
+        self._current_dispatch_source = item.source
         # 发送单段到 TTS
         ok = await self._speech_broadcaster.send_segment(item.segment)
         if ok:
           # 等待 TTS 完播
           await self._speech_broadcaster.wait_for_playback()
+          # 刷新所有待播项的 TTL，防止连续播放期间后面的项因排队过期
+          await self._speech_queue.touch_all_pending()
           # 完播回调
           self._on_response_played(item)
+          await self._wait_for_response_continuation(item)
         else:
           print(f"[Dispatcher] TTS 发送失败: «{item.segment.get('text_zh', '')[:30]}»")
+        self._current_dispatch_source = ""
 
       except asyncio.CancelledError:
         break
       except Exception as e:
+        self._current_dispatch_source = ""
         print(f"Dispatcher 循环错误: {e}")
         self._chat_log.info("[错误] Dispatcher 异常: %s", e)
         await asyncio.sleep(0.5)
@@ -1385,6 +1737,39 @@ class StreamingStudio:
     self._schedule_state_round_update(
       item.comments, item.response.content,
     )
+
+  def _start_memory_prefetch(self, comment: Comment) -> None:
+    """弹幕到达时预热记忆检索，在定时器等待期间利用空闲时间。"""
+    if self._memory_prefetch_task and not self._memory_prefetch_task.done():
+      self._memory_prefetch_task.cancel()
+    viewer_id = str(getattr(comment, "user_id", "") or "").strip()
+    self._memory_prefetch_viewer_ids = [viewer_id] if viewer_id else []
+    query = str(getattr(comment, "content", "") or "").strip()
+    if not query:
+      return
+    mem = self.llm_wrapper.memory_manager
+    if mem is None:
+      return
+
+    async def _do_prefetch():
+      try:
+        await asyncio.to_thread(
+          mem.compile_structured_context,
+          query,
+          self._memory_prefetch_viewer_ids,
+          False,
+          False,
+          False,
+          "normal",
+        )
+      except Exception:
+        pass
+
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+      self._memory_prefetch_task = loop.create_task(_do_prefetch())
+      self._background_tasks.add(self._memory_prefetch_task)
+      self._memory_prefetch_task.add_done_callback(self._background_tasks.discard)
 
   def _detect_emotion_from_comments(self, comments: list[Comment]) -> None:
     """分析弹幕，触发情绪状态转换（奶凶专用）"""
@@ -1572,14 +1957,24 @@ class StreamingStudio:
     )
     self._last_turn_snapshot = snapshot
     ctrl_input = build_controller_input(snapshot=snapshot)
+    dispatch_started_at = _beijing_now()
+    dispatch_started = time.monotonic()
+    self._last_controller_timing_window = None
 
     plan = await self._controller.dispatch(
       ctrl_input,
       force_fallback=force_fallback,
       fallback_source=fallback_source,
     )
+    dispatch_ended_at = _beijing_now()
+    self._last_controller_timing_window = {
+      "started_at_bj": _format_beijing_timestamp(dispatch_started_at),
+      "ended_at_bj": _format_beijing_timestamp(dispatch_ended_at),
+      "latency_ms": _round_ms((time.monotonic() - dispatch_started) * 1000),
+    }
     self._last_controller_trace = self._controller.last_dispatch_trace
     self._log_controller_trace(plan)
+    self._log_controller_io(ctrl_input, plan)
     self._round_count += 1
 
     if self._topic_manager and plan.topic_assignments:
@@ -1598,6 +1993,164 @@ class StreamingStudio:
       "plan_json": trace.get("plan_json") or getattr(plan, "to_dict", lambda **_: {})(nested=False),
     }
     self._chat_log.info("[Controller决策] %s", json.dumps(payload, ensure_ascii=False))
+
+  def _log_controller_io(self, ctrl_input, plan) -> None:
+    """将 Controller 完整输入/输出写入 logs/controller.jsonl，每行一条 JSON。"""
+    from dataclasses import asdict
+    trace = self._last_controller_trace or {}
+    entry = {
+      "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+      "round": self._round_count,
+      "input": {
+        "energy": ctrl_input.energy,
+        "patience": ctrl_input.patience,
+        "atmosphere": ctrl_input.atmosphere,
+        "emotion": ctrl_input.emotion,
+        "stream_phase": ctrl_input.stream_phase,
+        "round_count": ctrl_input.round_count,
+        "silence_seconds": round(ctrl_input.silence_seconds, 1),
+        "comment_rate": round(ctrl_input.comment_rate, 2),
+        "is_conversation_mode": ctrl_input.is_conversation_mode,
+        "has_scene_change": ctrl_input.has_scene_change,
+        "scene_description": ctrl_input.scene_description[:80],
+        "last_response_style": ctrl_input.last_response_style,
+        "last_topic": ctrl_input.last_topic[:40],
+        "comments": [asdict(c) for c in ctrl_input.comments],
+        "viewer_briefs": [asdict(v) for v in ctrl_input.viewer_briefs],
+        "active_topics": [asdict(t) for t in ctrl_input.active_topics],
+      },
+      "output": plan.to_dict(nested=False),
+      "trace": {
+        "source": trace.get("source", ""),
+        "model_name": trace.get("model_name", ""),
+        "latency_ms": trace.get("latency_ms", 0.0),
+        "enrichment": trace.get("enrichment"),
+        "experts": {
+          name: {
+            "source": exp.get("source", ""),
+            "latency_ms": exp.get("latency_ms", 0.0),
+            "raw_output": exp.get("raw_output", "")[:500],
+            "fields": exp.get("fields"),
+          }
+          for name, exp in (trace.get("experts") or {}).items()
+        },
+      },
+    }
+    try:
+      self._controller_log.info(json.dumps(entry, ensure_ascii=False))
+    except Exception:
+      pass
+
+  def _log_timing_event(self, event: str, **payload: Any) -> None:
+    entry = {
+      "event": event,
+      "ts_bj": _format_beijing_timestamp(_beijing_now()),
+      "session_id": self._session_id or "",
+      **payload,
+    }
+    try:
+      self._timing_log.info(json.dumps(entry, ensure_ascii=False))
+    except Exception:
+      pass
+
+  @staticmethod
+  def _timing_comments_preview(
+    old_comments: list[Comment],
+    new_comments: list[Comment],
+    limit: int = 120,
+  ) -> str:
+    preview = " | ".join(
+      str(c.content or "").strip()
+      for c in (old_comments + new_comments)
+      if str(c.content or "").strip()
+    )
+    if len(preview) <= limit:
+      return preview
+    return preview[:limit] + "...<截断>"
+
+  def _log_pipeline_timing(
+    self,
+    timings,
+    *,
+    source: str,
+    old_comments: list[Comment],
+    new_comments: list[Comment],
+    plan=None,
+    controller_trace: Optional[dict[str, Any]] = None,
+    skipped_reason: str = "",
+    response: Optional[StreamerResponse] = None,
+  ) -> None:
+    trace = controller_trace or self._last_controller_trace or {}
+    controller_window = self._last_controller_timing_window or {}
+    experts = {
+      name: _round_ms(float(exp.get("latency_ms", 0.0) or 0.0))
+      for name, exp in (trace.get("experts") or {}).items()
+    }
+    stages = [
+      {
+        "name": item.name,
+        "started_at_bj": _format_beijing_timestamp(item.started_at),
+        "ended_at_bj": _format_beijing_timestamp(item.ended_at),
+        "duration_ms": _round_ms(item.duration_ms),
+        "duration_s": round(max(item.duration_ms, 0.0) / 1000, 3),
+      }
+      for item in (getattr(timings, "stage_details", None) or [])
+    ]
+    entry = {
+      "event": "pipeline_round",
+      "ts_bj": _format_beijing_timestamp(_beijing_now()),
+      "session_id": self._session_id or "",
+      "round_id": timings.round_id,
+      "source": source,
+      "summary": timings.format_summary(),
+      "started_at_bj": _format_beijing_timestamp(getattr(timings, "started_at", None)),
+      "ended_at_bj": _format_beijing_timestamp(getattr(timings, "ended_at", None) or timings.timestamp),
+      "total_ms": _round_ms(timings.total_ms),
+      "total_s": round(max(timings.total_ms, 0.0) / 1000, 3),
+      "skipped": timings.skipped,
+      "skipped_reason": skipped_reason,
+      "comments": {
+        "old_count": len(old_comments),
+        "new_count": len(new_comments),
+        "preview": self._timing_comments_preview(old_comments, new_comments),
+      },
+      "plan": (
+        {
+          "route_kind": getattr(plan, "route_kind", ""),
+          "response_style": getattr(plan, "response_style", ""),
+          "sentences": getattr(plan, "sentences", 0),
+          "memory_strategy": getattr(plan, "memory_strategy", ""),
+          "session_mode": getattr(plan, "session_mode", ""),
+          "session_anchor": getattr(plan, "session_anchor", ""),
+          "priority": getattr(plan, "priority", 0),
+        }
+        if plan is not None else None
+      ),
+      "controller": {
+        "started_at_bj": controller_window.get("started_at_bj", ""),
+        "ended_at_bj": controller_window.get("ended_at_bj", ""),
+        "latency_ms": _round_ms(
+          float(controller_window.get("latency_ms", trace.get("latency_ms", 0.0)) or 0.0)
+        ),
+        "source": trace.get("source", ""),
+        "model_name": trace.get("model_name", ""),
+        "experts_ms": experts,
+      },
+      "response": (
+        {
+          "id": response.id,
+          "response_style": response.response_style,
+          "reply_target_text": response.reply_target_text,
+          "nickname": response.nickname,
+        }
+        if response is not None else None
+      ),
+      "stages": stages,
+    }
+    try:
+      self._timing_log.info(json.dumps(entry, ensure_ascii=False))
+    except Exception:
+      pass
 
   def _log_response_observation(self, response: StreamerResponse) -> None:
     controller_trace = response.controller_trace or {}
@@ -1871,31 +2424,32 @@ class StreamingStudio:
       relative = f"{hours}小时{minutes}分前"
 
     time_prefix = f"[{time_str} / {relative}]"
+    name = shorten_nickname(comment.nickname)
 
     if comment.event_type == EventType.GUARD_BUY:
       level = GUARD_LEVEL_NAMES.get(comment.guard_level, "舰长")
-      return f"[上舰] {comment.nickname} 开通了{level}！"
+      return f"[上舰] {name} 开通了{level}！"
 
     if comment.event_type == EventType.SUPER_CHAT:
       safe_content = StreamingStudio._sanitize_comment_for_prompt(comment.content)
-      return f"[SC ¥{comment.price:.0f}] {time_prefix} {comment.nickname}: {safe_content}"
+      return f"[SC ¥{comment.price:.0f}] {time_prefix} {name}: {safe_content}"
 
     if comment.event_type == EventType.GIFT:
-      return f"[礼物] {comment.nickname} 赠送了 {comment.gift_name} x{comment.gift_num}"
+      return f"[礼物] {name} 赠送了 {comment.gift_name} x{comment.gift_num}"
 
     if comment.event_type == EventType.ENTRY:
       badge = self._guard_roster.get_level_name_by_nickname(comment.nickname)
       if badge:
-        return f"[进入直播间] [{badge}] {comment.nickname}"
-      return f"[进入直播间] {comment.nickname}"
+        return f"[进入直播间] [{badge}] {name}"
+      return f"[进入直播间] {name}"
 
     # 普通弹幕：查询会员身份，有则加徽章
     safe_content = StreamingStudio._sanitize_comment_for_prompt(comment.content)
     badge = self._guard_roster.get_level_name_by_nickname(comment.nickname)
 
     if badge:
-      return f"{time_prefix} [{badge}] {comment.nickname} (id: {comment.user_id}): {safe_content}"
-    return f"{time_prefix} {comment.nickname} (id: {comment.user_id}): {safe_content}"
+      return f"{time_prefix} [{badge}] {name} (id: {comment.user_id}): {safe_content}"
+    return f"{time_prefix} {name} (id: {comment.user_id}): {safe_content}"
 
   def _format_comments_for_prompt(
     self,
@@ -2029,6 +2583,9 @@ class StreamingStudio:
       hint = f"{count_hint}\n{hint}" if hint else f"{count_hint}\n\n"
     if response_style == "guard_thanks" and self._guard_thanks_reference:
       hint = hint + f"[上舰感谢参考]\n{self._guard_thanks_reference}\n\n"
+    if response_style == "existential" and self._existential_references:
+      pick = random.choice(self._existential_references)
+      hint = hint + f"[存在性问题参考]\n{pick}\n\n"
     if (
       response_style not in ("reaction", "guard_thanks", "existential")
       and random.random() < self.config.engaging_question_probability
@@ -2193,6 +2750,7 @@ class StreamingStudio:
     images: Optional[list[str]] = None,
     max_chars: int = 0,
     controller_trace: Optional[dict[str, Any]] = None,
+    response_id: Optional[str] = None,
   ) -> Optional[StreamerResponse]:
     """按三阶段链路流式生成回复。"""
     response_started = time.monotonic()
@@ -2207,7 +2765,7 @@ class StreamingStudio:
     all_comments = old_comments + new_comments
     reply_ids = tuple(comment.id for comment in new_comments)
     reply_target = self._pick_primary_reply_target(new_comments, plan)
-    response_id = str(uuid.uuid4())
+    response_id = str(response_id or uuid.uuid4())
     accumulated = ""
     first_token_received = False
     llm_first_token_ms: Optional[float] = None
@@ -2315,10 +2873,31 @@ class StreamingStudio:
   def _reply_target_text(cls, comment: Optional[Comment], max_len: int = 120) -> str:
     if comment is None:
       return ""
+    if comment.event_type == EventType.ENTRY:
+      return ""
     content = cls._normalize_comment_text(comment.content, max_len=max_len)
     if content:
       return content
     return cls._normalize_comment_text(comment.format_for_llm(), max_len=max_len)
+
+  async def _wait_for_response_continuation(
+    self,
+    item: SpeechItem,
+    timeout_seconds: float = 0.8,
+  ) -> None:
+    """短暂等待同一回复的后续句子，避免低优先级欢迎词插进中间。"""
+    if self._speech_queue is None or item.is_last_segment:
+      return
+    response_id = str(item.response_id or "").strip()
+    if not response_id:
+      return
+    if await self._speech_queue.has_response(response_id):
+      return
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    while self._running and time.monotonic() < deadline:
+      await asyncio.sleep(0.05)
+      if await self._speech_queue.has_response(response_id):
+        return
 
   def _pick_primary_reply_target(
     self,
@@ -2480,6 +3059,7 @@ class StreamingStudio:
       "video_player": self._video_player.debug_state() if self._video_player else None,
       "scene_memory": self._scene_memory.debug_state() if self._scene_memory else None,
       "pipeline_timer": self._timer.debug_state(),
+      "timing_trace_log_path": str(self._timing_log_path),
       "last_prompt_timing_trace": self._last_prompt_timing_trace,
       "guard_roster": self._guard_roster.debug_state(),
       "controller": self._controller.debug_state() if self._controller else None,

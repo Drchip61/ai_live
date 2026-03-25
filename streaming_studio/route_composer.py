@@ -122,6 +122,7 @@ class PromptComposer:
     guard_thanks_reference: str = "",
     gift_thanks_reference: str = "",
     super_chat_reference: str = "",
+    existential_references: Optional[list[str]] = None,
   ) -> None:
     self._route_composer = route_composer
     self._style_instructions = dict(style_instructions or {})
@@ -130,6 +131,7 @@ class PromptComposer:
     self._guard_thanks_reference = guard_thanks_reference
     self._gift_thanks_reference = gift_thanks_reference
     self._super_chat_reference = super_chat_reference
+    self._existential_references: list[str] = list(existential_references or [])
 
   def compose(
     self,
@@ -205,6 +207,9 @@ class PromptComposer:
     route_reference = self._build_route_reference(route_kind)
     if route_reference:
       hint = hint + route_reference
+    if response_style == "existential" and self._existential_references:
+      pick = random.choice(self._existential_references)
+      hint = hint + f"[存在性问题参考]\n{pick}\n\n"
     force_engaging_question = any(
       any(keyword in str(instruction or "") for keyword in ("追问", "继续聊", "互动引导", "顺势往下聊"))
       for instruction in extra_instructions

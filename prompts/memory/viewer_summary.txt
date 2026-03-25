@@ -37,6 +37,7 @@ AI当时的回复摘要：{ai_response}
 - 观众说「你认识我不」「还记得我吗」「还记得我姓啥吗」这类关系试探时，优先写进 `callbacks`，必要时补 `relationship_state.last_dialogue_stop`，不要只写成 `stable_facts`
 - 观众说「下次告诉你」「回头再来汇报」「之后再说」这类话时，优先写进 `open_threads`
 - 观众说「嘴上送舰长」「又拿徽章来验记忆」这类反复玩的梗时，优先写进 `callbacks`
+- 如果这轮对话中观众**已经回答了之前悬而未决的问题**（比如之前问"站哪队"，这次他说了"站你这边"），必须在 `open_threads` 中用 `"status": "resolved"` 标记该话题已关闭，同时把结论写进 `callbacks` 或 `stable_facts`
 
 简短示例：
 - 输入：「你认识我不」
@@ -45,6 +46,8 @@ AI当时的回复摘要：{ai_response}
   输出片段：`"open_threads":[{{"thread":"他说下次再告诉主播结果","freshness":0.92,"status":"open"}}]`
 - 输入：「今天嘴上送舰长，实际没有」
   输出片段：`"callbacks":[{{"hook":"嘴上送舰长的玩笑梗","freshness":0.88,"expires_in_days":30}}]`
+- 输入：（之前一直问站哪队）「我站你这边」
+  输出片段：`"open_threads":[{{"thread":"站队问题已确认站主播","freshness":0.95,"status":"resolved"}}],"callbacks":[{{"hook":"明确表示站主播这边","freshness":0.95,"expires_in_days":60}}]`
 
 以下不值得记：
 - 纯感叹词、反应词、问候

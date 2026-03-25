@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
@@ -173,6 +174,8 @@ class MemoryManager:
     )
 
     self._summary_task: Optional[asyncio.Task] = None
+    self._background_tasks: set[asyncio.Task] = set()
+    self._structured_refresh_lock: Optional[asyncio.Lock] = None
     self._recent_interactions: list[tuple[str, str, datetime]] = []
 
   @property
@@ -215,7 +218,7 @@ class MemoryManager:
       content,
       source_layer="active_overflow",
     )
-    self._refresh_self_structured_indexes(include_threads=True)
+    self._schedule_structured_refresh(include_threads=True)
 
   def _get_summary_model(self) -> BaseChatModel:
     if self._summary_model is None:
@@ -223,6 +226,74 @@ class MemoryManager:
 
       self._summary_model = ModelProvider.remote_small()
     return self._summary_model
+
+  def _track_background_task(self, task: asyncio.Task) -> None:
+    self._background_tasks.add(task)
+    task.add_done_callback(self._background_tasks.discard)
+
+  def _get_structured_refresh_lock(self) -> asyncio.Lock:
+    if self._structured_refresh_lock is None:
+      self._structured_refresh_lock = asyncio.Lock()
+    return self._structured_refresh_lock
+
+  async def _run_structured_refresh(self, label: str, callback, *args) -> None:
+    if self._structured_retriever is None:
+      return
+    started = time.monotonic()
+    async with self._get_structured_refresh_lock():
+      await asyncio.to_thread(callback, *args)
+    elapsed_ms = (time.monotonic() - started) * 1000
+    if elapsed_ms >= 300:
+      logger.info("structured 索引刷新耗时 %.0fms (%s)", elapsed_ms, label)
+
+  async def _refresh_user_structured_indexes_async(self, viewer_ids: set[str]) -> None:
+    normalized_viewer_ids = {
+      str(viewer_id).strip()
+      for viewer_id in viewer_ids
+      if str(viewer_id).strip()
+    }
+    if not normalized_viewer_ids or self._structured_retriever is None:
+      return
+    await self._run_structured_refresh(
+      f"user_records x{len(normalized_viewer_ids)}",
+      self._refresh_user_structured_indexes,
+      normalized_viewer_ids,
+    )
+
+  async def _refresh_self_structured_indexes_async(self, include_threads: bool = False) -> None:
+    if self._structured_retriever is None:
+      return
+    label = "self_with_threads" if include_threads else "self_only"
+    await self._run_structured_refresh(
+      label,
+      self._refresh_self_structured_indexes,
+      include_threads,
+    )
+
+  def _schedule_structured_refresh(
+    self,
+    *,
+    include_threads: bool = False,
+    viewer_ids: Optional[set[str]] = None,
+  ) -> None:
+    try:
+      loop = asyncio.get_running_loop()
+    except RuntimeError:
+      if viewer_ids is not None:
+        self._refresh_user_structured_indexes(viewer_ids)
+      else:
+        self._refresh_self_structured_indexes(include_threads=include_threads)
+      return
+
+    if viewer_ids is not None:
+      task = loop.create_task(
+        self._refresh_user_structured_indexes_async(viewer_ids)
+      )
+    else:
+      task = loop.create_task(
+        self._refresh_self_structured_indexes_async(include_threads=include_threads)
+      )
+    self._track_background_task(task)
 
   @classmethod
   def _contains_guard_claim(cls, text: str) -> bool:
@@ -502,6 +573,22 @@ class MemoryManager:
       recall_profile=recall_profile,
     )
 
+  def get_corpus_context(
+    self,
+    query: Union[str, list[str]] = "",
+    style_tag: str = "",
+    scene_tag: str = "",
+    top_k: Optional[int] = None,
+  ) -> str:
+    if self._structured_retriever is None:
+      return ""
+    return self._structured_retriever.retrieve_corpus_context(
+      query=query,
+      style_tag=style_tag,
+      scene_tag=scene_tag,
+      top_k=top_k,
+    )
+
   def _refresh_user_structured_indexes(self, viewer_ids: set[str]) -> None:
     if self._structured_retriever is None:
       return
@@ -717,7 +804,7 @@ class MemoryManager:
         )
         touched_viewers.add(src["user_id"])
 
-      self._refresh_user_structured_indexes(touched_viewers)
+      await self._refresh_user_structured_indexes_async(touched_viewers)
     except Exception as e:
       logger.error(
         "观众记忆提取失败: %s | raw=%s",
@@ -823,7 +910,7 @@ class MemoryManager:
       updated_self_memory = True
 
     if updated_self_memory:
-      self._refresh_self_structured_indexes(include_threads=False)
+      await self._refresh_self_structured_indexes_async(include_threads=False)
 
   async def start(self) -> None:
     if self._summary_task is None:
@@ -834,11 +921,20 @@ class MemoryManager:
     if self._summary_task is not None:
       self._summary_task.cancel()
       try:
-        await self._summary_task
+        await asyncio.wait_for(self._summary_task, timeout=3.0)
+      except asyncio.TimeoutError:
+        logger.warning("等待记忆定时汇总任务停止超时")
       except asyncio.CancelledError:
         pass
       logger.info("记忆定时汇总任务已停止")
     self._summary_task = None
+    for task in list(self._background_tasks):
+      task.cancel()
+    if self._background_tasks:
+      done, pending = await asyncio.wait(self._background_tasks, timeout=3.0)
+      if pending:
+        logger.warning("等待记忆后台任务停止超时: %d", len(pending))
+    self._background_tasks.clear()
 
   def clear_runtime_state(self) -> None:
     self._active.clear()
@@ -892,7 +988,7 @@ class MemoryManager:
         summary_text,
         source_layer="summary_rollup",
       )
-      self._refresh_self_structured_indexes(include_threads=True)
+      await self._refresh_self_structured_indexes_async(include_threads=True)
       self._recent_interactions.clear()
       logger.info("定时汇总完成: %s", summary_text[:60])
     except Exception as e:
@@ -912,6 +1008,7 @@ class MemoryManager:
         for memory in active_memories
       ],
       "recent_interactions": len(self._recent_interactions),
+      "background_tasks": len(self._background_tasks),
       "summary_task_running": self._summary_task is not None and not self._summary_task.done(),
       "legacy_layers_removed": True,
     }

@@ -18,6 +18,7 @@ from .context_schema import (
   PersonaSpecRecord,
   SelfMemoryRecord,
   UserMemoryRecord,
+  _QUESTION_FRAGMENT_ADDRESSES,
   extract_requested_address,
   normalize_preferred_address,
   resolve_preferred_address,
@@ -26,6 +27,16 @@ from .context_schema import (
 logger = logging.getLogger(__name__)
 
 _TEXT_NORMALIZE_RE = re.compile(r"[\s，。！？、,.!?:：;；“”\"'（）()《》<>【】\[\]~～…·`]+")
+_UNRESOLVED_INDICATOR_RE = re.compile(
+  r"(还没|没有回|未[完确得]|等他|等她|等待|没说[完出清]|没回[答复应]|没确[认定]"
+  r"|不确定|没表态|没交代|待[确回说]|态度未明|还未|还需|尚未|未得"
+  r"|追问|在等|征集|可接|话题未|话头|可继续|下次可[问接]"
+  r"|需要澄清|需要确认|要求.*说清|待回应|待说明)"
+)
+_CONTENT_TOKEN_RE = re.compile(r"[a-zA-Z]{2,}|[\u4e00-\u9fff]")
+_STOP_CHARS = frozenset("的了吗呢是不也在和与有他她我你它这那个一")
+MAX_OPEN_THREADS_PER_USER = 10
+
 _GENERIC_SUMMARY_PATTERNS = (
   re.compile(r"^我(?:最近)?与多位观众"),
   re.compile(r"^我在与观众(?:们)?的互动中"),
@@ -144,6 +155,113 @@ def _merge_duplicate_items(
   return merged
 
 
+def _extract_content_tokens(text: str) -> set[str]:
+  """从文本中提取内容词元（英文单词 + 中文单字），去除停用字。"""
+  tokens: set[str] = set()
+  for m in _CONTENT_TOKEN_RE.finditer(text):
+    tok = m.group().lower()
+    if tok not in _STOP_CHARS:
+      tokens.add(tok)
+  return tokens
+
+
+def _topics_overlap(text_a: str, text_b: str, min_score: int = 3) -> bool:
+  """判断两段文本是否共享足够多的内容词元（主题重叠）。
+  英文词（如专有名词 nuro, battle）计 2 分，中文单字计 1 分。"""
+  tokens_a = _extract_content_tokens(text_a)
+  tokens_b = _extract_content_tokens(text_b)
+  if not tokens_a or not tokens_b:
+    return False
+  shared = tokens_a & tokens_b
+  if not shared:
+    return False
+  score = sum(2 if (len(t) >= 2 and t.isascii()) else 1 for t in shared)
+  return score >= min_score
+
+
+def _prune_resolved_threads(
+  existing_threads: tuple[dict, ...],
+  all_callbacks: tuple[dict, ...] | list[dict],
+  last_dialogue_stop: str,
+  incoming_resolved: list[dict] | None = None,
+) -> tuple[dict, ...]:
+  """移除已被 callbacks / last_dialogue_stop / 显式 resolved 标记解答的 open_threads。
+
+  三种清除路径：
+  1. 显式 resolved: incoming 中 status=="resolved" 的条目，按主题匹配删除
+  2. 交叉剪枝: callback/last_dialogue_stop 的内容与 "未完成" 标记的 thread 主题重叠
+  3. 同主题去重: 多条措辞不同但主题相同的 "未完成" thread 只保留 freshness 最高的
+  """
+  if not existing_threads:
+    return existing_threads
+
+  resolution_texts: list[str] = []
+  for cb in (all_callbacks or []):
+    hook = str(cb.get("hook", "")).strip()
+    if hook:
+      resolution_texts.append(hook)
+  if last_dialogue_stop:
+    resolution_texts.append(last_dialogue_stop)
+  for rt in (incoming_resolved or []):
+    text = str(rt.get("thread", "")).strip()
+    if text:
+      resolution_texts.append(text)
+
+  resolution_combined = " ".join(resolution_texts)
+
+  # 第 1+2 步: 移除已解决的 thread
+  surviving: list[dict] = []
+  for item in existing_threads:
+    thread_text = str(item.get("thread", "")).strip()
+    if not thread_text:
+      continue
+    if _UNRESOLVED_INDICATOR_RE.search(thread_text) and _topics_overlap(
+      thread_text, resolution_combined, min_score=2,
+    ):
+      continue
+    surviving.append(item)
+
+  # 第 3 步: 同主题去重（只针对含 "未完成" 标记的 thread）
+  deduped: list[dict] = []
+  for item in surviving:
+    thread_text = str(item.get("thread", "")).strip()
+    if not _UNRESOLVED_INDICATOR_RE.search(thread_text):
+      deduped.append(item)
+      continue
+    merged_into_existing = False
+    for i, kept in enumerate(deduped):
+      kept_text = str(kept.get("thread", "")).strip()
+      if not _UNRESOLVED_INDICATOR_RE.search(kept_text):
+        continue
+      if _topics_overlap(thread_text, kept_text, min_score=3):
+        if float(item.get("freshness", 0) or 0) > float(kept.get("freshness", 0) or 0):
+          deduped[i] = item
+        merged_into_existing = True
+        break
+    if not merged_into_existing:
+      deduped.append(item)
+
+  return tuple(deduped)
+
+
+def _cap_open_threads(
+  threads: tuple[dict, ...],
+  max_count: int = MAX_OPEN_THREADS_PER_USER,
+) -> tuple[dict, ...]:
+  """按 freshness 降序保留前 max_count 条 thread。"""
+  if len(threads) <= max_count:
+    return threads
+  ranked = sorted(
+    threads,
+    key=lambda t: (
+      float(t.get("freshness", 0) or 0),
+      str(t.get("updated_at", "")),
+    ),
+    reverse=True,
+  )
+  return tuple(ranked[:max_count])
+
+
 def _merge_text_entries(
   existing: tuple[dict, ...],
   incoming: list[dict],
@@ -224,14 +342,18 @@ def _merge_identity(existing: dict, incoming: Optional[dict], nickname: str = ""
     "identity": incoming or {},
   }).identity
 
-  names = _unique_keep_order(
-    list(current.get("names", ())) + list(incoming_identity.get("names", ()))
-  )
-  nicknames = _unique_keep_order(
-    list(current.get("nicknames", ()))
-    + list(incoming_identity.get("nicknames", ()))
-    + ([nickname] if nickname else [])
-  )
+  names = _unique_keep_order([
+    n for n in list(current.get("names", ())) + list(incoming_identity.get("names", ()))
+    if str(n or "").strip() not in _QUESTION_FRAGMENT_ADDRESSES
+  ])
+  nicknames = _unique_keep_order([
+    n for n in (
+      list(current.get("nicknames", ()))
+      + list(incoming_identity.get("nicknames", ()))
+      + ([nickname] if nickname else [])
+    )
+    if str(n or "").strip() not in _QUESTION_FRAGMENT_ADDRESSES
+  ])
   preferred_address = resolve_preferred_address(
     {
       "nicknames": nicknames,
@@ -430,7 +552,33 @@ class UserMemoryStore(_JsonStoreBase):
     recent_state_items = _merge_text_entries(record.recent_state, recent_state or [], "fact", semantic_mode="state")
     topic_items = _merge_topic_entries(record.topic_profile, topic_profile or [])
     callback_items = _merge_text_entries(record.callbacks, callbacks or [], "hook", semantic_mode="callback")
-    open_thread_items = _merge_text_entries(record.open_threads, open_threads or [], "thread", semantic_mode="callback")
+
+    # --- open_threads 三层清理 ---
+    # 1. 分离 incoming 中 status=="resolved" 的条目
+    active_incoming: list[dict] = []
+    resolved_incoming: list[dict] = []
+    for t in (open_threads or []):
+      if not isinstance(t, dict):
+        continue
+      if str(t.get("status", "")).strip().lower() == "resolved":
+        resolved_incoming.append(t)
+      else:
+        active_incoming.append(t)
+
+    # 2. 自动清理：用 callbacks + last_dialogue_stop 交叉剪枝 + 同主题去重
+    new_last_stop = str((relationship_state or {}).get("last_dialogue_stop", "")).strip()
+    existing_last_stop = str(record.relationship_state.get("last_dialogue_stop", "")).strip()
+    combined_last_stop = new_last_stop or existing_last_stop
+    pruned_existing = _prune_resolved_threads(
+      record.open_threads,
+      all_callbacks=list(record.callbacks) + list(callbacks or []),
+      last_dialogue_stop=combined_last_stop,
+      incoming_resolved=resolved_incoming,
+    )
+
+    # 3. 正常合并 + 上限
+    open_thread_items = _merge_text_entries(pruned_existing, active_incoming, "thread", semantic_mode="callback")
+    open_thread_items = _cap_open_threads(open_thread_items)
     sensitive_topic_items = _merge_named_entries(record.sensitive_topics, sensitive_topics or [], "topic")
     requested_address = extract_requested_address(
       *(str(item.get("hook", "")) for item in callback_items),

@@ -79,6 +79,9 @@ class LLMWrapper:
     response_checker: Optional["ResponseChecker"] = None,
     style_bank: Optional["StyleBank"] = None,
     state_card: Optional["StateCard"] = None,
+    model_kwargs: Optional[dict] = None,
+    vlm_model_type: Optional[ModelType] = None,
+    vlm_model_name: Optional[str] = None,
   ):
     """
     初始化 LLM 包装器
@@ -112,13 +115,19 @@ class LLMWrapper:
 
     # 创建模型
     provider = ModelProvider()
-    model = provider.get_model(model_type, model_name)
+    model = provider.get_model(model_type, model_name, **(model_kwargs or {}))
+
+    # VLM 备用模型：主模型不支持图片时，有图调用走此模型
+    vlm_model = None
+    if vlm_model_type is not None:
+      vlm_model = provider.get_model(vlm_model_type, vlm_model_name)
 
     # 创建管道
     self.pipeline = StreamingPipeline(
       model=model,
       system_prompt=system_prompt,
-      max_history=max_history
+      max_history=max_history,
+      vlm_model=vlm_model,
     )
 
     # 对话历史
