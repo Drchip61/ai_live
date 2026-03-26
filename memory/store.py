@@ -5,6 +5,7 @@
 
 import logging
 import threading
+import time
 from typing import Optional
 
 from langchain_core.documents import Document
@@ -111,6 +112,17 @@ class VectorStore:
       for content, meta in zip(contents, metadatas)
     ]
 
+  def _embed_contents(self, contents: list[str]) -> list[list[float]]:
+    if not contents:
+      return []
+    return self._embeddings.embed_documents(contents)
+
+  def embed_query(self, query: str) -> list[float]:
+    normalized = str(query or "").strip()
+    if not normalized:
+      return []
+    return self._embeddings.embed_query(normalized)
+
   @property
   def collection_name(self) -> str:
     return self._store._collection.name
@@ -131,12 +143,17 @@ class VectorStore:
     doc_ids: list[str],
     contents: list[str],
     metadatas: list[dict],
+    embeddings: Optional[list[list[float]]] = None,
   ) -> None:
     if delete_ids:
       self._store._collection.delete(ids=delete_ids)
     if doc_ids:
-      documents = self._build_documents(contents, metadatas)
-      self._store.add_documents(documents=documents, ids=doc_ids)
+      self._store._collection.upsert(
+        ids=doc_ids,
+        documents=contents,
+        metadatas=metadatas,
+        embeddings=embeddings or self._embed_contents(contents),
+      )
 
   def replace_all(
     self,
@@ -145,6 +162,7 @@ class VectorStore:
     metadatas: list[dict],
   ) -> None:
     """原子替换整个 collection。"""
+    embeddings = self._embed_contents(contents) if doc_ids else []
     with self._lock:
       all_data = self._store._collection.get()
       delete_ids = all_data.get("ids") or []
@@ -153,6 +171,7 @@ class VectorStore:
         doc_ids=doc_ids,
         contents=contents,
         metadatas=metadatas,
+        embeddings=embeddings,
       )
 
   def replace_where(
@@ -163,6 +182,7 @@ class VectorStore:
     metadatas: list[dict],
   ) -> int:
     """原子替换满足 where 的文档集合，返回删除数量。"""
+    embeddings = self._embed_contents(contents) if doc_ids else []
     with self._lock:
       data = self._store._collection.get(where=where)
       delete_ids = data.get("ids") or []
@@ -171,6 +191,7 @@ class VectorStore:
         doc_ids=doc_ids,
         contents=contents,
         metadatas=metadatas,
+        embeddings=embeddings,
       )
       return len(delete_ids)
 
@@ -185,8 +206,8 @@ class VectorStore:
     """
     if not doc_ids:
       return
+    embeddings = self._embed_contents(contents)
     with self._lock:
-      embeddings = self._embeddings.embed_documents(contents)
       self._store._collection.upsert(
         ids=doc_ids,
         documents=contents,
@@ -199,6 +220,7 @@ class VectorStore:
     query: str,
     top_k: int = 5,
     where: Optional[dict] = None,
+    trace_collector: Optional[list[dict]] = None,
   ) -> list[tuple[Document, float]]:
     """
     语义相似度检索
@@ -211,37 +233,118 @@ class VectorStore:
     Returns:
       (Document, score) 元组列表
     """
-    kwargs: dict = {"k": top_k}
-    if where is not None:
-      kwargs["filter"] = where
+    embed_started = time.monotonic()
+    query_embedding = self.embed_query(query)
+    embed_query_ms = (time.monotonic() - embed_started) * 1000
+    if not query_embedding:
+      if trace_collector is not None:
+        trace_collector.append({
+          "collection_name": self.collection_name,
+          "embed_query_ms": round(embed_query_ms, 1),
+          "chroma_query_ms": 0.0,
+          "retry_count": 0,
+          "self_heal_ms": 0.0,
+          "result_count": 0,
+        })
+      return []
+    return self.search_by_vector(
+      query_embedding,
+      top_k=top_k,
+      where=where,
+      trace_collector=trace_collector,
+      embed_query_ms=embed_query_ms,
+    )
 
+  @staticmethod
+  def _query_results_to_docs_and_scores(results: dict) -> list[tuple[Document, float]]:
+    documents = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
+    distances = (results.get("distances") or [[]])[0]
+
+    converted: list[tuple[Document, float]] = []
+    for idx, content in enumerate(documents):
+      metadata = {}
+      if idx < len(metadatas) and isinstance(metadatas[idx], dict):
+        metadata = metadatas[idx]
+      score = distances[idx] if idx < len(distances) else 0.0
+      converted.append((
+        Document(page_content=str(content or ""), metadata=metadata),
+        float(score or 0.0),
+      ))
+    return converted
+
+  def _search_by_vector_locked(
+    self,
+    query_embedding: list[float],
+    top_k: int,
+    where: Optional[dict],
+  ) -> list[tuple[Document, float]]:
+    kwargs = {
+      "query_embeddings": [query_embedding],
+      "n_results": top_k,
+      "include": ["documents", "metadatas", "distances"],
+    }
+    if where is not None:
+      kwargs["where"] = where
+    results = self._store._collection.query(**kwargs)
+    return self._query_results_to_docs_and_scores(results)
+
+  def search_by_vector(
+    self,
+    query_embedding: list[float],
+    top_k: int = 5,
+    where: Optional[dict] = None,
+    trace_collector: Optional[list[dict]] = None,
+    embed_query_ms: float = 0.0,
+  ) -> list[tuple[Document, float]]:
+    """复用已生成的 query embedding 做检索。"""
+    if not query_embedding:
+      return []
+
+    results: list[tuple[Document, float]] = []
+    chroma_query_ms = 0.0
+    retry_count = 0
+    self_heal_ms = 0.0
+    query_started = time.monotonic()
     try:
       with self._lock:
-        return self._store.similarity_search_with_score(
-          query=query,
-          **kwargs,
-        )
+        results = self._search_by_vector_locked(query_embedding, top_k, where)
+        chroma_query_ms += (time.monotonic() - query_started) * 1000
     except Exception as e:
+      chroma_query_ms += max(0.0, (time.monotonic() - query_started) * 1000)
       if self._is_recoverable_index_error(e):
         logger.warning(
           "向量检索命中损坏索引 (collection=%s): %s，尝试自愈后重试",
           self.collection_name, e,
         )
         try:
+          retry_count = 1
+          heal_started = time.monotonic()
           self.ensure_healthy()
+          self_heal_ms = (time.monotonic() - heal_started) * 1000
           with self._lock:
-            return self._store.similarity_search_with_score(
-              query=query,
-              **kwargs,
-            )
+            retry_started = time.monotonic()
+            results = self._search_by_vector_locked(query_embedding, top_k, where)
+            chroma_query_ms += (time.monotonic() - retry_started) * 1000
         except Exception as retry_error:
           logger.error(
             "向量检索自愈后仍失败 (collection=%s): %s",
             self.collection_name, retry_error,
           )
-          return []
-      logger.error("向量检索失败 (collection=%s): %s", self.collection_name, e)
-      return []
+          results = []
+      else:
+        logger.error("向量检索失败 (collection=%s): %s", self.collection_name, e)
+        results = []
+    if trace_collector is not None:
+      trace_collector.append({
+        "collection_name": self.collection_name,
+        "embed_query_ms": round(embed_query_ms, 1),
+        "chroma_query_ms": round(chroma_query_ms, 1),
+        "retry_count": retry_count,
+        "self_heal_ms": round(self_heal_ms, 1),
+        "result_count": len(results),
+      })
+    return results
 
   def delete(self, doc_ids: list[str]) -> None:
     """删除指定文档"""
@@ -329,16 +432,22 @@ class VectorStore:
         collection_name, e,
       )
       print(f"[记忆] {collection_name} 索引损坏，自愈重建中（数据零丢失）...")
+      ids: list[str] = []
+      docs: list[str] = []
+      metas: list[dict] = []
       with self._lock:
         all_data = self._store._collection.get()
         ids = all_data.get("ids") or []
         docs = all_data.get("documents") or []
         metas = all_data.get("metadatas") or []
+      embeddings = self._embed_contents(docs) if ids else []
+      with self._lock:
         self._replace_documents_locked(
           delete_ids=ids,
           doc_ids=ids,
           contents=docs,
           metadatas=metas,
+          embeddings=embeddings,
         )
       logger.info(
         "索引重建完成 (collection=%s)，%d 条记忆已恢复",

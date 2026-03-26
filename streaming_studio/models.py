@@ -148,8 +148,12 @@ class Comment:
     if self.event_type == EventType.SUPER_CHAT:
       return f"{self.nickname} (SC ¥{self.price}): {self.content}"
     if self.event_type == EventType.GIFT:
+      if self.content.strip():
+        return self.content.strip()
       return f"{self.nickname} 赠送了 {self.gift_name} x{self.gift_num}"
     if self.event_type == EventType.ENTRY:
+      if self.content.strip():
+        return self.content.strip()
       return f"{self.nickname} 进入了直播间"
     return f"用户 {self.nickname} 说: {self.content}"
 

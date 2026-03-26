@@ -38,6 +38,16 @@ from connection import DanmakuPushHost, SpeechBroadcaster, RemoteSource
 
 # 远程模式 Controller：3 路 expert 全走本地 Ollama，零网络延迟。
 _LOCAL_CTRL_MODEL = "hoangquan456/qwen3-nothink:8b"
+_CONTROLLER_TRANSPORT_TIMEOUT = 3.5
+
+
+def _controller_model_kwargs() -> dict:
+  return {
+    "temperature": 0.2,
+    "max_tokens": 256,
+    "timeout": _CONTROLLER_TRANSPORT_TIMEOUT,
+    "max_retries": 0,
+  }
 
 def _controller_expert_specs(model_provider: ModelProvider):
   return (
@@ -54,8 +64,7 @@ def _build_controller_expert_models(model_provider: ModelProvider):
     expert_models[key] = model_provider.get_model(
       model_type,
       model_name=model_name,
-      temperature=0.2,
-      max_tokens=256,
+      **_controller_model_kwargs(),
       **extra_kwargs,
     )
     if extra_kwargs.get("base_url"):
@@ -337,8 +346,7 @@ async def main():
       controller_chat_model = model_provider.get_model(
         controller_model_type,
         model_name=controller_model_name,
-        temperature=0.2,
-        max_tokens=256,
+        **_controller_model_kwargs(),
       )
     controller = LLMController(
       model=controller_chat_model,

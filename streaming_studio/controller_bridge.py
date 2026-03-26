@@ -73,10 +73,16 @@ def _controller_content(comment: "Comment") -> str:
   if event_type == "super_chat":
     return f"SC ¥{getattr(comment, 'price', 0.0) or 0.0:.0f}: {comment.content}"
   if event_type == "gift":
+    content = str(getattr(comment, "content", "") or "").strip()
+    if content:
+      return content
     gift_name = getattr(comment, "gift_name", "") or "礼物"
     gift_num = getattr(comment, "gift_num", 0) or 1
     return f"{comment.nickname} 赠送 {gift_name} x{gift_num}"
   if event_type == "entry":
+    content = str(getattr(comment, "content", "") or "").strip()
+    if content:
+      return content
     return f"{comment.nickname} 进入直播间"
   return comment.content
 
@@ -191,10 +197,17 @@ def build_controller_input(
 
   now = datetime.now()
   comment_briefs: list[CommentBrief] = []
-  viewer_ids_seen: set[str] = set()
 
   all_comments = snapshot.all_comments
+  focus_comments = list(snapshot.new_comments or snapshot.all_comments)
   new_ids = {c.id for c in snapshot.new_comments}
+  viewer_ids_seen = [
+    viewer_id for viewer_id in dict.fromkeys(
+      str(c.user_id or "").strip()
+      for c in focus_comments
+      if str(c.user_id or "").strip()
+    )
+  ]
   viewer_nickname_map = {
     c.user_id: str(c.nickname).strip()
     for c in all_comments
@@ -207,8 +220,11 @@ def build_controller_input(
       snapshot.guard_roster.get_member_by_nickname(comment.nickname)
       if snapshot.guard_roster is not None else None
     )
-    is_guard = member is not None
-    guard_level_name = member.level_name if member else ""
+    guard_level = getattr(comment, "guard_level", 0) or 0
+    is_guard = member is not None or guard_level > 0
+    guard_level_name = (
+      member.level_name if member else _GUARD_LEVEL_NAMES.get(guard_level, "")
+    )
 
     comment_briefs.append(CommentBrief(
       id=comment.id,
@@ -217,13 +233,12 @@ def build_controller_input(
       content=_controller_content(comment),
       event_type=comment.event_type.value if hasattr(comment.event_type, "value") else str(comment.event_type),
       price=getattr(comment, "price", 0.0) or 0.0,
-      guard_level=getattr(comment, "guard_level", 0) or 0,
+      guard_level=guard_level,
       is_guard_member=is_guard,
       guard_member_level=guard_level_name,
       seconds_ago=seconds_ago,
       is_new=comment.id in new_ids,
     ))
-    viewer_ids_seen.add(comment.user_id)
 
   viewer_briefs: list[ViewerBrief] = []
   if snapshot.memory_manager is not None:

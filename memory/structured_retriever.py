@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from .config import EmbeddingConfig, StructuredContextConfig
 from .context_schema import (
@@ -113,6 +114,7 @@ class StructuredMemoryRetriever:
     self._persona_index = VectorStore(f"{prefix}persona_spec", embedding_config, embeddings=embeddings)
     self._corpus_index = VectorStore(f"{prefix}corpus", embedding_config, embeddings=embeddings)
     self._knowledge_index = VectorStore(f"{prefix}external_knowledge", embedding_config, embeddings=embeddings)
+    self._last_retrieval_trace: dict[str, Any] = {}
 
   def rebuild_all(self) -> None:
     self.rebuild_user_indexes()
@@ -267,14 +269,48 @@ class StructuredMemoryRetriever:
     recall_profile: str = "deep_recall",
   ) -> CompiledMemoryContext:
     query_text = self._normalize_query(query)
+    query_embed_ms = 0.0
+    query_embedding = None
+    if query_text:
+      embed_started = time.monotonic()
+      query_embedding = self._query_embedding(query_text)
+      query_embed_ms = (time.monotonic() - embed_started) * 1000
     profile = self._resolve_recall_profile(recall_profile)
-    return CompiledMemoryContext(
-      user_memory_lines=tuple(self._build_user_lines(query_text, viewer_ids, profile)),
-      self_memory_lines=tuple(self._build_self_lines(query_text, profile)),
-      persona_lines=tuple(self._build_persona_lines(query_text)) if include_persona else (),
-      corpus_lines=tuple(self._build_corpus_lines(query_text)) if include_corpus else (),
-      knowledge_lines=tuple(self._build_knowledge_lines(query_text)) if include_external_knowledge else (),
+    normalized_viewers = [
+      str(viewer_id).strip()
+      for viewer_id in viewer_ids or []
+      if str(viewer_id).strip()
+    ]
+    request_trace: dict[str, Any] = {
+      "semantic_search_count": 0,
+      "query_embed_count": 1 if query_embedding else 0,
+      "query_embed_ms": round(query_embed_ms, 1),
+      "viewer_count": len(list(dict.fromkeys(normalized_viewers))[:profile.max_viewers]),
+      "recall_profile": recall_profile,
+      "vector_searches": [],
+    }
+    context = CompiledMemoryContext(
+      user_memory_lines=tuple(self._build_user_lines(query_text, viewer_ids, profile, query_embedding, trace=request_trace)),
+      self_memory_lines=tuple(self._build_self_lines(query_text, profile, query_embedding, trace=request_trace)),
+      persona_lines=tuple(self._build_persona_lines(query_text, query_embedding, trace=request_trace)) if include_persona else (),
+      corpus_lines=tuple(self._build_corpus_lines(query_text, query_embedding, trace=request_trace)) if include_corpus else (),
+      knowledge_lines=tuple(self._build_knowledge_lines(query_text, query_embedding, trace=request_trace)) if include_external_knowledge else (),
     )
+    vector_searches = request_trace.get("vector_searches", [])
+    request_trace["chroma_query_ms"] = round(sum(
+      float(item.get("chroma_query_ms", 0.0) or 0.0)
+      for item in vector_searches
+    ), 1)
+    request_trace["self_heal_ms"] = round(sum(
+      float(item.get("self_heal_ms", 0.0) or 0.0)
+      for item in vector_searches
+    ), 1)
+    request_trace["retry_count"] = int(sum(
+      int(item.get("retry_count", 0) or 0)
+      for item in vector_searches
+    ))
+    self._last_retrieval_trace = request_trace
+    return context
 
   def compile_prompt_context(
     self,
@@ -295,6 +331,25 @@ class StructuredMemoryRetriever:
     )
     return context.to_prompt_blocks()
 
+  def compile_prompt_context_with_trace(
+    self,
+    query: Union[str, list[str]],
+    viewer_ids: Optional[list[str]] = None,
+    include_persona: bool = True,
+    include_corpus: bool = False,
+    include_external_knowledge: bool = False,
+    recall_profile: str = "deep_recall",
+  ) -> tuple[str, dict[str, Any]]:
+    prompt_context = self.compile_prompt_context(
+      query=query,
+      viewer_ids=viewer_ids,
+      include_persona=include_persona,
+      include_corpus=include_corpus,
+      include_external_knowledge=include_external_knowledge,
+      recall_profile=recall_profile,
+    )
+    return prompt_context, self.get_last_retrieval_trace()
+
   def debug_state(self) -> dict:
     return {
       "user_fact_docs": len(self._user_fact_index.get_all().get("ids", [])),
@@ -305,6 +360,20 @@ class StructuredMemoryRetriever:
       "persona_docs": len(self._persona_index.get_all().get("ids", [])),
       "corpus_docs": len(self._corpus_index.get_all().get("ids", [])),
       "knowledge_docs": len(self._knowledge_index.get_all().get("ids", [])),
+    }
+
+  def get_last_retrieval_trace(self) -> dict[str, Any]:
+    vector_searches = [
+      dict(item)
+      for item in self._last_retrieval_trace.get("vector_searches", [])
+      if isinstance(item, dict)
+    ]
+    return {
+      key: value
+      for key, value in {
+        **self._last_retrieval_trace,
+        "vector_searches": vector_searches,
+      }.items()
     }
 
   def ensure_healthy(self) -> None:
@@ -447,6 +516,12 @@ class StructuredMemoryRetriever:
       return " ".join(parts)
     return str(query or "").strip()
 
+  def _query_embedding(self, query_text: str) -> Optional[list[float]]:
+    normalized = str(query_text or "").strip()
+    if not normalized:
+      return None
+    return self._user_fact_index.embed_query(normalized)
+
   def _resolve_recall_profile(self, recall_profile: str) -> RecallProfile:
     if recall_profile == "normal":
       return RecallProfile(
@@ -481,6 +556,9 @@ class StructuredMemoryRetriever:
     query_text: str,
     viewer_ids: Optional[list[str]],
     profile: RecallProfile,
+    query_embedding: Optional[list[float]] = None,
+    *,
+    trace: Optional[dict[str, Any]] = None,
   ) -> list[str]:
     if self._user_memory_store is None:
       return []
@@ -573,9 +651,11 @@ class StructuredMemoryRetriever:
         self._user_fact_index,
         record,
         query_text=query_text,
+        query_embedding=query_embedding,
         top_k=profile.user_fact_top_k,
         fallback_items=record.stable_facts,
         text_key="fact",
+        trace=trace,
       )
       if facts:
         lines.append(f"{nickname} 的稳定事实：" + "；".join(facts))
@@ -597,9 +677,11 @@ class StructuredMemoryRetriever:
         self._user_callback_index,
         record,
         query_text=query_text,
+        query_embedding=query_embedding,
         top_k=profile.user_callback_top_k,
         fallback_items=record.callbacks,
         text_key="hook",
+        trace=trace,
       )
       if callbacks:
         lines.append(f"{nickname} 的历史梗/回钩线索：" + "；".join(callbacks))
@@ -614,7 +696,14 @@ class StructuredMemoryRetriever:
         lines.append(f"{nickname} 上次对话停在：" + "；".join(open_threads))
     return lines
 
-  def _build_self_lines(self, query_text: str, profile: RecallProfile) -> list[str]:
+  def _build_self_lines(
+    self,
+    query_text: str,
+    profile: RecallProfile,
+    query_embedding: Optional[list[float]] = None,
+    *,
+    trace: Optional[dict[str, Any]] = None,
+  ) -> list[str]:
     if self._self_memory_store is None:
       return []
     record = self._self_memory_store.get()
@@ -623,9 +712,11 @@ class StructuredMemoryRetriever:
     self_said = self._search_or_fallback(
       self._self_said_index,
       query_text=query_text,
+      query_embedding=query_embedding,
       top_k=profile.self_said_top_k,
       fallback_items=record.self_said,
       text_key="text",
+      trace=trace,
     )
     if self_said:
       lines.append("和当前话题相关的我说过：" + "；".join(self_said))
@@ -633,9 +724,11 @@ class StructuredMemoryRetriever:
     commitments = self._search_or_fallback(
       self._self_commitment_index,
       query_text=query_text,
+      query_embedding=query_embedding,
       top_k=profile.self_commitment_top_k,
       fallback_items=record.commitments,
       text_key="text",
+      trace=trace,
     )
     if commitments:
       lines.append("仍在延续的承诺/话头：" + "；".join(commitments))
@@ -643,9 +736,11 @@ class StructuredMemoryRetriever:
     threads = self._search_or_fallback(
       self._self_thread_index,
       query_text=query_text,
+      query_embedding=query_embedding,
       top_k=profile.self_thread_top_k,
       fallback_items=record.self_threads,
       text_key="text",
+      trace=trace,
     )
     if threads:
       lines.append("可续接的旧线头：" + "；".join(threads))
@@ -656,12 +751,24 @@ class StructuredMemoryRetriever:
       lines.append("较稳定的表达偏好：" + "；".join(preference_texts))
     return lines
 
-  def _build_persona_lines(self, query_text: str) -> list[str]:
+  def _build_persona_lines(
+    self,
+    query_text: str,
+    query_embedding: Optional[list[float]] = None,
+    *,
+    trace: Optional[dict[str, Any]] = None,
+  ) -> list[str]:
     if self._persona_spec_store is None:
       return []
     record = self._persona_spec_store.get()
     if query_text:
-      lines = self._search_texts(self._persona_index, query_text, top_k=self._config.persona_top_k)
+      lines = self._search_texts(
+        self._persona_index,
+        query_text,
+        top_k=self._config.persona_top_k,
+        query_embedding=query_embedding,
+        trace=trace,
+      )
       if lines:
         return lines
     result: list[str] = []
@@ -673,11 +780,23 @@ class StructuredMemoryRetriever:
       result.append(f"{section}：{text}" if section else text)
     return result
 
-  def _build_corpus_lines(self, query_text: str) -> list[str]:
+  def _build_corpus_lines(
+    self,
+    query_text: str,
+    query_embedding: Optional[list[float]] = None,
+    *,
+    trace: Optional[dict[str, Any]] = None,
+  ) -> list[str]:
     if self._corpus_store is None:
       return []
     if query_text:
-      lines = self._search_texts(self._corpus_index, query_text, top_k=self._config.corpus_top_k)
+      lines = self._search_texts(
+        self._corpus_index,
+        query_text,
+        top_k=self._config.corpus_top_k,
+        query_embedding=query_embedding,
+        trace=trace,
+      )
       if lines:
         return lines
     return [entry.text for entry in self._corpus_store.list_enabled()[:self._config.corpus_top_k]]
@@ -705,10 +824,11 @@ class StructuredMemoryRetriever:
       part for part in (style_tag, scene_tag) if str(part or "").strip()
     ).strip() or "语料参考"
     candidate_k = max(limit * 4, limit)
+    search_query_embedding = self._query_embedding(search_query)
 
     ranked: list[tuple[int, int, float, float, str]] = []
     seen: set[str] = set()
-    for doc, score in self._corpus_index.search(search_query, top_k=candidate_k):
+    for doc, score in self._corpus_index.search_by_vector(search_query_embedding or [], top_k=candidate_k):
       if self._score_too_far(score):
         continue
       meta = doc.metadata or {}
@@ -800,11 +920,23 @@ class StructuredMemoryRetriever:
       f"{idx}. {line}" for idx, line in enumerate(lines, 1)
     )
 
-  def _build_knowledge_lines(self, query_text: str) -> list[str]:
+  def _build_knowledge_lines(
+    self,
+    query_text: str,
+    query_embedding: Optional[list[float]] = None,
+    *,
+    trace: Optional[dict[str, Any]] = None,
+  ) -> list[str]:
     if self._external_knowledge_store is None:
       return []
     if query_text:
-      lines = self._search_texts(self._knowledge_index, query_text, top_k=self._config.knowledge_top_k)
+      lines = self._search_texts(
+        self._knowledge_index,
+        query_text,
+        top_k=self._config.knowledge_top_k,
+        query_embedding=query_embedding,
+        trace=trace,
+      )
       if lines:
         return lines
     result: list[str] = []
@@ -823,9 +955,12 @@ class StructuredMemoryRetriever:
     index: VectorStore,
     record: UserMemoryRecord,
     query_text: str,
+    query_embedding: Optional[list[float]],
     top_k: int,
     fallback_items: tuple[dict, ...],
     text_key: str,
+    *,
+    trace: Optional[dict[str, Any]] = None,
   ) -> list[str]:
     if top_k <= 0:
       return []
@@ -835,6 +970,8 @@ class StructuredMemoryRetriever:
         query_text,
         top_k=top_k,
         where={"viewer_id": record.viewer_id},
+        query_embedding=query_embedding,
+        trace=trace,
       )
       if lines:
         return lines
@@ -844,14 +981,23 @@ class StructuredMemoryRetriever:
     self,
     index: VectorStore,
     query_text: str,
+    query_embedding: Optional[list[float]],
     top_k: int,
     fallback_items: tuple[dict, ...],
     text_key: str,
+    *,
+    trace: Optional[dict[str, Any]] = None,
   ) -> list[str]:
     if top_k <= 0:
       return []
     if query_text:
-      lines = self._search_texts(index, query_text, top_k=top_k)
+      lines = self._search_texts(
+        index,
+        query_text,
+        top_k=top_k,
+        query_embedding=query_embedding,
+        trace=trace,
+      )
       if lines:
         return lines
     return self._fallback_texts(fallback_items, text_key, top_k)
@@ -862,12 +1008,34 @@ class StructuredMemoryRetriever:
     query_text: str,
     top_k: int,
     where: Optional[dict] = None,
+    query_embedding: Optional[list[float]] = None,
+    *,
+    trace: Optional[dict[str, Any]] = None,
   ) -> list[str]:
     if not query_text or top_k <= 0:
       return []
+    trace_collector = None
+    if trace is not None:
+      trace["semantic_search_count"] = int(trace.get("semantic_search_count", 0) or 0) + 1
+      trace_collector = trace.setdefault("vector_searches", [])
     picked: list[str] = []
     seen: set[str] = set()
-    for doc, score in index.search(query_text, top_k=top_k, where=where):
+    search_results = (
+      index.search_by_vector(
+        query_embedding,
+        top_k=top_k,
+        where=where,
+        trace_collector=trace_collector,
+      )
+      if query_embedding is not None
+      else index.search(
+        query_text,
+        top_k=top_k,
+        where=where,
+        trace_collector=trace_collector,
+      )
+    )
+    for doc, score in search_results:
       if self._score_too_far(score):
         continue
       meta = doc.metadata or {}

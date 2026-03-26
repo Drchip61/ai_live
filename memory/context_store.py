@@ -7,6 +7,7 @@
 import json
 import logging
 import re
+import threading
 from difflib import SequenceMatcher
 from datetime import datetime
 from pathlib import Path
@@ -473,31 +474,34 @@ class _JsonStoreBase:
 
   def __init__(self, persist_path: Optional[Path]) -> None:
     self._persist_path = persist_path
+    self._lock = threading.RLock()
 
   @property
   def persist_path(self) -> Optional[Path]:
     return self._persist_path
 
   def _load_json(self, default):
-    if self._persist_path is None or not self._persist_path.exists():
-      return default
-    try:
-      return json.loads(self._persist_path.read_text(encoding="utf-8"))
-    except Exception as e:
-      logger.error("读取结构化上下文失败 %s: %s", self._persist_path, e)
-      return default
+    with self._lock:
+      if self._persist_path is None or not self._persist_path.exists():
+        return default
+      try:
+        return json.loads(self._persist_path.read_text(encoding="utf-8"))
+      except Exception as e:
+        logger.error("读取结构化上下文失败 %s: %s", self._persist_path, e)
+        return default
 
   def _save_json(self, data) -> None:
-    if self._persist_path is None:
-      return
-    try:
-      self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-      self._persist_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-      )
-    except Exception as e:
-      logger.error("保存结构化上下文失败 %s: %s", self._persist_path, e)
+    with self._lock:
+      if self._persist_path is None:
+        return
+      try:
+        self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+        self._persist_path.write_text(
+          json.dumps(data, ensure_ascii=False, indent=2),
+          encoding="utf-8",
+        )
+      except Exception as e:
+        logger.error("保存结构化上下文失败 %s: %s", self._persist_path, e)
 
 
 class UserMemoryStore(_JsonStoreBase):
@@ -523,10 +527,12 @@ class UserMemoryStore(_JsonStoreBase):
       self._persist()
 
   def get(self, viewer_id: str) -> Optional[UserMemoryRecord]:
-    return self._records.get(viewer_id)
+    with self._lock:
+      return self._records.get(viewer_id)
 
   def all(self) -> dict[str, UserMemoryRecord]:
-    return dict(self._records)
+    with self._lock:
+      return dict(self._records)
 
   def record_extract(
     self,
@@ -543,97 +549,98 @@ class UserMemoryStore(_JsonStoreBase):
     legacy_source: str = "",
     was_addressed: bool = False,
   ) -> UserMemoryRecord:
-    record = self._records.get(viewer_id)
-    if record is None:
-      record = UserMemoryRecord(viewer_id=viewer_id)
+    with self._lock:
+      record = self._records.get(viewer_id)
+      if record is None:
+        record = UserMemoryRecord(viewer_id=viewer_id)
 
-    merged_identity = _merge_identity(record.identity, identity, nickname)
-    stable_fact_items = _merge_text_entries(record.stable_facts, stable_facts or [], "fact", semantic_mode="fact")
-    recent_state_items = _merge_text_entries(record.recent_state, recent_state or [], "fact", semantic_mode="state")
-    topic_items = _merge_topic_entries(record.topic_profile, topic_profile or [])
-    callback_items = _merge_text_entries(record.callbacks, callbacks or [], "hook", semantic_mode="callback")
+      merged_identity = _merge_identity(record.identity, identity, nickname)
+      stable_fact_items = _merge_text_entries(record.stable_facts, stable_facts or [], "fact", semantic_mode="fact")
+      recent_state_items = _merge_text_entries(record.recent_state, recent_state or [], "fact", semantic_mode="state")
+      topic_items = _merge_topic_entries(record.topic_profile, topic_profile or [])
+      callback_items = _merge_text_entries(record.callbacks, callbacks or [], "hook", semantic_mode="callback")
 
-    # --- open_threads 三层清理 ---
-    # 1. 分离 incoming 中 status=="resolved" 的条目
-    active_incoming: list[dict] = []
-    resolved_incoming: list[dict] = []
-    for t in (open_threads or []):
-      if not isinstance(t, dict):
-        continue
-      if str(t.get("status", "")).strip().lower() == "resolved":
-        resolved_incoming.append(t)
+      # --- open_threads 三层清理 ---
+      # 1. 分离 incoming 中 status=="resolved" 的条目
+      active_incoming: list[dict] = []
+      resolved_incoming: list[dict] = []
+      for t in (open_threads or []):
+        if not isinstance(t, dict):
+          continue
+        if str(t.get("status", "")).strip().lower() == "resolved":
+          resolved_incoming.append(t)
+        else:
+          active_incoming.append(t)
+
+      # 2. 自动清理：用 callbacks + last_dialogue_stop 交叉剪枝 + 同主题去重
+      new_last_stop = str((relationship_state or {}).get("last_dialogue_stop", "")).strip()
+      existing_last_stop = str(record.relationship_state.get("last_dialogue_stop", "")).strip()
+      combined_last_stop = new_last_stop or existing_last_stop
+      pruned_existing = _prune_resolved_threads(
+        record.open_threads,
+        all_callbacks=list(record.callbacks) + list(callbacks or []),
+        last_dialogue_stop=combined_last_stop,
+        incoming_resolved=resolved_incoming,
+      )
+
+      # 3. 正常合并 + 上限
+      open_thread_items = _merge_text_entries(pruned_existing, active_incoming, "thread", semantic_mode="callback")
+      open_thread_items = _cap_open_threads(open_thread_items)
+      sensitive_topic_items = _merge_named_entries(record.sensitive_topics, sensitive_topics or [], "topic")
+      requested_address = extract_requested_address(
+        *(str(item.get("hook", "")) for item in callback_items),
+        *(str(item.get("thread", "")) for item in open_thread_items),
+        str((relationship_state or {}).get("last_dialogue_stop", "")),
+      )
+      resolved_preferred_address = resolve_preferred_address(
+        merged_identity,
+        fallback_nicknames=tuple(merged_identity.get("nicknames", ())),
+        raw_aliases=(viewer_id, nickname),
+        requested_address=requested_address,
+        fallback=nickname or viewer_id,
+      )
+      merged_identity = dict(merged_identity)
+      if requested_address:
+        merged_identity["nicknames"] = _unique_keep_order(
+          list(merged_identity.get("nicknames", ())) + [requested_address]
+        )
+      if resolved_preferred_address:
+        merged_identity["preferred_address"] = resolved_preferred_address
+      elif normalize_preferred_address(merged_identity.get("preferred_address", "")):
+        merged_identity["preferred_address"] = normalize_preferred_address(
+          merged_identity.get("preferred_address", "")
+        )
       else:
-        active_incoming.append(t)
-
-    # 2. 自动清理：用 callbacks + last_dialogue_stop 交叉剪枝 + 同主题去重
-    new_last_stop = str((relationship_state or {}).get("last_dialogue_stop", "")).strip()
-    existing_last_stop = str(record.relationship_state.get("last_dialogue_stop", "")).strip()
-    combined_last_stop = new_last_stop or existing_last_stop
-    pruned_existing = _prune_resolved_threads(
-      record.open_threads,
-      all_callbacks=list(record.callbacks) + list(callbacks or []),
-      last_dialogue_stop=combined_last_stop,
-      incoming_resolved=resolved_incoming,
-    )
-
-    # 3. 正常合并 + 上限
-    open_thread_items = _merge_text_entries(pruned_existing, active_incoming, "thread", semantic_mode="callback")
-    open_thread_items = _cap_open_threads(open_thread_items)
-    sensitive_topic_items = _merge_named_entries(record.sensitive_topics, sensitive_topics or [], "topic")
-    requested_address = extract_requested_address(
-      *(str(item.get("hook", "")) for item in callback_items),
-      *(str(item.get("thread", "")) for item in open_thread_items),
-      str((relationship_state or {}).get("last_dialogue_stop", "")),
-    )
-    resolved_preferred_address = resolve_preferred_address(
-      merged_identity,
-      fallback_nicknames=tuple(merged_identity.get("nicknames", ())),
-      raw_aliases=(viewer_id, nickname),
-      requested_address=requested_address,
-      fallback=nickname or viewer_id,
-    )
-    merged_identity = dict(merged_identity)
-    if requested_address:
-      merged_identity["nicknames"] = _unique_keep_order(
-        list(merged_identity.get("nicknames", ())) + [requested_address]
+        merged_identity.pop("preferred_address", None)
+      merged_relationship = _merge_relationship_state(
+        record.relationship_state,
+        relationship_state,
+        preferred_address=str(merged_identity.get("preferred_address", "")),
+        was_addressed=was_addressed,
       )
-    if resolved_preferred_address:
-      merged_identity["preferred_address"] = resolved_preferred_address
-    elif normalize_preferred_address(merged_identity.get("preferred_address", "")):
-      merged_identity["preferred_address"] = normalize_preferred_address(
-        merged_identity.get("preferred_address", "")
+
+      legacy_sources = list(record.legacy_sources)
+      if legacy_source and legacy_source not in legacy_sources:
+        legacy_sources.append(legacy_source)
+
+      updated = UserMemoryRecord(
+        viewer_id=viewer_id,
+        identity=merged_identity,
+        stable_facts=stable_fact_items,
+        recent_state=recent_state_items,
+        topic_profile=topic_items,
+        relationship_state=merged_relationship,
+        callbacks=callback_items,
+        open_threads=open_thread_items,
+        sensitive_topics=sensitive_topic_items,
+        cooldowns=record.cooldowns,
+        legacy_sources=tuple(legacy_sources),
+        created_at=record.created_at,
+        updated_at=_now_iso(),
       )
-    else:
-      merged_identity.pop("preferred_address", None)
-    merged_relationship = _merge_relationship_state(
-      record.relationship_state,
-      relationship_state,
-      preferred_address=str(merged_identity.get("preferred_address", "")),
-      was_addressed=was_addressed,
-    )
-
-    legacy_sources = list(record.legacy_sources)
-    if legacy_source and legacy_source not in legacy_sources:
-      legacy_sources.append(legacy_source)
-
-    updated = UserMemoryRecord(
-      viewer_id=viewer_id,
-      identity=merged_identity,
-      stable_facts=stable_fact_items,
-      recent_state=recent_state_items,
-      topic_profile=topic_items,
-      relationship_state=merged_relationship,
-      callbacks=callback_items,
-      open_threads=open_thread_items,
-      sensitive_topics=sensitive_topic_items,
-      cooldowns=record.cooldowns,
-      legacy_sources=tuple(legacy_sources),
-      created_at=record.created_at,
-      updated_at=_now_iso(),
-    )
-    self._records[viewer_id] = updated
-    self._persist()
-    return updated
+      self._records[viewer_id] = updated
+      self._persist()
+      return updated
 
   def set_cooldown(
     self,
@@ -642,34 +649,35 @@ class UserMemoryStore(_JsonStoreBase):
     cooldown_until: str,
     reason: str = "",
   ) -> UserMemoryRecord:
-    record = self._records.get(viewer_id) or UserMemoryRecord(viewer_id=viewer_id)
-    cooldowns = _merge_named_entries(
-      record.cooldowns,
-      [{
-        "key": key,
-        "cooldown_until": cooldown_until,
-        "reason": reason,
-      }],
-      "key",
-    )
-    updated = UserMemoryRecord(
-      viewer_id=record.viewer_id,
-      identity=record.identity,
-      stable_facts=record.stable_facts,
-      recent_state=record.recent_state,
-      topic_profile=record.topic_profile,
-      relationship_state=dict(record.relationship_state),
-      callbacks=record.callbacks,
-      open_threads=record.open_threads,
-      sensitive_topics=record.sensitive_topics,
-      cooldowns=cooldowns,
-      legacy_sources=record.legacy_sources,
-      created_at=record.created_at,
-      updated_at=_now_iso(),
-    )
-    self._records[viewer_id] = updated
-    self._persist()
-    return updated
+    with self._lock:
+      record = self._records.get(viewer_id) or UserMemoryRecord(viewer_id=viewer_id)
+      cooldowns = _merge_named_entries(
+        record.cooldowns,
+        [{
+          "key": key,
+          "cooldown_until": cooldown_until,
+          "reason": reason,
+        }],
+        "key",
+      )
+      updated = UserMemoryRecord(
+        viewer_id=record.viewer_id,
+        identity=record.identity,
+        stable_facts=record.stable_facts,
+        recent_state=record.recent_state,
+        topic_profile=record.topic_profile,
+        relationship_state=dict(record.relationship_state),
+        callbacks=record.callbacks,
+        open_threads=record.open_threads,
+        sensitive_topics=record.sensitive_topics,
+        cooldowns=cooldowns,
+        legacy_sources=record.legacy_sources,
+        created_at=record.created_at,
+        updated_at=_now_iso(),
+      )
+      self._records[viewer_id] = updated
+      self._persist()
+      return updated
 
   @staticmethod
   def _looks_like_current_schema(record: dict) -> bool:
@@ -685,15 +693,17 @@ class UserMemoryStore(_JsonStoreBase):
     )
 
   def debug_state(self) -> dict:
-    return {
-      "count": len(self._records),
-      "viewer_ids": list(self._records.keys()),
-      "sample": [record.to_dict() for record in list(self._records.values())[:5]],
-    }
+    with self._lock:
+      return {
+        "count": len(self._records),
+        "viewer_ids": list(self._records.keys()),
+        "sample": [record.to_dict() for record in list(self._records.values())[:5]],
+      }
 
   def clear(self) -> None:
-    self._records = {}
-    self._persist()
+    with self._lock:
+      self._records = {}
+      self._persist()
 
   def _persist(self) -> None:
     self._save_json({
@@ -711,7 +721,8 @@ class SelfMemoryStore(_JsonStoreBase):
     self._record = SelfMemoryRecord.from_dict(raw if isinstance(raw, dict) else {})
 
   def get(self) -> SelfMemoryRecord:
-    return self._record
+    with self._lock:
+      return self._record
 
   def record_stance(
     self,
@@ -720,68 +731,70 @@ class SelfMemoryStore(_JsonStoreBase):
     response_excerpt: str = "",
     source: str = "stance_extraction",
   ) -> SelfMemoryRecord:
-    self_said = _merge_text_entries(
-      self._record.self_said,
-      [{
-        "topic": topic,
-        "text": statement,
-        "response_excerpt": response_excerpt[:200],
-        "source": source,
-        "confidence": 0.7,
-      }],
-      "text",
-      semantic_mode="stance",
-    )
-    commitments = self._record.commitments
-    if self._looks_like_commitment(statement):
-      commitments = _merge_text_entries(
-        self._record.commitments,
+    with self._lock:
+      self_said = _merge_text_entries(
+        self._record.self_said,
         [{
-          "text": statement,
           "topic": topic,
-          "status": "open",
+          "text": statement,
+          "response_excerpt": response_excerpt[:200],
           "source": source,
+          "confidence": 0.7,
         }],
         "text",
-        semantic_mode="commitment",
+        semantic_mode="stance",
       )
+      commitments = self._record.commitments
+      if self._looks_like_commitment(statement):
+        commitments = _merge_text_entries(
+          self._record.commitments,
+          [{
+            "text": statement,
+            "topic": topic,
+            "status": "open",
+            "source": source,
+          }],
+          "text",
+          semantic_mode="commitment",
+        )
 
-    self._record = SelfMemoryRecord(
-      self_said=self_said,
-      commitments=commitments,
-      self_threads=self._record.self_threads,
-      stable_preferences=self._record.stable_preferences,
-      legacy_sources=self._merge_legacy_sources(source),
-      created_at=self._record.created_at,
-      updated_at=_now_iso(),
-    )
-    self._persist()
-    return self._record
+      self._record = SelfMemoryRecord(
+        self_said=self_said,
+        commitments=commitments,
+        self_threads=self._record.self_threads,
+        stable_preferences=self._record.stable_preferences,
+        legacy_sources=self._merge_legacy_sources(source),
+        created_at=self._record.created_at,
+        updated_at=_now_iso(),
+      )
+      self._persist()
+      return self._record
 
   def add_thread_memory(self, text: str, source_layer: str) -> SelfMemoryRecord:
-    if not self.should_keep_thread(text, source_layer):
+    with self._lock:
+      if not self.should_keep_thread(text, source_layer):
+        return self._record
+      self_threads = _merge_text_entries(
+        self._record.self_threads,
+        [{
+          "text": text,
+          "source_layer": source_layer,
+          "status": "legacy_fallback",
+        }],
+        "text",
+        semantic_mode="thread",
+      )
+      self._record = SelfMemoryRecord(
+        self_said=self._record.self_said,
+        commitments=self._record.commitments,
+        self_threads=self_threads,
+        stable_preferences=self._record.stable_preferences,
+        legacy_sources=self._merge_legacy_sources(source_layer),
+        created_at=self._record.created_at,
+        updated_at=_now_iso(),
+      )
+      self._persist()
       return self._record
-    self_threads = _merge_text_entries(
-      self._record.self_threads,
-      [{
-        "text": text,
-        "source_layer": source_layer,
-        "status": "legacy_fallback",
-      }],
-      "text",
-      semantic_mode="thread",
-    )
-    self._record = SelfMemoryRecord(
-      self_said=self._record.self_said,
-      commitments=self._record.commitments,
-      self_threads=self_threads,
-      stable_preferences=self._record.stable_preferences,
-      legacy_sources=self._merge_legacy_sources(source_layer),
-      created_at=self._record.created_at,
-      updated_at=_now_iso(),
-    )
-    self._persist()
-    return self._record
 
   def add_commitment(
     self,
@@ -790,35 +803,38 @@ class SelfMemoryStore(_JsonStoreBase):
     source: str = "self_commitment",
     status: str = "open",
   ) -> SelfMemoryRecord:
-    commitments = _merge_text_entries(
-      self._record.commitments,
-      [{
-        "text": text,
-        "topic": topic,
-        "source": source,
-        "status": status,
-      }],
-      "text",
-      semantic_mode="commitment",
-    )
-    self._record = SelfMemoryRecord(
-      self_said=self._record.self_said,
-      commitments=commitments,
-      self_threads=self._record.self_threads,
-      stable_preferences=self._record.stable_preferences,
-      legacy_sources=self._merge_legacy_sources(source),
-      created_at=self._record.created_at,
-      updated_at=_now_iso(),
-    )
-    self._persist()
-    return self._record
+    with self._lock:
+      commitments = _merge_text_entries(
+        self._record.commitments,
+        [{
+          "text": text,
+          "topic": topic,
+          "source": source,
+          "status": status,
+        }],
+        "text",
+        semantic_mode="commitment",
+      )
+      self._record = SelfMemoryRecord(
+        self_said=self._record.self_said,
+        commitments=commitments,
+        self_threads=self._record.self_threads,
+        stable_preferences=self._record.stable_preferences,
+        legacy_sources=self._merge_legacy_sources(source),
+        created_at=self._record.created_at,
+        updated_at=_now_iso(),
+      )
+      self._persist()
+      return self._record
 
   def debug_state(self) -> dict:
-    return self._record.to_dict()
+    with self._lock:
+      return self._record.to_dict()
 
   def clear(self) -> None:
-    self._record = SelfMemoryRecord()
-    self._persist()
+    with self._lock:
+      self._record = SelfMemoryRecord()
+      self._persist()
 
   def _merge_legacy_sources(self, source: str) -> tuple[str, ...]:
     merged = list(self._record.legacy_sources)

@@ -330,6 +330,27 @@ def test_enrichment_relationship():
   print("  [OK] 增强信号: 关系牌检测")
 
 
+def test_enrichment_plain_greeting_does_not_trigger_relationship():
+  inp = ControllerInput(
+    comments=(
+      CommentBrief(id="1", user_id="u_hook", nickname="老观众",
+                   content="早上好", is_new=True),
+    ),
+    viewer_briefs=(
+      ViewerBrief(
+        viewer_id="u_hook", nickname="老观众",
+        familiarity=0.8, has_open_threads=True, last_topic="舰长验证",
+      ),
+    ),
+    available_persona_sections=("relationships",),
+  )
+  _, enrichment = _router.route(inp)
+  assert enrichment.relationship_signal is False
+  assert enrichment.viewer_focus_ids == ()
+  assert enrichment.suggested_session_anchor == ""
+  print("  [OK] 增强信号: 普通问候不误触发关系续聊")
+
+
 # ================================================================
 # LLMController.dispatch — 规则路由路径
 # ================================================================
@@ -528,6 +549,9 @@ def test_dispatch_expert_timeout_uses_defaults():
   plan = asyncio.run(ctrl.dispatch(inp))
   assert plan.should_reply is True
   assert plan.route_kind == "chat"
+  trace = ctrl.last_dispatch_trace
+  assert trace["expert_dropped_count"] >= 1
+  assert trace["experts"]["reply_judge"]["source"] == "default_deadline"
   print("  [OK] dispatch 单个专家超时，其余正常，合并成功")
 
 
@@ -650,7 +674,7 @@ def test_controller_accepts_distinct_expert_models():
 
 
 def test_run_remote_default_wiring_uses_three_models():
-  """run_remote 默认 wiring 应收敛到 3 路请求，ContextAdvisor 切到 gpt-5-mini。"""
+  """run_remote 默认 wiring 应收敛到 3 路请求，并下发 transport timeout。"""
   from langchain_wrapper import ModelType
   from run_remote import _build_controller_expert_models
 
@@ -665,22 +689,24 @@ def test_run_remote_default_wiring_uses_three_models():
   provider = FakeModelProvider()
   _, model_name, expert_models, expert_labels = _build_controller_expert_models(provider)
   assert model_name == "per-expert"
-  assert provider.calls[0][0] == ModelType.DEEPSEEK
-  assert provider.calls[0][1] == "deepseek-chat"
-  assert "deepseek" in expert_labels["reply_judge"]
-  assert provider.calls[1][0] == ModelType.OPENAI
-  assert provider.calls[1][1] == "gpt-5-mini"
-  assert "ContextAdvisor: gpt-5-mini via openai" == expert_labels["context_advisor"]
-  assert provider.calls[2][0] == ModelType.DEEPSEEK
-  assert provider.calls[2][1] == "deepseek-chat"
-  assert "StyleAdvisor: deepseek-chat via deepseek" == expert_labels["style_advisor"]
+  assert provider.calls[0][0] == ModelType.LOCAL_QWEN
+  assert provider.calls[0][1] == "hoangquan456/qwen3-nothink:8b"
+  assert expert_labels["reply_judge"] == "ReplyJudge+ActionGuard: hoangquan456/qwen3-nothink:8b via local_qwen"
+  assert provider.calls[1][0] == ModelType.LOCAL_QWEN
+  assert provider.calls[1][1] == "hoangquan456/qwen3-nothink:8b"
+  assert expert_labels["context_advisor"] == "ContextAdvisor: hoangquan456/qwen3-nothink:8b via local_qwen"
+  assert provider.calls[2][0] == ModelType.LOCAL_QWEN
+  assert provider.calls[2][1] == "hoangquan456/qwen3-nothink:8b"
+  assert expert_labels["style_advisor"] == "StyleAdvisor: hoangquan456/qwen3-nothink:8b via local_qwen"
   assert len(provider.calls) == 3
+  assert provider.calls[0][2]["timeout"] == 3.5
+  assert provider.calls[0][2]["max_retries"] == 0
   assert "action_guard" not in expert_labels
-  assert expert_models["reply_judge"]["model_type"] == ModelType.DEEPSEEK
-  assert expert_models["context_advisor"]["model_type"] == ModelType.OPENAI
-  assert expert_models["style_advisor"]["model_type"] == ModelType.DEEPSEEK
+  assert expert_models["reply_judge"]["model_type"] == ModelType.LOCAL_QWEN
+  assert expert_models["context_advisor"]["model_type"] == ModelType.LOCAL_QWEN
+  assert expert_models["style_advisor"]["model_type"] == ModelType.LOCAL_QWEN
   assert expert_models["action_guard"] is None
-  print("  [OK] run_remote 默认 3 路 expert wiring，ActionGuard 并入 ReplyJudge")
+  print("  [OK] run_remote 默认 3 路 expert wiring，且携带 transport timeout")
 
 
 # ================================================================
@@ -963,6 +989,7 @@ if __name__ == "__main__":
       test_enrichment_knowledge,
       test_enrichment_fake_gift,
       test_enrichment_relationship,
+      test_enrichment_plain_greeting_does_not_trigger_relationship,
     ]),
     ("LLMController.dispatch", [
       test_dispatch_rule_route,

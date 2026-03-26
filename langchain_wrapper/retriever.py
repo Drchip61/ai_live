@@ -109,16 +109,34 @@ class RetrieverResolver:
       scene_context=scene_context,
     )
     current_comments = new_comments or old_comments[-2:]
-    relationship_followup = any(
-      self._looks_like_relationship_recall(self._comment_payload(comment))
-      or self._looks_like_continuation(self._comment_payload(comment))
-      for comment in current_comments
+    current_payloads: list[str] = []
+    relationship_followup = False
+    for comment in current_comments:
+      payload = self._clean_query_text(
+        self._comment_payload(comment),
+        max_len=120,
+      )
+      if not payload:
+        continue
+      current_payloads.append(payload)
+      if (
+        self._looks_like_relationship_recall(payload)
+        or self._looks_like_continuation(payload)
+      ):
+        relationship_followup = True
+    lightweight_turn = bool(current_payloads) and all(
+      self._is_lightweight_turn_payload(payload)
+      for payload in current_payloads
     )
-    if self._anchor_needs_deep_recall(session_anchor):
-      relationship_followup = True
     effective_memory_strategy = str(getattr(plan, "memory_strategy", "normal") or "normal")
     if relationship_followup and effective_memory_strategy in ("minimal", "normal"):
       effective_memory_strategy = "deep_recall"
+    elif (
+      effective_memory_strategy == "deep_recall"
+      and lightweight_turn
+      and not relationship_followup
+    ):
+      effective_memory_strategy = "normal"
     explicit_viewer_focus = tuple(plan.viewer_focus_ids)
     effective_viewer_ids = (
       explicit_viewer_focus
@@ -135,6 +153,7 @@ class RetrieverResolver:
 
     blocks: list[ContextBlock] = []
     seen: set[tuple[str, str]] = set()
+    retrieval_trace: dict = {}
 
     def add_block(block: ContextBlock) -> None:
       rendered = block.render().strip()
@@ -176,7 +195,11 @@ class RetrieverResolver:
       ))
 
     if self._memory is not None and effective_memory_strategy in ("normal", "deep_recall"):
-      active_text, _, _ = await asyncio.to_thread(self._memory.retrieve_active_only)
+      active_reader = getattr(type(self._memory), "retrieve_active_only_async", None)
+      if callable(active_reader) and asyncio.iscoroutinefunction(active_reader):
+        active_text, _, _ = await self._memory.retrieve_active_only_async()
+      else:
+        active_text, _, _ = await asyncio.to_thread(self._memory.retrieve_active_only)
       if active_text:
         add_block(ContextBlock(
           source="active_memory",
@@ -185,15 +208,59 @@ class RetrieverResolver:
           query_used=resolved_query,
         ))
 
-      structured_text = await asyncio.to_thread(
-        self._memory.compile_structured_context,
-        resolved_query,
-        memory_viewer_ids,
-        False,
-        False,
-        False,
-        effective_memory_strategy,
+      structured_reader_with_trace = getattr(
+        type(self._memory),
+        "compile_structured_context_with_trace_async",
+        None,
       )
+      structured_reader = getattr(type(self._memory), "compile_structured_context_async", None)
+      if (
+        callable(structured_reader_with_trace)
+        and asyncio.iscoroutinefunction(structured_reader_with_trace)
+      ):
+        structured_text, retrieval_trace = await self._memory.compile_structured_context_with_trace_async(
+          resolved_query,
+          memory_viewer_ids,
+          False,
+          False,
+          False,
+          effective_memory_strategy,
+        )
+      elif callable(structured_reader) and asyncio.iscoroutinefunction(structured_reader):
+        structured_text = await self._memory.compile_structured_context_async(
+          resolved_query,
+          memory_viewer_ids,
+          False,
+          False,
+          False,
+          effective_memory_strategy,
+        )
+      else:
+        sync_reader_with_trace = getattr(
+          type(self._memory),
+          "compile_structured_context_with_trace",
+          None,
+        )
+        if callable(sync_reader_with_trace):
+          structured_text, retrieval_trace = await asyncio.to_thread(
+            self._memory.compile_structured_context_with_trace,
+            resolved_query,
+            memory_viewer_ids,
+            False,
+            False,
+            False,
+            effective_memory_strategy,
+          )
+        else:
+          structured_text = await asyncio.to_thread(
+            self._memory.compile_structured_context,
+            resolved_query,
+            memory_viewer_ids,
+            False,
+            False,
+            False,
+            effective_memory_strategy,
+          )
       if structured_text:
         add_block(ContextBlock(
           source="structured_memory",
@@ -278,6 +345,8 @@ class RetrieverResolver:
       retrieval_query=resolved_query,
       writeback_input=resolved_writeback,
       viewer_ids=tuple(memory_viewer_ids),
+      effective_memory_strategy=effective_memory_strategy,
+      retrieval_trace=retrieval_trace,
     )
 
   @classmethod
@@ -487,6 +556,13 @@ class RetrieverResolver:
   @staticmethod
   def _looks_like_relationship_recall(payload: str) -> bool:
     return any(pattern.search(payload) for pattern in _QUERY_RELATION_PATTERNS)
+
+  @staticmethod
+  def _is_lightweight_turn_payload(payload: str) -> bool:
+    normalized = str(payload or "").strip()
+    if not normalized:
+      return False
+    return any(pattern.fullmatch(normalized) for pattern in _QUERY_NOISE_PATTERNS)
 
   @staticmethod
   def _anchor_needs_deep_recall(session_anchor: str) -> bool:

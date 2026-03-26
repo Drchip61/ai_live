@@ -215,10 +215,7 @@ class ReplyJudge:
     prompt = self._render_prompt(ctrl_input, enrichment)
     started = time.monotonic()
     try:
-      result = await asyncio.wait_for(
-        self._model.ainvoke([HumanMessage(content=prompt)]),
-        timeout=self._timeout,
-      )
+      result = await self._model.ainvoke([HumanMessage(content=prompt)])
       latency_ms = (time.monotonic() - started) * 1000
       raw = _message_content_to_text(getattr(result, "content", ""))
       data = _parse_json(raw)
@@ -232,15 +229,6 @@ class ReplyJudge:
         name="reply_judge", fields=fields,
         source="llm", latency_ms=latency_ms,
         raw_output=raw, prompt_chars=len(prompt),
-      )
-    except asyncio.TimeoutError:
-      logger.warning("ReplyJudge 超时 (%.1fs)", self._timeout)
-      return ExpertResult(
-        name="reply_judge", fields=dict(self.DEFAULTS),
-        source="default_timeout",
-        latency_ms=(time.monotonic() - started) * 1000,
-        error=f"timeout>{self._timeout:.1f}s",
-        prompt_chars=len(prompt),
       )
     except Exception as e:
       logger.warning("ReplyJudge 失败: %s", e)
@@ -293,10 +281,7 @@ class StyleAdvisor:
     prompt = self._render_prompt(ctrl_input, enrichment)
     started = time.monotonic()
     try:
-      result = await asyncio.wait_for(
-        self._model.ainvoke([HumanMessage(content=prompt)]),
-        timeout=self._timeout,
-      )
+      result = await self._model.ainvoke([HumanMessage(content=prompt)])
       latency_ms = (time.monotonic() - started) * 1000
       raw = _message_content_to_text(getattr(result, "content", ""))
       data = _parse_json(raw)
@@ -313,15 +298,6 @@ class StyleAdvisor:
         name="style_advisor", fields=fields,
         source="llm", latency_ms=latency_ms,
         raw_output=raw, prompt_chars=len(prompt),
-      )
-    except asyncio.TimeoutError:
-      logger.warning("StyleAdvisor 超时 (%.1fs)", self._timeout)
-      return ExpertResult(
-        name="style_advisor", fields=dict(self.DEFAULTS),
-        source="default_timeout",
-        latency_ms=(time.monotonic() - started) * 1000,
-        error=f"timeout>{self._timeout:.1f}s",
-        prompt_chars=len(prompt),
       )
     except Exception as e:
       logger.warning("StyleAdvisor 失败: %s", e)
@@ -394,10 +370,7 @@ class ContextAdvisor:
     )
     started = time.monotonic()
     try:
-      result = await asyncio.wait_for(
-        self._model.ainvoke([HumanMessage(content=prompt)]),
-        timeout=self._timeout,
-      )
+      result = await self._model.ainvoke([HumanMessage(content=prompt)])
       latency_ms = (time.monotonic() - started) * 1000
       raw = _message_content_to_text(getattr(result, "content", ""))
       data = _parse_json(raw)
@@ -437,15 +410,6 @@ class ContextAdvisor:
         name="context_advisor", fields=fields,
         source="llm", latency_ms=latency_ms,
         raw_output=raw, prompt_chars=len(prompt),
-      )
-    except asyncio.TimeoutError:
-      logger.warning("ContextAdvisor 超时 (%.1fs)", self._timeout)
-      return ExpertResult(
-        name="context_advisor", fields=dict(self.DEFAULTS),
-        source="default_timeout",
-        latency_ms=(time.monotonic() - started) * 1000,
-        error=f"timeout>{self._timeout:.1f}s",
-        prompt_chars=len(prompt),
       )
     except Exception as e:
       logger.warning("ContextAdvisor 失败: %s", e)
@@ -522,10 +486,7 @@ class ActionGuard:
     prompt = _append_json_object_guardrail(self._render_prompt(ctrl_input))
     started = time.monotonic()
     try:
-      result = await asyncio.wait_for(
-        self._model.ainvoke([HumanMessage(content=prompt)]),
-        timeout=self._timeout,
-      )
+      result = await self._model.ainvoke([HumanMessage(content=prompt)])
       latency_ms = (time.monotonic() - started) * 1000
       raw = _message_content_to_text(getattr(result, "content", ""))
       data = _parse_json(raw)
@@ -537,15 +498,6 @@ class ActionGuard:
         name="action_guard", fields=fields,
         source="llm", latency_ms=latency_ms,
         raw_output=raw, prompt_chars=len(prompt),
-      )
-    except asyncio.TimeoutError:
-      logger.warning("ActionGuard 超时 (%.1fs)", self._timeout)
-      return ExpertResult(
-        name="action_guard", fields=dict(self.DEFAULTS),
-        source="default_timeout",
-        latency_ms=(time.monotonic() - started) * 1000,
-        error=f"timeout>{self._timeout:.1f}s",
-        prompt_chars=len(prompt),
       )
     except Exception as e:
       logger.warning("ActionGuard 失败: %s", e)

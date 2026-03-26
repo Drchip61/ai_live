@@ -8,7 +8,7 @@ Prompt 运行时 contract
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 
 ContextTrust = Literal["trusted", "untrusted"]
@@ -42,6 +42,8 @@ class RetrievedContextBundle:
   retrieval_query: str = ""
   writeback_input: str = ""
   viewer_ids: tuple[str, ...] = field(default_factory=tuple)
+  effective_memory_strategy: str = ""
+  retrieval_trace: dict[str, Any] = field(default_factory=dict)
 
   def by_trust(self, trust: ContextTrust) -> tuple[ContextBlock, ...]:
     return tuple(block for block in self.blocks if block.trust == trust)
@@ -61,6 +63,8 @@ class RetrievedContextBundle:
       "retrieval_query": self.retrieval_query,
       "writeback_input": self.writeback_input,
       "viewer_ids": list(self.viewer_ids),
+      "effective_memory_strategy": self.effective_memory_strategy,
+      "retrieval_trace": self.retrieval_trace,
       "trusted_sources": [block.source for block in self.by_trust("trusted")],
       "untrusted_sources": [block.source for block in self.by_trust("untrusted")],
     }

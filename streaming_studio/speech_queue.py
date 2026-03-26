@@ -39,6 +39,7 @@ class SpeechItem:
   segment_total: int = 1
   comments: list[Comment] = field(default_factory=list)
   generated_at: float = field(default_factory=time.monotonic)
+  preempt_epoch: int = 0
   id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
   @property

@@ -17,6 +17,7 @@ import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 project_root = Path(__file__).parent
@@ -958,24 +959,110 @@ def test_session_anchor_promotes_deep_recall_in_resolver():
   check("session_anchor 注入 trusted source", "session_anchor" in debug_view["trusted_sources"], f"debug={debug_view}")
 
 
+def test_plain_greeting_downgrades_deep_recall_in_resolver():
+  """MEM-4C2: 普通问候不应仅因 deep_recall/session_anchor 落到重检索画像"""
+  mock_memory = MagicMock()
+  mock_memory.retrieve_active_only.return_value = ("", "", "")
+  mock_memory.compile_structured_context.return_value = "【结构化记忆】轻量关系内容"
+
+  resolver = RetrieverResolver(memory_manager=mock_memory)
+  comments = [
+    _runtime_comment("早上好", id="rt_hi", user_id="u_hook", nickname="老观众"),
+  ]
+  plan = PromptPlan(
+    route_kind="chat",
+    memory_strategy="deep_recall",
+    session_anchor="继续 老观众 上次没聊完的话头",
+    viewer_focus_ids=("u_hook",),
+  )
+  bundle = asyncio.run(resolver.resolve(
+    plan,
+    old_comments=[],
+    new_comments=comments,
+  ))
+  call = mock_memory.compile_structured_context.call_args
+  debug_view = bundle.debug_view()
+  trace("resolver.query", call.args[0])
+  trace("resolver.profile", call.args[-1])
+  trace("bundle.debug", debug_view)
+  check("普通问候降级为 normal", call.args[-1] == "normal", f"args={call.args}")
+  check("effective_memory_strategy=normal", bundle.effective_memory_strategy == "normal", f"strategy={bundle.effective_memory_strategy}")
+  check("session_anchor 仍注入 trusted source", "session_anchor" in debug_view["trusted_sources"], f"debug={debug_view}")
+
+
+def test_structured_retriever_reuses_single_query_embedding():
+  """MEM-4D: structured retriever 对同一 query 只做一次 embedding 并复用到各索引"""
+  from memory.structured_retriever import StructuredMemoryRetriever, RecallProfile
+
+  retriever = StructuredMemoryRetriever.__new__(StructuredMemoryRetriever)
+  query_embedding = [0.1, 0.2, 0.3]
+  profile = RecallProfile(
+    max_viewers=1,
+    user_fact_top_k=1,
+    user_recent_state_top_k=1,
+    user_topic_top_k=1,
+    user_callback_top_k=1,
+    user_open_thread_top_k=1,
+    user_sensitive_top_k=1,
+    self_said_top_k=1,
+    self_commitment_top_k=1,
+    self_thread_top_k=1,
+    stable_preference_top_k=1,
+  )
+  retriever._query_embedding = MagicMock(return_value=query_embedding)
+  retriever._resolve_recall_profile = MagicMock(return_value=profile)
+  retriever._build_user_lines = MagicMock(return_value=["user"])
+  retriever._build_self_lines = MagicMock(return_value=["self"])
+  retriever._build_persona_lines = MagicMock(return_value=["persona"])
+  retriever._build_corpus_lines = MagicMock(return_value=["corpus"])
+  retriever._build_knowledge_lines = MagicMock(return_value=["knowledge"])
+
+  context = retriever.build_compiled_context(
+    "测试查询",
+    viewer_ids=["u1"],
+    include_persona=True,
+    include_corpus=True,
+    include_external_knowledge=True,
+    recall_profile="deep_recall",
+  )
+  trace("compiled_context", context)
+  check("query embedding 只生成一次", retriever._query_embedding.call_count == 1)
+  check("user lines 复用 embedding", retriever._build_user_lines.call_args.args[3] is query_embedding)
+  check("self lines 复用 embedding", retriever._build_self_lines.call_args.args[2] is query_embedding)
+  check("persona lines 复用 embedding", retriever._build_persona_lines.call_args.args[1] is query_embedding)
+  check("corpus lines 复用 embedding", retriever._build_corpus_lines.call_args.args[1] is query_embedding)
+  check("knowledge lines 复用 embedding", retriever._build_knowledge_lines.call_args.args[1] is query_embedding)
+  check("编译结果保留各层输出", context.user_memory_lines == ("user",) and context.self_memory_lines == ("self",))
+
+
 def test_vector_store_search_auto_heals_missing_segment():
   """MEM-4D: VectorStore.search 遇到磁盘段缺失时先自愈再重试"""
   store = VectorStore.__new__(VectorStore)
   store._lock = threading.RLock()
+  store._embeddings = MagicMock()
+  store._embeddings.embed_query.return_value = [0.1, 0.2]
   store._store = MagicMock()
   store._store._collection.name = "structured_self_said"
-  expected = [(MagicMock(page_content="ok"), 0.12)]
-  store._store.similarity_search_with_score = MagicMock(side_effect=[
+  store._store._collection.query = MagicMock(side_effect=[
     Exception("Error executing plan: Internal error: Error creating hnsw segment reader: Nothing found on disk"),
-    expected,
+    {
+      "documents": [["ok"]],
+      "metadatas": [[{}]],
+      "distances": [[0.12]],
+    },
   ])
   store.ensure_healthy = MagicMock(return_value=False)
 
   results = store.search("测试查询", top_k=1)
   trace("search.results", results)
   check("坏索引查询会调用 ensure_healthy", store.ensure_healthy.call_count == 1)
-  check("自愈后会重试 similarity_search", store._store.similarity_search_with_score.call_count == 2)
-  check("自愈重试后返回正常结果", results == expected)
+  check("query embedding 只生成一次", store._embeddings.embed_query.call_count == 1)
+  check("自愈后会重试底层 query", store._store._collection.query.call_count == 2)
+  check(
+    "自愈重试后返回正常结果",
+    len(results) == 1 and results[0][0].page_content == "ok" and abs(results[0][1] - 0.12) < 1e-6,
+    f"results={results}",
+  )
 
 
 def test_persona_sections_retrieval():
@@ -2325,6 +2412,72 @@ def test_bridge_no_state_card_defaults():
   check("无 StateCard: emotion 默认空", ctrl_input.emotion == "")
 
 
+def test_bridge_viewer_briefs_focus_on_new_commenters():
+  """BRIDGE-5: viewer_briefs 优先聚焦本轮新发言观众，避免旧观众关系状态误触发"""
+  from streaming_studio.controller_bridge import build_controller_input
+  from streaming_studio.guard_roster import GuardRoster
+  from streaming_studio.models import Comment, EventType
+
+  roster = GuardRoster.__new__(GuardRoster)
+  roster._path = Path(tempfile.mktemp(suffix=".json"))
+  roster._members = {}
+
+  old_record = SimpleNamespace(
+    identity={"preferred_address": "老观众", "nicknames": ("老观众",)},
+    relationship_state={"familiarity": 0.9, "trust": 0.8},
+    callbacks=({"hook": "老梗"},),
+    open_threads=({"thread": "上次舰长话题还没聊完", "status": "open"},),
+    topic_profile=({"topic": "舰长验证"},),
+  )
+  new_record = SimpleNamespace(
+    identity={"preferred_address": "新观众", "nicknames": ("新观众",)},
+    relationship_state={"familiarity": 0.1, "trust": 0.1},
+    callbacks=(),
+    open_threads=(),
+    topic_profile=(),
+  )
+  user_store = MagicMock()
+  user_store.get.side_effect = lambda viewer_id: {
+    "u_old": old_record,
+    "u_new": new_record,
+  }.get(viewer_id)
+  memory_manager = MagicMock(user_memory_store=user_store)
+
+  old_comment = Comment(
+    user_id="u_old",
+    nickname="老观众",
+    content="上次那个舰长话题还记得不",
+    event_type=EventType.DANMAKU,
+  )
+  new_comment = Comment(
+    user_id="u_new",
+    nickname="新观众",
+    content="早上好",
+    event_type=EventType.DANMAKU,
+  )
+
+  ctrl_input = build_controller_input(
+    old_comments=[old_comment],
+    new_comments=[new_comment],
+    guard_roster=roster,
+    memory_manager=memory_manager,
+    topic_manager=None,
+    state_card=None,
+    scene_memory=None,
+    is_conversation_mode=False,
+    has_scene_change=False,
+    scene_description="",
+    silence_seconds=0,
+    comment_rate=1.0,
+    round_count=3,
+    last_response_style="normal",
+    last_topic="",
+  )
+  viewer_ids = tuple(viewer.viewer_id for viewer in ctrl_input.viewer_briefs)
+  trace("viewer_briefs", viewer_ids)
+  check("viewer_briefs 仅保留当前发言者", viewer_ids == ("u_new",), f"viewer_ids={viewer_ids}")
+
+
 # ================================================================
 # 12. Comment 模型与 SpeechQueue（4 项）
 # ================================================================
@@ -3468,6 +3621,8 @@ if __name__ == "__main__":
       test_record_viewer_memories_logs_outer_non_list_structure,
       test_memory_strategy_profiles_diverge_by_viewer_scope,
       test_session_anchor_promotes_deep_recall_in_resolver,
+      test_plain_greeting_downgrades_deep_recall_in_resolver,
+      test_structured_retriever_reuses_single_query_embedding,
       test_vector_store_search_auto_heals_missing_segment,
       test_persona_sections_retrieval,
       test_knowledge_topics_retrieval,
@@ -3550,6 +3705,7 @@ if __name__ == "__main__":
       test_bridge_mixed_event_types,
       test_bridge_resource_catalog_passthrough,
       test_bridge_no_state_card_defaults,
+      test_bridge_viewer_briefs_focus_on_new_commenters,
     ]),
     ("12. Comment 模型与数据流", [
       test_comment_model_event_types,

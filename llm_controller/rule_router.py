@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .schema import CommentBrief, ControllerInput, PromptPlan
+from .schema import CommentBrief, ControllerInput, PromptPlan, ViewerBrief
 
 
 # ------------------------------------------------------------------
@@ -62,6 +62,11 @@ _QUESTION_KEYWORDS = (
   "是不是", "吗", "呢", "么", "为什么", "为啥", "怎么看", "咋看",
   "怎么说", "怎么理解", "知不知道", "能不能", "可不可以", "行不行",
   "会不会", "有没有", "算不算", "是什么", "啥意思",
+)
+
+_PLAIN_GREETING_PATTERNS = (
+  re.compile(r"^(你好|hello|hi|嗨|晚上好|早上好|下午好|主播好)$", re.I),
+  re.compile(r"^(早呀|早安|午安|晚安)$", re.I),
 )
 
 
@@ -159,10 +164,13 @@ def pick_persona_sections(
   if contains_any(current_text, SECTION_KEYWORDS["streaming"]):
     add("streaming")
 
+  current_viewers = _current_viewer_briefs(ctrl_input, comments)
   relationship_signal = (
-    has_guard_member
-    or any(v.has_callbacks or v.has_open_threads or v.is_guard_member for v in ctrl_input.viewer_briefs)
-    or contains_any(current_text, SECTION_KEYWORDS["relationships"])
+    contains_any(current_text, SECTION_KEYWORDS["relationships"])
+    or (
+      any(v.has_open_threads for v in current_viewers)
+      and not _is_plain_greeting_turn(comments)
+    )
   )
   if relationship_signal:
     add("relationships")
@@ -216,6 +224,45 @@ def _collect_current_text(comments: list[CommentBrief]) -> str:
     str(c.content or "").strip()
     for c in comments
     if str(c.content or "").strip()
+  )
+
+
+def _current_viewer_briefs(
+  ctrl_input: ControllerInput,
+  comments: list[CommentBrief],
+) -> list[ViewerBrief]:
+  current_viewer_ids = [
+    viewer_id for viewer_id in dict.fromkeys(
+      str(comment.user_id or "").strip()
+      for comment in comments
+      if str(comment.user_id or "").strip()
+    )
+  ]
+  if not current_viewer_ids:
+    return list(ctrl_input.viewer_briefs)
+  viewer_map = {
+    str(viewer.viewer_id).strip(): viewer
+    for viewer in ctrl_input.viewer_briefs
+    if str(viewer.viewer_id).strip()
+  }
+  return [
+    viewer_map[viewer_id]
+    for viewer_id in current_viewer_ids
+    if viewer_id in viewer_map
+  ]
+
+
+def _is_plain_greeting_turn(comments: list[CommentBrief]) -> bool:
+  payloads = [
+    str(comment.content or "").strip()
+    for comment in comments
+    if str(comment.content or "").strip()
+  ]
+  if not payloads:
+    return False
+  return all(
+    any(pattern.fullmatch(payload) for pattern in _PLAIN_GREETING_PATTERNS)
+    for payload in payloads
   )
 
 
@@ -283,6 +330,9 @@ class RuleRouter:
   ) -> RuleEnrichment:
     has_guard_member = any(c.is_guard_member for c in current_comments)
     current_text = _collect_current_text(current_comments)
+    current_viewers = _current_viewer_briefs(ctrl_input, current_comments)
+    explicit_relationship = contains_any(current_text, SECTION_KEYWORDS["relationships"])
+    plain_greeting = _is_plain_greeting_turn(current_comments)
 
     fake_gift_ids = detect_fake_gift_ids(current_comments)
     persona_sections = pick_persona_sections(
@@ -306,14 +356,18 @@ class RuleRouter:
 
     existential_trigger = "existential" in persona_sections
 
-    relationship_viewers = [
-      v for v in ctrl_input.viewer_briefs
-      if v.has_callbacks or v.has_open_threads
-    ]
+    relationship_viewers = (
+      list(current_viewers)
+      if explicit_relationship
+      else (
+        []
+        if plain_greeting
+        else [v for v in current_viewers if v.has_open_threads]
+      )
+    )
     relationship_signal = (
-      bool(relationship_viewers)
-      or "relationships" in persona_sections
-      or contains_any(current_text, SECTION_KEYWORDS["relationships"])
+      explicit_relationship
+      or bool(relationship_viewers)
     )
     viewer_focus_ids = tuple(v.viewer_id for v in relationship_viewers[:1])
 

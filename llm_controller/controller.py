@@ -30,6 +30,7 @@ from .schema import ControllerInput, PromptPlan
 logger = logging.getLogger(__name__)
 
 _CONTROLLER_TIMEOUT = 3.0
+_TRANSPORT_TIMEOUT_GRACE = 0.5
 
 
 def _bump_sentences(value: Any, *, delta: int = 1, minimum: int = 1, maximum: int = 4) -> int:
@@ -55,9 +56,15 @@ class LLMController:
     base_url: str = "http://localhost:2001/v1",
     model_name: str = "qwen3.5-9b",
     timeout: float = _CONTROLLER_TIMEOUT,
+    transport_timeout: Optional[float] = None,
     *,
+    max_retries: int = 0,
     expert_models: Optional[dict[str, BaseChatModel]] = None,
   ):
+    resolved_transport_timeout = max(
+      float(transport_timeout if transport_timeout is not None else timeout + _TRANSPORT_TIMEOUT_GRACE),
+      0.1,
+    )
     if model is not None:
       resolved_model = model
     elif not str(base_url or "").strip():
@@ -70,10 +77,14 @@ class LLMController:
         base_url=base_url,
         temperature=0.3,
         max_tokens=512,
+        timeout=resolved_transport_timeout,
+        max_retries=max_retries,
       )
 
     self._model = resolved_model
     self._timeout = timeout
+    self._transport_timeout = resolved_transport_timeout
+    self._max_retries = max_retries
     self._model_name = model_name
 
     self._rule_router = RuleRouter()
@@ -145,7 +156,7 @@ class LLMController:
 
     # 2. 规则无法决定 → 并行专家组
     started = time.monotonic()
-    expert_results = await self._run_experts(ctrl_input, enrichment)
+    expert_results, dropped_experts = await self._run_experts(ctrl_input, enrichment)
     total_latency = (time.monotonic() - started) * 1000
 
     # 3. 集成合并
@@ -157,6 +168,7 @@ class LLMController:
       enrichment=enrichment,
       expert_results=expert_results,
       latency_ms=total_latency,
+      dropped_experts=dropped_experts,
     )
     return plan
 
@@ -176,8 +188,8 @@ class LLMController:
     self,
     ctrl_input: ControllerInput,
     enrichment: RuleEnrichment,
-  ) -> dict[str, ExpertResult]:
-    """并行调用专家组；默认 3 路，必要时可带独立 ActionGuard。"""
+  ) -> tuple[dict[str, ExpertResult], list[str]]:
+    """并行调用专家组；达到 controller deadline 后直接丢弃晚到专家。"""
     tasks: dict[str, asyncio.Task] = {}
 
     if self._reply_judge:
@@ -198,20 +210,72 @@ class LLMController:
       )
 
     results: dict[str, ExpertResult] = {}
-    if tasks:
-      done = await asyncio.gather(*tasks.values(), return_exceptions=True)
-      for name, result in zip(tasks.keys(), done):
-        if isinstance(result, Exception):
-          logger.warning("专家 %s 异常: %s", name, result)
+    if not tasks:
+      return results, []
+
+    for task in tasks.values():
+      task.add_done_callback(self._consume_expert_task_result)
+
+    pending = dict(tasks)
+    deadline_at = time.monotonic() + max(self._timeout, 0.0)
+    dropped: list[str] = []
+
+    while pending:
+      remaining = deadline_at - time.monotonic()
+      if remaining <= 0:
+        break
+      done, _ = await asyncio.wait(
+        pending.values(),
+        timeout=remaining,
+        return_when=asyncio.FIRST_COMPLETED,
+      )
+      if not done:
+        break
+      for name, task in list(pending.items()):
+        if task not in done:
+          continue
+        pending.pop(name)
+        try:
+          results[name] = task.result()
+        except asyncio.CancelledError:
+          raise
+        except Exception as exc:
+          logger.warning("专家 %s 异常: %s", name, exc)
           defaults = self._get_expert_defaults(name)
           results[name] = ExpertResult(
-            name=name, fields=defaults,
-            source="default_exception", error=str(result),
+            name=name,
+            fields=defaults,
+            source="default_exception",
+            error=str(exc),
           )
-        else:
-          results[name] = result
 
-    return results
+    if pending:
+      deadline_error = f"controller_deadline>{self._timeout:.1f}s"
+      for name, task in pending.items():
+        dropped.append(name)
+        task.cancel()
+        defaults = self._get_expert_defaults(name)
+        results[name] = ExpertResult(
+          name=name,
+          fields=defaults,
+          source="default_deadline",
+          latency_ms=max(self._timeout, 0.0) * 1000,
+          error=deadline_error,
+        )
+
+    return results, dropped
+
+  @staticmethod
+  def _consume_expert_task_result(task: asyncio.Task) -> None:
+    """消费后台 task 的最终结果，避免 deadline drop 后出现未读取异常。"""
+    try:
+      if task.cancelled():
+        return
+      task.exception()
+    except asyncio.CancelledError:
+      return
+    except Exception:
+      return
 
   @staticmethod
   def _get_expert_defaults(name: str) -> dict[str, Any]:
@@ -344,6 +408,7 @@ class LLMController:
     enrichment: RuleEnrichment,
     expert_results: Optional[dict[str, ExpertResult]] = None,
     latency_ms: float = 0.0,
+    dropped_experts: Optional[list[str]] = None,
   ) -> None:
     """记录 dispatch 的可观测信息。"""
     experts_trace: dict[str, Any] = {}
@@ -362,7 +427,12 @@ class LLMController:
       "source": source,
       "model_name": self._model_name,
       "timeout_s": self._timeout,
+      "controller_deadline_ms": round(max(self._timeout, 0.0) * 1000, 1),
+      "transport_timeout_s": round(self._transport_timeout, 2),
+      "max_retries": self._max_retries,
       "latency_ms": round(max(latency_ms, 0.0), 1),
+      "expert_dropped": list(dropped_experts or ()),
+      "expert_dropped_count": len(dropped_experts or ()),
       "plan_json": plan.to_dict(nested=False),
       "enrichment": {
         "has_guard_member": enrichment.has_guard_member,

@@ -7,13 +7,15 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import json
 import logging
 import re
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import json_repair
 from langchain_core.language_models import BaseChatModel
@@ -175,8 +177,27 @@ class MemoryManager:
 
     self._summary_task: Optional[asyncio.Task] = None
     self._background_tasks: set[asyncio.Task] = set()
-    self._structured_refresh_lock: Optional[asyncio.Lock] = None
     self._recent_interactions: list[tuple[str, str, datetime]] = []
+    self._read_executor = ThreadPoolExecutor(
+      max_workers=2,
+      thread_name_prefix="memory_read",
+    )
+    self._refresh_executor = ThreadPoolExecutor(
+      max_workers=1,
+      thread_name_prefix="memory_refresh",
+    )
+    self._store_executor = ThreadPoolExecutor(
+      max_workers=1,
+      thread_name_prefix="memory_store",
+    )
+    self._read_backlog: int = 0
+    self._refresh_backlog: int = 0
+    self._refresh_merged: int = 0
+    self._store_backlog: int = 0
+    self._pending_user_refresh_ids: set[str] = set()
+    self._pending_self_refresh: bool = False
+    self._pending_self_include_threads: bool = False
+    self._refresh_drain_task: Optional[asyncio.Task] = None
 
   @property
   def user_memory_store(self) -> Optional[UserMemoryStore]:
@@ -214,9 +235,12 @@ class MemoryManager:
     """Active 层溢出后，把旧线头沉入 structured self threads。"""
     if self._self_memory_store is None:
       return
-    self._self_memory_store.add_thread_memory(
+    self._submit_executor_job(
+      getattr(self, "_store_executor", None),
+      "_store_backlog",
+      self._self_memory_store.add_thread_memory,
       content,
-      source_layer="active_overflow",
+      "active_overflow",
     )
     self._schedule_structured_refresh(include_threads=True)
 
@@ -231,17 +255,87 @@ class MemoryManager:
     self._background_tasks.add(task)
     task.add_done_callback(self._background_tasks.discard)
 
-  def _get_structured_refresh_lock(self) -> asyncio.Lock:
-    if self._structured_refresh_lock is None:
-      self._structured_refresh_lock = asyncio.Lock()
-    return self._structured_refresh_lock
+  async def _run_executor_job(
+    self,
+    executor: Optional[ThreadPoolExecutor],
+    backlog_attr: str,
+    callback,
+    *args,
+  ):
+    if executor is None:
+      return callback(*args)
+    loop = asyncio.get_running_loop()
+    setattr(self, backlog_attr, getattr(self, backlog_attr, 0) + 1)
+    try:
+      return await loop.run_in_executor(executor, partial(callback, *args))
+    finally:
+      setattr(self, backlog_attr, max(0, getattr(self, backlog_attr, 0) - 1))
+
+  @staticmethod
+  def _execute_with_timing(callback, *args):
+    started = time.monotonic()
+    result = callback(*args)
+    finished = time.monotonic()
+    return started, finished, result
+
+  async def _run_executor_job_with_timing(
+    self,
+    executor: Optional[ThreadPoolExecutor],
+    backlog_attr: str,
+    callback,
+    *args,
+  ) -> tuple[Any, dict[str, float]]:
+    if executor is None:
+      started, finished, result = self._execute_with_timing(callback, *args)
+      return result, {
+        "queue_wait_ms": 0.0,
+        "exec_ms": round((finished - started) * 1000, 1),
+      }
+    loop = asyncio.get_running_loop()
+    submitted_at = time.monotonic()
+    setattr(self, backlog_attr, getattr(self, backlog_attr, 0) + 1)
+    try:
+      started, finished, result = await loop.run_in_executor(
+        executor,
+        partial(self._execute_with_timing, callback, *args),
+      )
+    finally:
+      setattr(self, backlog_attr, max(0, getattr(self, backlog_attr, 0) - 1))
+    return result, {
+      "queue_wait_ms": round((started - submitted_at) * 1000, 1),
+      "exec_ms": round((finished - started) * 1000, 1),
+    }
+
+  def _submit_executor_job(
+    self,
+    executor: Optional[ThreadPoolExecutor],
+    backlog_attr: str,
+    callback,
+    *args,
+  ) -> None:
+    if executor is None:
+      callback(*args)
+      return
+    try:
+      loop = asyncio.get_running_loop()
+    except RuntimeError:
+      callback(*args)
+      return
+    task = loop.create_task(
+      self._run_executor_job(executor, backlog_attr, callback, *args)
+    )
+    self._track_background_task(task)
 
   async def _run_structured_refresh(self, label: str, callback, *args) -> None:
     if self._structured_retriever is None:
       return
     started = time.monotonic()
-    async with self._get_structured_refresh_lock():
-      await asyncio.to_thread(callback, *args)
+    await self._run_executor_job(
+      getattr(self, "_refresh_executor", None),
+      "_refresh_backlog",
+      callback,
+      *args,
+    )
     elapsed_ms = (time.monotonic() - started) * 1000
     if elapsed_ms >= 300:
       logger.info("structured 索引刷新耗时 %.0fms (%s)", elapsed_ms, label)
@@ -276,6 +370,8 @@ class MemoryManager:
     include_threads: bool = False,
     viewer_ids: Optional[set[str]] = None,
   ) -> None:
+    if self._structured_retriever is None:
+      return
     try:
       loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -286,14 +382,44 @@ class MemoryManager:
       return
 
     if viewer_ids is not None:
-      task = loop.create_task(
-        self._refresh_user_structured_indexes_async(viewer_ids)
-      )
+      before = len(self._pending_user_refresh_ids)
+      self._pending_user_refresh_ids.update({
+        str(viewer_id).strip()
+        for viewer_id in viewer_ids
+        if str(viewer_id).strip()
+      })
+      if before > 0:
+        self._refresh_merged += 1
     else:
-      task = loop.create_task(
-        self._refresh_self_structured_indexes_async(include_threads=include_threads)
+      if self._pending_self_refresh:
+        self._refresh_merged += 1
+      self._pending_self_refresh = True
+      self._pending_self_include_threads = (
+        self._pending_self_include_threads or include_threads
       )
-    self._track_background_task(task)
+
+    if self._refresh_drain_task is None or self._refresh_drain_task.done():
+      self._refresh_drain_task = loop.create_task(self._drain_structured_refresh_queue())
+      self._track_background_task(self._refresh_drain_task)
+
+  async def _drain_structured_refresh_queue(self) -> None:
+    try:
+      while True:
+        viewer_ids = set(self._pending_user_refresh_ids)
+        self._pending_user_refresh_ids.clear()
+        refresh_self = self._pending_self_refresh
+        include_threads = self._pending_self_include_threads
+        self._pending_self_refresh = False
+        self._pending_self_include_threads = False
+        if not viewer_ids and not refresh_self:
+          return
+        if viewer_ids:
+          await self._refresh_user_structured_indexes_async(viewer_ids)
+        if refresh_self:
+          await self._refresh_self_structured_indexes_async(include_threads=include_threads)
+    finally:
+      if self._refresh_drain_task is asyncio.current_task():
+        self._refresh_drain_task = None
 
   @classmethod
   def _contains_guard_claim(cls, text: str) -> bool:
@@ -553,6 +679,13 @@ class MemoryManager:
         lines.append(f"  → 我说：「{memory.response[:80]}」")
     return "\n".join(lines), "", ""
 
+  async def retrieve_active_only_async(self) -> tuple[str, str, str]:
+    return await self._run_executor_job(
+      getattr(self, "_read_executor", None),
+      "_read_backlog",
+      self.retrieve_active_only,
+    )
+
   def compile_structured_context(
     self,
     query: Union[str, list[str]] = "",
@@ -572,6 +705,77 @@ class MemoryManager:
       include_external_knowledge=include_external_knowledge,
       recall_profile=recall_profile,
     )
+
+  def compile_structured_context_with_trace(
+    self,
+    query: Union[str, list[str]] = "",
+    viewer_ids: Optional[list[str]] = None,
+    include_persona: bool = True,
+    include_corpus: bool = False,
+    include_external_knowledge: bool = False,
+    recall_profile: str = "deep_recall",
+  ) -> tuple[str, dict[str, Any]]:
+    if self._structured_retriever is None:
+      return "", {}
+    started = time.monotonic()
+    text, trace = self._structured_retriever.compile_prompt_context_with_trace(
+      query=query,
+      viewer_ids=viewer_ids,
+      include_persona=include_persona,
+      include_corpus=include_corpus,
+      include_external_knowledge=include_external_knowledge,
+      recall_profile=recall_profile,
+    )
+    trace = dict(trace or {})
+    trace["read_queue_wait_ms"] = trace.get("read_queue_wait_ms", 0.0)
+    trace["read_exec_ms"] = round((time.monotonic() - started) * 1000, 1)
+    return text, trace
+
+  async def compile_structured_context_async(
+    self,
+    query: Union[str, list[str]] = "",
+    viewer_ids: Optional[list[str]] = None,
+    include_persona: bool = True,
+    include_corpus: bool = False,
+    include_external_knowledge: bool = False,
+    recall_profile: str = "deep_recall",
+  ) -> str:
+    return await self._run_executor_job(
+      getattr(self, "_read_executor", None),
+      "_read_backlog",
+      self.compile_structured_context,
+      query,
+      viewer_ids,
+      include_persona,
+      include_corpus,
+      include_external_knowledge,
+      recall_profile,
+    )
+
+  async def compile_structured_context_with_trace_async(
+    self,
+    query: Union[str, list[str]] = "",
+    viewer_ids: Optional[list[str]] = None,
+    include_persona: bool = True,
+    include_corpus: bool = False,
+    include_external_knowledge: bool = False,
+    recall_profile: str = "deep_recall",
+  ) -> tuple[str, dict[str, Any]]:
+    (text, trace), timing = await self._run_executor_job_with_timing(
+      getattr(self, "_read_executor", None),
+      "_read_backlog",
+      self.compile_structured_context_with_trace,
+      query,
+      viewer_ids,
+      include_persona,
+      include_corpus,
+      include_external_knowledge,
+      recall_profile,
+    )
+    trace = dict(trace or {})
+    trace["read_queue_wait_ms"] = timing.get("queue_wait_ms", 0.0)
+    trace["read_exec_ms"] = timing.get("exec_ms", 0.0)
+    return text, trace
 
   def get_corpus_context(
     self,
@@ -603,6 +807,36 @@ class MemoryManager:
     self._structured_retriever.rebuild_self_said_indexes()
     if include_threads:
       self._structured_retriever.rebuild_self_thread_index()
+
+  def _persist_viewer_memory_updates(self, updates: list[dict]) -> None:
+    if self._user_memory_store is None:
+      return
+    for update in updates:
+      self._user_memory_store.record_extract(**update)
+
+  def _persist_self_memory_updates(
+    self,
+    self_said_updates: list[dict],
+    commitment_updates: list[dict],
+    response_excerpt: str,
+  ) -> None:
+    if self._self_memory_store is None:
+      return
+    excerpt = response_excerpt[:200]
+    for item in self_said_updates:
+      self._self_memory_store.record_stance(
+        topic=str(item.get("topic", "")).strip(),
+        statement=str(item.get("statement", "")).strip(),
+        response_excerpt=excerpt,
+        source="stance_extraction",
+      )
+    for item in commitment_updates:
+      self._self_memory_store.add_commitment(
+        text=str(item.get("text", "")).strip(),
+        topic=str(item.get("topic", "")).strip(),
+        source="stance_extraction",
+        status=str(item.get("status", "open")).strip() or "open",
+      )
 
   async def record_interaction(
     self,
@@ -707,6 +941,7 @@ class MemoryManager:
         return
 
       touched_viewers: set[str] = set()
+      updates: list[dict] = []
       for item in memory_items:
         idx = item.get("index")
         if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
@@ -788,22 +1023,29 @@ class MemoryManager:
         if not has_meaningful_update:
           continue
 
-        self._user_memory_store.record_extract(
-          viewer_id=src["user_id"],
-          nickname=src["nickname"],
-          identity=normalized_identity,
-          stable_facts=normalized_facts,
-          recent_state=normalized_recent_state,
-          topic_profile=normalized_topic_profile,
-          relationship_state=normalized_relationship_state,
-          callbacks=normalized_callbacks,
-          open_threads=normalized_open_threads,
-          sensitive_topics=normalized_sensitive_topics,
-          legacy_source="viewer_summary_extract",
-          was_addressed=bool(ai_response_summary),
-        )
+        updates.append({
+          "viewer_id": src["user_id"],
+          "nickname": src["nickname"],
+          "identity": normalized_identity,
+          "stable_facts": normalized_facts,
+          "recent_state": normalized_recent_state,
+          "topic_profile": normalized_topic_profile,
+          "relationship_state": normalized_relationship_state,
+          "callbacks": normalized_callbacks,
+          "open_threads": normalized_open_threads,
+          "sensitive_topics": normalized_sensitive_topics,
+          "legacy_source": "viewer_summary_extract",
+          "was_addressed": bool(ai_response_summary),
+        })
         touched_viewers.add(src["user_id"])
 
+      if updates:
+        await self._run_executor_job(
+          getattr(self, "_store_executor", None),
+          "_store_backlog",
+          self._persist_viewer_memory_updates,
+          updates,
+        )
       await self._refresh_user_structured_indexes_async(touched_viewers)
     except Exception as e:
       logger.error(
@@ -864,7 +1106,8 @@ class MemoryManager:
     stances = data.get("stances", [])
     self_said = data.get("self_said", [])
     commitments = data.get("commitments", [])
-    updated_self_memory = False
+    self_said_updates: list[dict] = []
+    commitment_updates: list[dict] = []
 
     if not self_said and stances:
       self_said = [
@@ -885,13 +1128,10 @@ class MemoryManager:
       ).strip()
       if not statement_text:
         continue
-      self._self_memory_store.record_stance(
-        topic=topic,
-        statement=statement_text,
-        response_excerpt=response[:200],
-        source="stance_extraction",
-      )
-      updated_self_memory = True
+      self_said_updates.append({
+        "topic": topic,
+        "statement": statement_text,
+      })
 
     for item in commitments:
       if not isinstance(item, dict):
@@ -899,17 +1139,21 @@ class MemoryManager:
       text_value = str(item.get("text", "")).strip()
       if not text_value:
         continue
-      topic = str(item.get("topic", "")).strip()
-      status = str(item.get("status", "open")).strip() or "open"
-      self._self_memory_store.add_commitment(
-        text=text_value,
-        topic=topic,
-        source="stance_extraction",
-        status=status,
-      )
-      updated_self_memory = True
+      commitment_updates.append({
+        "text": text_value,
+        "topic": str(item.get("topic", "")).strip(),
+        "status": str(item.get("status", "open")).strip() or "open",
+      })
 
-    if updated_self_memory:
+    if self_said_updates or commitment_updates:
+      await self._run_executor_job(
+        getattr(self, "_store_executor", None),
+        "_store_backlog",
+        self._persist_self_memory_updates,
+        self_said_updates,
+        commitment_updates,
+        response,
+      )
       await self._refresh_self_structured_indexes_async(include_threads=False)
 
   async def start(self) -> None:
@@ -935,6 +1179,15 @@ class MemoryManager:
       if pending:
         logger.warning("等待记忆后台任务停止超时: %d", len(pending))
     self._background_tasks.clear()
+    for attr in ("_read_executor", "_refresh_executor", "_store_executor"):
+      executor = getattr(self, attr, None)
+      if executor is None:
+        continue
+      try:
+        executor.shutdown(wait=False, cancel_futures=True)
+      except Exception:
+        pass
+      setattr(self, attr, None)
 
   def clear_runtime_state(self) -> None:
     self._active.clear()
@@ -984,9 +1237,12 @@ class MemoryManager:
       if not summary_text:
         return
 
-      self._self_memory_store.add_thread_memory(
+      await self._run_executor_job(
+        getattr(self, "_store_executor", None),
+        "_store_backlog",
+        self._self_memory_store.add_thread_memory,
         summary_text,
-        source_layer="summary_rollup",
+        "summary_rollup",
       )
       await self._refresh_self_structured_indexes_async(include_threads=True)
       self._recent_interactions.clear()
@@ -1010,6 +1266,10 @@ class MemoryManager:
       "recent_interactions": len(self._recent_interactions),
       "background_tasks": len(self._background_tasks),
       "summary_task_running": self._summary_task is not None and not self._summary_task.done(),
+      "read_backlog": self._read_backlog,
+      "refresh_backlog": self._refresh_backlog,
+      "refresh_merged": self._refresh_merged,
+      "store_backlog": self._store_backlog,
       "legacy_layers_removed": True,
     }
 

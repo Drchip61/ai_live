@@ -10,8 +10,7 @@ from typing import Callable, Optional
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.runnables import RunnableLambda
 
 from .contracts import ModelInvocation
 
@@ -139,13 +138,6 @@ class StreamingPipeline:
     self._preprocessors: list[Processor] = []
     self._postprocessors: list[Processor] = []
 
-    # 构建提示模板（纯文本模式使用）
-    self._prompt_template = ChatPromptTemplate.from_messages([
-      ("system", "{system_prompt}"),
-      MessagesPlaceholder(variable_name="history"),
-      ("human", "{input}")
-    ])
-
     # 输出解析器
     self._output_parser = StrOutputParser()
 
@@ -222,22 +214,24 @@ class StreamingPipeline:
         formatted = messages
       return {**data, "history": formatted}
 
-    # 注入系统提示词（支持 extra_context 追加）
-    def inject_system_prompt(data: dict) -> dict:
+    # 手动构建消息列表（纯文本路径），绕过 ChatPromptTemplate 避免花括号注入
+    def build_text_messages(data: dict) -> list:
       prompt = build_system_prompt(
         self.system_prompt,
         extra_context=data.get("extra_context", ""),
         trusted_context=data.get("trusted_context", ""),
         untrusted_context=data.get("untrusted_context", ""),
       )
-      return {**data, "system_prompt": prompt}
+      msgs = [SystemMessage(content=prompt)]
+      msgs.extend(data.get("history", []))
+      msgs.append(HumanMessage(content=data.get("input", "")))
+      return msgs
 
     # 基础管道（流式使用，不含后处理器）— 纯文本路径
     self._stream_chain = (
-      RunnableLambda(inject_system_prompt)
-      | RunnableLambda(format_history)
+      RunnableLambda(format_history)
       | RunnableLambda(apply_preprocessors)
-      | self._prompt_template
+      | RunnableLambda(build_text_messages)
       | self.model
       | self._output_parser
     )

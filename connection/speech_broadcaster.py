@@ -20,6 +20,8 @@
 """
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 import logging
 import re
 import socket
@@ -152,6 +154,14 @@ class SpeechBroadcaster:
     self._pending_batch_id: Optional[str] = None
     self._estimated_playback_seconds: float = 0.0
     self._runner: Optional[web.AppRunner] = None
+    self._http_executor = ThreadPoolExecutor(
+      max_workers=1,
+      thread_name_prefix="tts_http",
+    )
+    self._http_backlog: int = 0
+    self._send_count: int = 0
+    self._wait_interrupted_count: int = 0
+    self._playback_interrupted: bool = False
 
     # 最新回复（供外部轮询）
     self._latest_response: Optional[dict] = None
@@ -223,16 +233,21 @@ class SpeechBroadcaster:
     else:
       print(f"[语音广播] 完播同步: 未启用（fire-and-forget 模式）")
 
-  async def wait_for_playback(self) -> None:
+  async def wait_for_playback(self) -> str:
     """等待当前语音播放完毕（由 StreamingStudio 主循环调用）
     兜底超时 30 秒，防止回调丢失导致长时间卡死"""
     if self._playback_done.is_set():
-      return
+      return "interrupted" if self._playback_interrupted else "completed"
     try:
       await asyncio.wait_for(self._playback_done.wait(), timeout=30.0)
     except asyncio.TimeoutError:
       print("[语音广播] 30s 未收到完播回调，疑似回调丢失，强制继续")
+      self._playback_interrupted = False
       self._playback_done.set()
+    if self._playback_interrupted:
+      self._wait_interrupted_count += 1
+      return "interrupted"
+    return "completed"
 
   # ── 回调处理 ──────────────────────────────────────────
 
@@ -253,6 +268,8 @@ class SpeechBroadcaster:
 
   def cancel_current_playback(self) -> None:
     """强制解除 wait_for_playback 阻塞（高优先级弹幕抢占低优先级播放时使用）。"""
+    self._playback_interrupted = True
+    self._pending_batch_id = f"interrupted:{uuid.uuid4()}"
     self._playback_done.set()
 
   async def _handle_speech_done(self, request: web.Request) -> web.Response:
@@ -280,6 +297,7 @@ class SpeechBroadcaster:
     else:
       print(f"[语音广播] 收到就绪信号 status={status}")
 
+    self._playback_interrupted = False
     self._playback_done.set()
     return web.Response(text="ok")
 
@@ -383,7 +401,9 @@ class SpeechBroadcaster:
     if not self.enabled:
       return False
 
+    self._send_count += 1
     self._pending_batch_id = str(uuid.uuid4())
+    self._playback_interrupted = False
     self._playback_done.clear()
 
     seg = (await self._prepare_segments_for_tts([dict(segment)]))[0]
@@ -395,11 +415,12 @@ class SpeechBroadcaster:
     if self._callback_url:
       seg["callback_url"] = self._callback_url
 
-    ok = await asyncio.to_thread(
+    ok = await self._run_http_call(
       self._post_segment,
       self._strip_private_segment_fields(seg),
     )
     if not ok or not self._callback_url:
+      self._playback_interrupted = False
       self._playback_done.set()
     return ok
 
@@ -428,7 +449,7 @@ class SpeechBroadcaster:
         seg["is_last"] = (i == total - 1)
         if self._callback_url:
           seg["callback_url"] = self._callback_url
-        ok = await asyncio.to_thread(
+        ok = await self._run_http_call(
           self._post_segment,
           self._strip_private_segment_fields(seg),
         )
@@ -443,6 +464,7 @@ class SpeechBroadcaster:
       self._estimated_playback_seconds = total_chars / 3.5 + 2.0
 
       if not self._callback_url or not all_ok:
+        self._playback_interrupted = False
         self._playback_done.set()
     except Exception as e:
       logger.error("SpeechBroadcaster 处理失败: %s", e)
@@ -720,3 +742,15 @@ class SpeechBroadcaster:
       logger.error("[语音广播] POST 失败: %s", e)
       print(f"[语音广播] POST 失败: {e}")
       return False
+
+  async def _run_http_call(self, callback, *args):
+    """将阻塞式 HTTP 发送固定在专用单线程 executor，避免抢占默认线程池。"""
+    loop = asyncio.get_running_loop()
+    self._http_backlog += 1
+    try:
+      return await loop.run_in_executor(
+        self._http_executor,
+        partial(callback, *args),
+      )
+    finally:
+      self._http_backlog = max(0, self._http_backlog - 1)

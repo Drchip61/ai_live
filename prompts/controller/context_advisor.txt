@@ -21,7 +21,7 @@
 输出 JSON：
 - memory_strategy: "minimal"|"normal"|"deep_recall"
 - session_mode: "comment_focus"|"video_focus"|"none"
-- session_anchor: 可选，如"继续 老观众 上次聊的舰长话题"
+- session_anchor: 可选，如"继续 老观众 上次聊的话题"
 - extra_instructions: 可选，最多 2 条短句指令
 - corpus_style: 可选，必须从可用语料风格标签中选择；不需要时填空字符串
 - corpus_scene: 可选，必须从可用语料场景标签中选择；不需要时填空字符串
