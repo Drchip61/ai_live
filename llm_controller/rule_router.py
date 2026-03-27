@@ -447,7 +447,7 @@ class RuleRouter:
         sentences=_bump_sentences(2 if max_price >= 10 else 1),
         memory_strategy="minimal",
         session_mode="comment_focus",
-        priority=0 if max_price >= 5 else 2,
+        priority=0 if max_price >= 5 else 3,
       )
 
     # — entry only（无弹幕同场）—
@@ -461,7 +461,7 @@ class RuleRouter:
           response_style="normal", sentences=_bump_sentences(2),
           memory_strategy="normal",
           persona_sections=enrichment.high_value_sections,
-          session_mode="comment_focus", priority=2,
+          session_mode="comment_focus", priority=3,
           extra_instructions=(
             "这是会员进场欢迎，要比普通入场更热情，点名并点出等级，但不要误说成新上舰。",
           ),
@@ -470,7 +470,7 @@ class RuleRouter:
         should_reply=True, urgency=3, route_kind="entry",
         response_style="brief", sentences=_bump_sentences(1),
         memory_strategy="minimal",
-        session_mode="comment_focus", priority=2,
+        session_mode="comment_focus", priority=3,
       )
 
     # — 有弹幕 → 交给专家组 —
@@ -487,7 +487,7 @@ class RuleRouter:
         should_reply=False, urgency=4, route_kind="vlm",
         response_style="brief", sentences=_bump_sentences(1),
         memory_strategy="minimal",
-        session_mode="video_focus", priority=3,
+        session_mode="video_focus", priority=4,
         proactive_speak=True, proactive_reason="rule_scene_reaction",
       )
 
@@ -503,7 +503,7 @@ class RuleRouter:
         sentences=_bump_sentences(1),
         memory_strategy="normal" if silence_sections else "minimal",
         persona_sections=silence_sections,
-        priority=3, proactive_speak=True,
+        priority=4, proactive_speak=True,
         proactive_reason="rule_deep_night_existential" if existential_silence else "rule_silence",
       )
 

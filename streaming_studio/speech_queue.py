@@ -5,15 +5,16 @@
 优先级（越小越优先）：
   0 — SC / 上舰 / >=5元礼物（付费事件）
   1 — 普通弹幕回复 / CommentSession 续接
-  2 — 小礼物 / 入场问候
-  3 — 视频解说 / 独白
+  2 — 游戏解说（外部推送）
+  3 — 小礼物 / 入场问候
+  4 — 视频解说 / 独白
 """
 
 import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from .models import StreamerResponse, Comment
 
@@ -22,8 +23,9 @@ from .models import StreamerResponse, Comment
 
 PRIORITY_PAID = 0
 PRIORITY_DANMAKU = 1
-PRIORITY_EVENT_LOW = 2
-PRIORITY_VIDEO = 3
+PRIORITY_GAME = 2
+PRIORITY_EVENT_LOW = 3
+PRIORITY_VIDEO = 4
 
 
 @dataclass
@@ -41,6 +43,7 @@ class SpeechItem:
   generated_at: float = field(default_factory=time.monotonic)
   preempt_epoch: int = 0
   id: str = field(default_factory=lambda: str(uuid.uuid4()))
+  on_played: Optional[Callable] = field(default=None, repr=False)
 
   @property
   def expired(self) -> bool:
@@ -148,6 +151,29 @@ class SpeechQueue:
       self._new_item.clear()
       self._space_available.set()
       return None
+
+  async def pop_response_batch(self, first: SpeechItem) -> list[SpeechItem]:
+    """取出与 first 同 response_id 的所有后续未过期条目（first 本身不含在内）。"""
+    return await self.pop_by_response_id(first.response_id)
+
+  async def pop_by_response_id(self, response_id: str) -> list[SpeechItem]:
+    """取出指定 response_id 的所有未过期条目。"""
+    rid = str(response_id or "").strip()
+    if not rid:
+      return []
+    async with self._lock:
+      keep, batch = [], []
+      for item in self._items:
+        if item.response_id == rid and not item.expired:
+          batch.append(item)
+          self._total_played += 1
+        else:
+          keep.append(item)
+      self._items = keep
+      if len(self._items) < self._max_size:
+        self._space_available.set()
+      batch.sort(key=lambda i: i.segment_index)
+      return batch
 
   async def touch_response(self, response_id: str) -> int:
     """刷新同一回复中剩余句子的 generated_at，防止排队等兄弟句播放期间 TTL 过期。"""

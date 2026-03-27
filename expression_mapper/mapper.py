@@ -20,40 +20,30 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 _TAG_PATTERN = re.compile(r"#\[([^\]]*)\]\[([^\]]*)\](?:\[([^\]]*)\])?")
-_DEFAULT_VOICE_EMOTION = "serenity"
+_DEFAULT_VOICE_EMOTION = "neutral"
 
 # 中英双语关键词扩展，提升跨语言 embedding 匹配准确率。
 # key = mapping.json 中的 name，value = 追加的英文同义词列表。
 _EMOTION_KEYWORDS: dict[str, list[str]] = {
-    "脸红": ["blush", "embarrassed", "shy", "flustered", "tsundere", "nervous"],
-    "生气": ["angry", "mad", "annoyed", "frustrated", "furious", "rage"],
-    "哭": ["cry", "sad", "upset", "whine", "tearful", "sobbing", "disappointed"],
-    "- -": ["deadpan", "unamused", "bored", "blank", "poker face", "indifferent", "cold"],
-    "口罩": ["mask", "hiding", "cover face", "extremely shy", "facepalm", "nervous", "scared"],
-    "吐舌": ["tongue out", "playful", "teasing", "mischievous", "cheeky", "smug", "proud", "satisfied", "得意"],
-    "外套": ["coat", "caring", "warm", "cold weather", "concern", "friendly"],
-    "星星": ["sparkle", "starry eyes", "interested", "excited", "happy", "amazed", "开心", "快乐"],
-    "比心": ["heart", "love", "sincere", "touched", "affection", "heartfelt"],
-    "水印": ["watermark", "special", "neutral"],
-    "眼镜": ["glasses", "serious", "analytical", "lecturing", "smart", "thoughtful", "thinking", "沉思"],
-    "脸黑": ["dark face", "speechless", "cringe", "awkward", "fail", "facepalm"],
-    "荷包蛋": ["fried egg", "mind blown", "exhausted", "done", "broken", "overwhelmed", "shocked"],
-    "阿尼亚": ["anya", "curious", "cute", "breaking character", "surprised", "waku waku"],
+    "joy": ["happy", "joyful", "cheerful", "delighted", "sparkle", "starry eyes", "excited", "love", "开心", "快乐"],
+    "angry": ["angry", "mad", "annoyed", "frustrated", "furious", "rage", "dark face", "生气", "愤怒"],
+    "embarrased": ["embarrassed", "shy", "blush", "flustered", "tsundere", "nervous", "bashful", "脸红", "害羞"],
+    "disgust": ["disgust", "cringe", "speechless", "unamused", "bored", "disdain", "嫌弃", "无语"],
+    "neutral": ["neutral", "calm", "deadpan", "blank", "poker face", "indifferent", "relaxed", "平静"],
+    "sad": ["sad", "cry", "upset", "disappointed", "tearful", "sobbing", "down", "难过", "委屈"],
+    "surprised": ["surprised", "shocked", "startled", "mind blown", "overwhelmed", "惊讶", "意外"],
+    "wonder": ["wonder", "curious", "interested", "intrigued", "amazed", "thinking", "好奇", "期待"],
 }
 
 _VOICE_EMOTION_KEYWORDS: dict[str, list[str]] = {
     "joy": ["happy", "joyful", "cheerful", "delighted", "playful", "开心", "快乐", "雀跃"],
-    "anticipation": ["anticipation", "excited", "eager", "expectant", "hyped", "期待", "兴奋", "跃跃欲试"],
-    "anger": ["anger", "angry", "mad", "furious", "rage", "生气", "火大", "发怒"],
+    "angry": ["angry", "mad", "furious", "rage", "irritated", "生气", "火大", "发怒"],
+    "embarrased": ["embarrassed", "shy", "bashful", "flustered", "害羞", "不好意思", "扭捏"],
     "disgust": ["disgust", "grossed out", "repulsed", "revolted", "嫌弃", "厌恶", "反感"],
-    "sadness": ["sadness", "sad", "down", "depressed", "heartbroken", "难过", "失落", "委屈"],
-    "surprise": ["surprise", "surprised", "shocked", "startled", "惊讶", "意外", "吃惊"],
-    "fear": ["fear", "afraid", "scared", "terrified", "nervous", "害怕", "紧张", "担心"],
-    "serenity": ["serenity", "calm", "gentle", "steady", "neutral", "平静", "温柔", "自然"],
-    "curiosity": ["curiosity", "curious", "interested", "intrigued", "好奇", "想知道", "感兴趣"],
-    "agitation": ["agitation", "restless", "irritated", "worked up", "烦躁", "焦躁", "急了"],
-    "shyness": ["shyness", "shy", "bashful", "flustered", "害羞", "不好意思", "扭捏"],
-    "indignation": ["indignation", "indignant", "resentful", "wronged", "不服", "愤愤不平", "抗议"],
+    "neutral": ["neutral", "calm", "gentle", "steady", "serene", "平静", "温柔", "自然"],
+    "sad": ["sad", "down", "depressed", "heartbroken", "难过", "失落", "委屈"],
+    "surprised": ["surprised", "shocked", "startled", "amazed", "惊讶", "意外", "吃惊"],
+    "wonder": ["wonder", "curious", "interested", "intrigued", "anticipation", "好奇", "期待", "感兴趣"],
 }
 
 _MOTION_KEYWORDS: dict[str, list[str]] = {

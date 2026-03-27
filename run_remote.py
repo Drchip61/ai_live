@@ -33,7 +33,7 @@ from langchain_wrapper.model_provider import REMOTE_MODELS
 from llm_controller import LLMController
 from streaming_studio import StreamingStudio
 from streaming_studio.models import EventType
-from connection import DanmakuPushHost, SpeechBroadcaster, RemoteSource
+from connection import DanmakuPushHost, SpeechBroadcaster, RemoteSource, GameCommentaryHost
 
 
 # 远程模式 Controller：3 路 expert 全走本地 Ollama，零网络延迟。
@@ -247,6 +247,15 @@ def parse_args():
     help="显式指定时使用单共享 Controller 模型；不传则默认启用 per-expert wiring",
   )
 
+  parser.add_argument(
+    "--game-port", type=int, default=None,
+    help="游戏解说接收端口（如 6666），启用后监听 POST /game 接收外部解说文本",
+  )
+  parser.add_argument(
+    "--game-done-url", default="http://10.81.7.165:6667",
+    help="游戏解说完播后发送 done 信号的目标 URL（默认 http://10.81.7.165:6667）",
+  )
+
   return parser.parse_args()
 
 
@@ -328,6 +337,8 @@ async def main():
     print(f"  本地日语字幕补译: {args.translator_model_name} @ {base_url}")
   else:
     print("  本地日语字幕补译: 关闭（text_ja 留空）")
+  if args.game_port:
+    print(f"  游戏解说: port={args.game_port}  done→{args.game_done_url}")
   print("=" * 60)
   print()
 
@@ -407,6 +418,14 @@ async def main():
     )
     speech.attach(studio)
 
+  game_host = None
+  if args.game_port:
+    game_host = GameCommentaryHost(
+      studio,
+      port=args.game_port,
+      done_url=args.game_done_url,
+    )
+
   try:
     if speech:
       await speech.start()
@@ -414,6 +433,8 @@ async def main():
       await _warmup_controller_models(expert_models)
     await studio.start()
     await danmaku_push.start()
+    if game_host:
+      await game_host.start()
     print("[直播开始] 远程数据源运行中... 按 Ctrl+C 停止\n")
 
     input_task = asyncio.create_task(_input_loop(studio))
@@ -424,6 +445,8 @@ async def main():
   except KeyboardInterrupt:
     print("\n\n[手动停止]")
   finally:
+    if game_host:
+      await game_host.stop()
     await danmaku_push.stop()
     await studio.stop()
     if speech:

@@ -74,6 +74,9 @@ class SpeechQueueConfig:
   danmaku_ttl: float = 25.0
   """普通弹幕回复的生存时间（秒）"""
 
+  game_ttl: float = 60.0
+  """游戏解说（外部推送）的生存时间（秒）"""
+
   event_low_ttl: float = 20.0
   """低优先级事件（小礼物 / 入场问候）的生存时间（秒）"""
 

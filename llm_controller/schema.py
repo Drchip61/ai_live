@@ -174,9 +174,9 @@ def _normalize_priority_for_route(route_kind: str, priority: int) -> int:
   if route_kind == "chat":
     return 1
   if route_kind == "entry":
-    return 2
-  if route_kind in ("vlm", "proactive"):
     return 3
+  if route_kind in ("vlm", "proactive"):
+    return 4
   return priority
 
 
@@ -362,7 +362,7 @@ class PromptPlan:
     urgency = max(0, min(9, int(urgency))) if urgency is not None else 5
 
     priority = data.get("priority", 1)
-    priority = max(0, min(3, int(priority))) if priority is not None else 1
+    priority = max(0, min(4, int(priority))) if priority is not None else 1
 
     route_kind = str(data.get("route_kind", "chat") or "chat").strip()
     if route_kind not in _VALID_ROUTE_KINDS:

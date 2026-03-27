@@ -377,7 +377,20 @@ class StructuredMemoryRetriever:
     }
 
   def ensure_healthy(self) -> None:
-    for index in (
+    for index in self._all_indexes:
+      index.ensure_healthy()
+
+  def heal_if_needed(self) -> int:
+    """后台调用：修复运行时标记为损坏的索引，返回修复数量。"""
+    healed = 0
+    for index in self._all_indexes:
+      if index.heal_if_needed():
+        healed += 1
+    return healed
+
+  @property
+  def _all_indexes(self):
+    return (
       self._user_fact_index,
       self._user_callback_index,
       self._self_said_index,
@@ -386,8 +399,7 @@ class StructuredMemoryRetriever:
       self._persona_index,
       self._corpus_index,
       self._knowledge_index,
-    ):
-      index.ensure_healthy()
+    )
 
   def _build_user_record_docs(
     self,

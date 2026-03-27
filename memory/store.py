@@ -58,6 +58,7 @@ class VectorStore:
 
     self._store = Chroma(**chroma_kwargs)
     self._lock = threading.RLock()
+    self._needs_heal = False
 
   @property
   def embeddings(self) -> HuggingFaceEmbeddings:
@@ -314,27 +315,13 @@ class VectorStore:
       chroma_query_ms += max(0.0, (time.monotonic() - query_started) * 1000)
       if self._is_recoverable_index_error(e):
         logger.warning(
-          "向量检索命中损坏索引 (collection=%s): %s，尝试自愈后重试",
+          "向量检索索引异常 (collection=%s): %s，跳过本次检索",
           self.collection_name, e,
         )
-        try:
-          retry_count = 1
-          heal_started = time.monotonic()
-          self.ensure_healthy()
-          self_heal_ms = (time.monotonic() - heal_started) * 1000
-          with self._lock:
-            retry_started = time.monotonic()
-            results = self._search_by_vector_locked(query_embedding, top_k, where)
-            chroma_query_ms += (time.monotonic() - retry_started) * 1000
-        except Exception as retry_error:
-          logger.error(
-            "向量检索自愈后仍失败 (collection=%s): %s",
-            self.collection_name, retry_error,
-          )
-          results = []
+        self._needs_heal = True
       else:
         logger.error("向量检索失败 (collection=%s): %s", self.collection_name, e)
-        results = []
+      results = []
     if trace_collector is not None:
       trace_collector.append({
         "collection_name": self.collection_name,
@@ -455,6 +442,13 @@ class VectorStore:
       )
       print(f"[记忆] {collection_name} 索引重建完成，{len(ids)} 条记忆已恢复")
       return False
+
+  def heal_if_needed(self) -> bool:
+    """有待修复标记时执行自愈，供后台任务调用。返回是否执行了重建。"""
+    if not self._needs_heal:
+      return False
+    self._needs_heal = False
+    return not self.ensure_healthy()
 
   def count(self) -> int:
     """获取文档总数"""

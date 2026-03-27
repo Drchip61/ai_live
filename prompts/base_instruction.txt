@@ -32,7 +32,7 @@
 
 - **每个句子**都必须以 `#[动作][表情][语音情绪]` 格式的标签开头。
 - 方括号中的文本使用英文小写单词或短语。
-- 第三个方括号是语音情绪，**只能**从这 12 个值里选：`joy`、`anticipation`、`anger`、`disgust`、`sadness`、`surprise`、`fear`、`serenity`、`curiosity`、`agitation`、`shyness`、`indignation`。
+- 第三个方括号是语音情绪，**只能**从这 8 个值里选：`joy`、`angry`、`embarrased`、`disgust`、`neutral`、`sad`、`surprised`、`wonder`。
 - 每个标签后只写**纯中文**内容，不要附带日语翻译。
 - 不要混入日语假名、日语句式或双语分隔格式（如 ` / `）。
 - 极短反应词（如“哈哈哈”“哇噢”）也必须保持这个标签格式。

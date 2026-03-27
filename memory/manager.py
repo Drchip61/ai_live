@@ -41,6 +41,19 @@ from .prompts import (
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_llm_message_text(text: str, max_len: int | None = None) -> str:
+  """剔除 NUL 等控制字符，避免 OpenAI 网关报「无法解析请求 JSON」。"""
+  if not text:
+    return ""
+  out = "".join(
+    ch for ch in text
+    if ord(ch) >= 32 or ch in "\n\r\t"
+  )
+  if max_len is not None:
+    out = out[:max_len]
+  return out
+
+
 class MemoryManager:
   """记忆系统顶层编排器（active + structured stores）"""
 
@@ -846,9 +859,11 @@ class MemoryManager:
     """异步记录一次交互，并写入 active 层。"""
     try:
       model = self._get_summary_model()
+      safe_in = _sanitize_llm_message_text(user_input)
+      safe_out = _sanitize_llm_message_text(response)
       prompt = INTERACTION_SUMMARY_PROMPT.format(
-        input=user_input,
-        response=response,
+        input=safe_in,
+        response=safe_out,
       )
       summary = await model.ainvoke(prompt)
       summary_text = summary.content if hasattr(summary, "content") else str(summary)
@@ -899,13 +914,15 @@ class MemoryManager:
       return
 
     comments_text = "\n".join(
-      f"{idx}. {item['nickname']}：{item['content']}"
+      f"{idx}. {_sanitize_llm_message_text(item['nickname'])}：{_sanitize_llm_message_text(item['content'])}"
       for idx, item in enumerate(candidates)
     )
     try:
       prompt = VIEWER_SUMMARY_PROMPT.format(
         comments=comments_text,
-        ai_response=ai_response_summary[:200] if ai_response_summary else "（无）",
+        ai_response=_sanitize_llm_message_text(
+          ai_response_summary[:200] if ai_response_summary else "（无）",
+        ),
       )
       model = self._get_summary_model()
       result = await model.ainvoke(prompt)
@@ -1082,8 +1099,8 @@ class MemoryManager:
 
     model = self._get_summary_model()
     prompt = STANCE_EXTRACTION_PROMPT.format(
-      input=user_input,
-      response=response,
+      input=_sanitize_llm_message_text(user_input),
+      response=_sanitize_llm_message_text(response),
     )
     result = await model.ainvoke(prompt)
     text = result.content if hasattr(result, "content") else str(result)
@@ -1199,18 +1216,35 @@ class MemoryManager:
     while True:
       try:
         await asyncio.sleep(interval)
+        await self._heal_indexes_async()
         await self._do_summary()
       except asyncio.CancelledError:
         break
       except Exception as e:
         logger.error("定时汇总出错: %s", e)
 
+  async def _heal_indexes_async(self) -> None:
+    """后台修复运行时标记为损坏的向量索引。"""
+    if self._structured_retriever is None:
+      return
+    try:
+      healed = await asyncio.get_running_loop().run_in_executor(
+        getattr(self, "_store_executor", None),
+        self._structured_retriever.heal_if_needed,
+      )
+      if healed:
+        logger.info("后台自愈修复了 %d 个索引", healed)
+    except Exception as e:
+      logger.error("后台索引自愈失败: %s", e)
+
   async def _do_summary(self) -> None:
     if self._self_memory_store is None:
       return
 
     active_memories = self._active.get_all()
-    active_texts = [memory.content for memory in active_memories]
+    active_texts = [
+      _sanitize_llm_message_text(memory.content) for memory in active_memories
+    ]
     recent = list(self._recent_interactions)
     if not active_texts and not recent:
       return
@@ -1218,7 +1252,7 @@ class MemoryManager:
     active_str = "\n".join(f"- {text}" for text in active_texts) if active_texts else "（无）"
     recent_str = (
       "\n".join(
-        f"- 观众说「{inp}」，我回复了「{resp[:50]}」"
+        f"- 观众说「{_sanitize_llm_message_text(inp)}」，我回复了「{_sanitize_llm_message_text(resp[:50])}」"
         for inp, resp, _ in recent
       )
       if recent else "（无）"

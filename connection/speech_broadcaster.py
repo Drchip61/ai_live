@@ -40,14 +40,67 @@ logger = logging.getLogger(__name__)
 
 _TAG_RE = re.compile(r"#\[([^\]]*)\]\[([^\]]*)\](?:\[([^\]]*)\])?")
 _EXPRESSION_TAG_RE = re.compile(r"#\[[^\]]*\]\[[^\]]*\](?:\[[^\]]*\])?")
-_DEFAULT_EMOTION = "- -"
-_DEFAULT_MOTION = "Idle"
-_DEFAULT_VOICE_EMOTION = "serenity"
+_DEFAULT_EMOTION = "neutral"
+_DEFAULT_MOTION = "idle"
+_DEFAULT_VOICE_EMOTION = "neutral"
 
 _CHINESE_SPEECH_RE = re.compile(
   r"谢谢|感谢|多谢|谢啦|太感[谢动]|欢迎|来[了啦]"
   r"|舰长|提督|总督|上舰|SC|礼物|打赏"
 )
+
+_CLAUSE_SPLIT_RE = re.compile(r"[，,、；;]")
+_MOOD_PARTICLE_RE = re.compile(r"^[啊呀哦噢嗯呐呢吧哈嘿嘻唉哎呜嘛欸哇喂哼嘁呵嚯噫诶嗨咦嗷噗嘶呃]+$")
+_MAX_CLAUSE_LEN = 8
+
+_CONTINUATION_MOTION_MAP: dict[str, str] = {
+  "wave": "nod",
+  "dance": "nod",
+  "clap": "nod",
+  "hands_up": "nod",
+  "fists_up": "nod",
+  "peace_sign": "nod",
+  "leg_raise": "nod",
+  "acting_cute": "nod",
+  "half_squat": "nod",
+  "point_camera": "nod",
+  "pointing": "nod",
+
+  "thinking": "chin_rest",
+  "chin_pinch": "chin_rest",
+  "hand_on_chin": "chin_rest",
+  "finger_on_chin": "chin_rest",
+  "hands_on_chin": "chin_rest",
+  "cheek_rest": "chin_rest",
+
+  "hands_cover_face": "glance_down",
+  "face_rest": "glance_down",
+  "glance_down": "idle",
+  "hands_behind_back": "idle",
+  "shush": "idle",
+
+  "arms_crossed": "idle",
+  "hands_on_hips": "idle",
+  "shrugging": "idle",
+  "stop": "idle",
+  "hands_raise": "idle",
+
+  "head_shake": "idle",
+  "head_tilt": "nod",
+  "nod": "idle",
+  "look_around": "idle",
+  "look_left_panic": "idle",
+  "look_right": "idle",
+  "eye_roll": "idle",
+  "eye_rub": "idle",
+  "praying": "idle",
+  "stretch": "idle",
+  "cold": "idle",
+  "disdain": "idle",
+  "affirm": "nod",
+  "arms_open": "idle",
+}
+_DEFAULT_CONTINUATION_MOTION = "idle"
 
 _TRANSLATE_JA_SINGLE = (
   "/no_think\n"
@@ -152,12 +205,14 @@ class SpeechBroadcaster:
     self._playback_done = asyncio.Event()
     self._playback_done.set()
     self._pending_batch_id: Optional[str] = None
+    self._total_chars_sent: int = 0
     self._estimated_playback_seconds: float = 0.0
     self._runner: Optional[web.AppRunner] = None
     self._http_executor = ThreadPoolExecutor(
       max_workers=1,
       thread_name_prefix="tts_http",
     )
+    self._http_session = requests.Session()
     self._http_backlog: int = 0
     self._send_count: int = 0
     self._wait_interrupted_count: int = 0
@@ -198,6 +253,24 @@ class SpeechBroadcaster:
     print(f"[语音广播] 回调服务器启动: 0.0.0.0:{self._callback_port}")
     print(f"[语音广播] 回调 URL: {self._callback_url}")
 
+    await self._self_test_callback()
+
+  async def _self_test_callback(self) -> None:
+    """启动自检：自己 POST 到回调 URL，验证 HTTP 端口可达。"""
+    import aiohttp
+    test_payload = {"batch_id": "__self_test__", "status": "self_test"}
+    try:
+      async with aiohttp.ClientSession() as session:
+        async with session.post(
+          self._callback_url, json=test_payload, timeout=aiohttp.ClientTimeout(total=3),
+        ) as resp:
+          if resp.status == 200:
+            print(f"[语音广播] 回调自检通过 ✓ (本机 → {self._callback_url})")
+          else:
+            print(f"[语音广播] 回调自检异常: HTTP {resp.status}")
+    except Exception as e:
+      print(f"[语音广播] 回调自检失败 ✗ 本机无法访问 {self._callback_url}: {e}")
+
   async def stop(self) -> None:
     """停止回调服务器并取消后台任务"""
     for task in self._background_tasks:
@@ -211,6 +284,9 @@ class SpeechBroadcaster:
       self._runner = None
 
     self._playback_done.set()
+
+    if self._http_session:
+      self._http_session.close()
 
   # ── 挂载与同步 ──────────────────────────────────────
 
@@ -234,16 +310,31 @@ class SpeechBroadcaster:
       print(f"[语音广播] 完播同步: 未启用（fire-and-forget 模式）")
 
   async def wait_for_playback(self) -> str:
-    """等待当前语音播放完毕（由 StreamingStudio 主循环调用）
-    兜底超时 30 秒，防止回调丢失导致长时间卡死"""
+    """等待当前语音播放完毕（由 StreamingStudio 主循环调用）。
+    超时根据 TTS 队列总字符数动态计算：chars/3 + 15s，下限 30s。
+    lookahead 期间可能追加字符，因此用轮询方式动态延伸截止时间。"""
     if self._playback_done.is_set():
       return "interrupted" if self._playback_interrupted else "completed"
-    try:
-      await asyncio.wait_for(self._playback_done.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-      print("[语音广播] 30s 未收到完播回调，疑似回调丢失，强制继续")
-      self._playback_interrupted = False
-      self._playback_done.set()
+    start = time.monotonic()
+    deadline = max(30.0, self._total_chars_sent / 3.0 + 15.0)
+    while not self._playback_done.is_set():
+      deadline = max(deadline, self._total_chars_sent / 3.0 + 15.0)
+      elapsed = time.monotonic() - start
+      remaining = deadline - elapsed
+      if remaining <= 0:
+        print(
+          f"[语音广播] {deadline:.0f}s 未收到完播回调，疑似回调丢失，强制继续 "
+          f"(已发 {self._total_chars_sent} 字)"
+        )
+        self._playback_interrupted = False
+        self._playback_done.set()
+        break
+      try:
+        await asyncio.wait_for(
+          self._playback_done.wait(), timeout=min(remaining, 5.0),
+        )
+      except asyncio.TimeoutError:
+        continue
     if self._playback_interrupted:
       self._wait_interrupted_count += 1
       return "interrupted"
@@ -284,6 +375,9 @@ class SpeechBroadcaster:
 
     batch_id = data.get("batch_id")
     status = data.get("status", "done")
+
+    if batch_id == "__self_test__":
+      return web.Response(text="ok")
 
     if batch_id and self._pending_batch_id and batch_id != self._pending_batch_id:
       print(
@@ -383,30 +477,73 @@ class SpeechBroadcaster:
       body = _json.dumps(self._latest_response, ensure_ascii=False)
     return web.Response(text=body, content_type="application/json")
 
-  # ── SpeechQueue 模式：单段发送 ────────────────────────
+  # ── SpeechQueue 模式：单段 / 批量发送 ───────────────────
 
   async def send_segment(self, segment: dict) -> bool:
+    """发送单个 TTS 段。是 send_segments 的单条快捷方式。"""
+    return await self.send_segments([segment])
+
+  async def send_segments(self, segments: list[dict]) -> bool:
     """
-    发送单个 TTS 段（由 TTS Dispatcher 调用）。
+    批量发送同一 batch 的多个 TTS 段（由 TTS Dispatcher 调用）。
 
-    自动生成 batch_id 并清除 playback_done，调用方需在之后
-    await wait_for_playback() 等待完播回调。
-
-    Args:
-      segment: TTS 段字典（text, text_zh, emotion, motion, voice_emotion, language 等）
+    所有 segment 共享同一 batch_id，连续 POST 不等完播，
+    只在最后一段标记 is_last=True。TTS 队列清空后回调该 batch_id。
+    调用方需在之后 await wait_for_playback() 等待完播。
 
     Returns:
-      True 表示 POST 成功（2xx），False 表示失败
+      True 表示全部 POST 成功（2xx），False 表示任一失败
     """
-    if not self.enabled:
+    if not self.enabled or not segments:
       return False
 
     self._send_count += 1
     self._pending_batch_id = str(uuid.uuid4())
     self._playback_interrupted = False
     self._playback_done.clear()
+    self._total_chars_sent = 0
+
+    prepared = await self._prepare_segments_for_tts(
+      [dict(s) for s in segments]
+    )
+
+    total = len(prepared)
+    all_ok = True
+    for i, seg in enumerate(prepared):
+      self._total_chars_sent += len(str(seg.get("text_zh", "") or ""))
+      seg["timestamp"] = time.time()
+      seg["batch_id"] = self._pending_batch_id
+      seg["seq"] = i
+      seg["total"] = total
+      seg["is_last"] = (i == total - 1)
+      if self._callback_url:
+        seg["callback_url"] = self._callback_url
+      ok = await self._run_http_call(
+        self._post_segment,
+        self._strip_private_segment_fields(seg),
+      )
+      if not ok:
+        all_ok = False
+
+    if not all_ok or not self._callback_url:
+      self._playback_interrupted = False
+      self._playback_done.set()
+    return all_ok
+
+  async def _send_lookahead(self, segment: dict) -> bool:
+    """
+    在当前 batch 播放期间预发后续 segment。
+
+    更新 _pending_batch_id 为新 batch_id。TTS 队列按序播放所有段，
+    队列清空后发送最后一个 batch_id 的完播回调，刚好匹配。
+    """
+    if not self.enabled:
+      return False
+
+    self._pending_batch_id = str(uuid.uuid4())
 
     seg = (await self._prepare_segments_for_tts([dict(segment)]))[0]
+    self._total_chars_sent += len(str(seg.get("text_zh", "") or ""))
     seg["timestamp"] = time.time()
     seg["batch_id"] = self._pending_batch_id
     seg["seq"] = 0
@@ -415,14 +552,10 @@ class SpeechBroadcaster:
     if self._callback_url:
       seg["callback_url"] = self._callback_url
 
-    ok = await self._run_http_call(
+    return await self._run_http_call(
       self._post_segment,
       self._strip_private_segment_fields(seg),
     )
-    if not ok or not self._callback_url:
-      self._playback_interrupted = False
-      self._playback_done.set()
-    return ok
 
   # ── 处理管线（旧路径，_on_response 回调使用）──────────
 
@@ -436,6 +569,7 @@ class SpeechBroadcaster:
         return
 
       self._apply_chinese_speech(segments, response.response_style)
+      segments = self._split_long_segments(segments)
       segments = await self.prepare_segments_for_broadcast(response, segments)
       self._update_latest_response(response)
 
@@ -638,6 +772,82 @@ class SpeechBroadcaster:
 
     return segments
 
+  @staticmethod
+  def _split_long_segments(
+    segments: list[dict],
+    max_clause_len: int = _MAX_CLAUSE_LEN,
+  ) -> list[dict]:
+    """
+    在每个 segment 内部按中文逗号等标点拆分子句。
+
+    规则：
+    - 子句超过 max_clause_len 字时独立为新 segment
+    - 纯语气词（啊、呢、吧…）不独立，合并到前一个子句
+    - 首段保留原始 motion，后续段使用延续动作避免重复触发
+    - emotion 和 voice_emotion 全部继承原 segment
+    """
+    result: list[dict] = []
+    for seg in segments:
+      text = (seg.get("text_zh") or seg.get("text") or "").strip()
+      clauses = _CLAUSE_SPLIT_RE.split(text)
+
+      if len(clauses) <= 1 or len(text) <= max_clause_len:
+        result.append(seg)
+        continue
+
+      merged: list[str] = []
+      for clause in clauses:
+        clause = clause.strip()
+        if not clause:
+          continue
+        if _MOOD_PARTICLE_RE.match(clause) and merged:
+          merged[-1] += "，" + clause
+        else:
+          merged.append(clause)
+
+      # 句首语气词向后合并（"啊，好厉害" → "啊，好厉害"）
+      if len(merged) > 1 and _MOOD_PARTICLE_RE.match(merged[0]):
+        merged[1] = merged[0] + "，" + merged[1]
+        merged.pop(0)
+
+      if len(merged) <= 1:
+        result.append(seg)
+        continue
+
+      buf = ""
+      sub_segments: list[str] = []
+      for clause in merged:
+        if not buf:
+          buf = clause
+        elif len(buf) + len(clause) + 1 <= max_clause_len:
+          buf += "，" + clause
+        elif _MOOD_PARTICLE_RE.match(buf):
+          buf += "，" + clause
+        else:
+          sub_segments.append(buf)
+          buf = clause
+      if buf:
+        sub_segments.append(buf)
+
+      if len(sub_segments) <= 1:
+        result.append(seg)
+        continue
+
+      original_motion = seg.get("motion", _DEFAULT_MOTION)
+      continuation = _CONTINUATION_MOTION_MAP.get(
+        original_motion.lower(), _DEFAULT_CONTINUATION_MOTION,
+      )
+      for i, sub_text in enumerate(sub_segments):
+        new_seg = dict(seg)
+        new_seg["text"] = sub_text
+        new_seg["text_zh"] = sub_text
+        new_seg["text_ja"] = ""
+        if i > 0:
+          new_seg["motion"] = continuation
+        result.append(new_seg)
+
+    return result
+
   async def _translate_batch(
     self, texts: list[str], lang: str = "ja",
   ) -> tuple[list[str], bool]:
@@ -716,7 +926,7 @@ class SpeechBroadcaster:
         "发送语音段:\n%s",
         _json.dumps(segment, ensure_ascii=False, indent=2),
       )
-      resp = requests.post(
+      resp = self._http_session.post(
         self._url, json=segment, timeout=self._timeout,
       )
       status = resp.status_code

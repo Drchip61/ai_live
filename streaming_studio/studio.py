@@ -808,7 +808,7 @@ class StreamingStudio:
 
   @staticmethod
   def _is_low_priority_source(source: str) -> bool:
-    return source in ("entry", "video", "monologue")
+    return source in ("game", "entry", "video", "monologue")
 
   async def _run_executor_call(
     self,
@@ -914,7 +914,7 @@ class StreamingStudio:
         self._current_generation_task.cancel()
 
       if (
-        self._current_dispatch_source in ("entry", "video", "monologue")
+        self._current_dispatch_source in ("game", "entry", "video", "monologue")
         and self._speech_broadcaster is not None
       ):
         print(f"[Dispatcher] 弹幕抢占：打断当前 {self._current_dispatch_source} 播放")
@@ -939,7 +939,7 @@ class StreamingStudio:
     if self._speech_queue is None:
       return
     flushed: list[SpeechItem] = []
-    for pending_source in ("entry", "video", "monologue"):
+    for pending_source in ("game", "entry", "video", "monologue"):
       flushed.extend(await self._speech_queue.flush_source(pending_source))
     for item in flushed:
       preview = str(item.segment.get("text_zh", "") or "")[:20]
@@ -1191,6 +1191,46 @@ class StreamingStudio:
   def _on_remote_comment(self, comment: Comment) -> None:
     """远程数据源事件到达回调：Comment 已含事件类型元数据，直接注入"""
     self.send_comment(comment)
+
+  async def enqueue_external_speech(
+    self,
+    text: str,
+    source: str = "game",
+    priority: int = 2,
+    on_played: Optional[Callable] = None,
+  ) -> Optional[str]:
+    """将外部文本直接入队 SpeechQueue（绕过 LLM 生成管线）。返回 response_id 或 None。"""
+    from .speech_queue import SpeechItem, PRIORITY_GAME
+    if self._speech_queue is None:
+      return None
+    response_id = str(uuid.uuid4())
+    response = StreamerResponse(content=text, id=response_id)
+    segment = {
+      "text": text,
+      "text_zh": text,
+      "text_ja": "",
+      "language": "Chinese",
+      "emotion": "- -",
+      "motion": "Idle",
+      "voice_emotion": "serenity",
+    }
+    cfg = self._speech_queue_config
+    ttl = cfg.game_ttl if priority == PRIORITY_GAME else cfg.danmaku_ttl
+    item = SpeechItem(
+      segment=segment,
+      priority=priority,
+      ttl=ttl,
+      source=source,
+      response_id=response_id,
+      response=response,
+      segment_index=0,
+      segment_total=1,
+      on_played=on_played,
+      preempt_epoch=self._current_preempt_epoch_for_source(source),
+    )
+    await self._speech_queue.push(item)
+    print(f"[ExternalSpeech] 入队: source={source} p={priority} «{text[:30]}»")
+    return response_id
 
   def _on_video_frame(self, frame) -> None:
     """视频新帧回调：缓存最新帧的 base64 数据和黑屏检测结果"""
@@ -1904,7 +1944,7 @@ class StreamingStudio:
     # ── 句级流式 TTS：流式生成 + 边生成边入队 ──
     priority = plan.priority
     cfg = self._speech_queue_config
-    ttl_map = {0: cfg.paid_event_ttl, 1: cfg.danmaku_ttl, 2: cfg.event_low_ttl, 3: cfg.video_ttl}
+    ttl_map = {0: cfg.paid_event_ttl, 1: cfg.danmaku_ttl, 2: cfg.game_ttl, 3: cfg.event_low_ttl, 4: cfg.video_ttl}
     ttl = ttl_map.get(priority, cfg.danmaku_ttl)
     preempt_epoch = self._current_preempt_epoch_for_source(source)
     reply_target = self._pick_primary_reply_target(new_comments, plan)
@@ -2126,9 +2166,7 @@ class StreamingStudio:
 
   async def _tts_dispatch_loop(self) -> None:
     """
-    Dispatcher 循环：从 SpeechQueue 取出最高优先级条目 → 发送 TTS → 等待完播。
-
-    每次只播一句。播完后触发 _on_response_played 回调。
+    Dispatcher 循环：从 SpeechQueue 逐条取出 → 发送 TTS → 等完播 → 下一条。
     """
     while self._running:
       try:
@@ -2142,20 +2180,23 @@ class StreamingStudio:
           print(f"[Dispatcher] 丢弃过期低优先级片段: {item.source} item={item.id[:8]}")
           self._current_dispatch_source = ""
           continue
-        # 发送单段到 TTS
+
         ok = await self._speech_broadcaster.send_segment(item.segment)
         if ok:
-          # 等待 TTS 完播
           playback_state = await self._speech_broadcaster.wait_for_playback()
+
           if playback_state == "completed":
             if self._is_dispatch_item_stale(item):
               print(f"[Dispatcher] 片段在播放后判 stale，跳过回调: {item.source} item={item.id[:8]}")
               self._current_dispatch_source = ""
               continue
-            # 刷新所有待播项的 TTL，防止连续播放期间后面的项因排队过期
             await self._speech_queue.touch_all_pending()
-            # 完播回调
             self._on_response_played(item)
+            if item.on_played is not None:
+              try:
+                item.on_played(item)
+              except Exception as e:
+                print(f"[Dispatcher] on_played 回调错误: {e}")
             await self._wait_for_response_continuation(item)
           else:
             print(f"[Dispatcher] 播放被打断，丢弃当前 {item.source} 片段")
@@ -2170,6 +2211,26 @@ class StreamingStudio:
         print(f"Dispatcher 循环错误: {e}")
         self._chat_log.info("[错误] Dispatcher 异常: %s", e)
         await asyncio.sleep(0.5)
+
+  async def _dispatch_lookahead(
+    self,
+    response_id: str,
+    collected: list,
+  ) -> None:
+    """播放期间轮询队列，预发同 response 的后续 segment 给 TTS。"""
+    from streaming_studio.speech_queue import SpeechItem
+    while True:
+      await asyncio.sleep(0.1)
+      items: list[SpeechItem] = await self._speech_queue.pop_by_response_id(response_id)
+      if not items:
+        continue
+      for it in items:
+        if self._is_dispatch_item_stale(it):
+          continue
+        ok = await self._speech_broadcaster._send_lookahead(it.segment)
+        if ok:
+          collected.append(it)
+          print(f"[Dispatcher·预发] +1 段 «{it.segment.get('text_zh', '')[:20]}»")
 
   def _on_response_played(self, item: SpeechItem) -> None:
     """
